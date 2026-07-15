@@ -1,3 +1,4 @@
+import { Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { Test } from '@nestjs/testing';
 import { PrismaService } from '../prisma/prisma.service';
@@ -82,5 +83,31 @@ describe('SyncScheduler lock (integration)', () => {
 
     await scheduler.tick();
     expect(cycleRuns).toBe(1); // expired lease → we take over
+  });
+
+  it('logs the failing STAGE when the cycle throws, and still releases the lock', async () => {
+    const errorSpy = jest
+      .spyOn(Logger.prototype, 'error')
+      .mockImplementation(() => undefined);
+    const boom = new Error('kaboom');
+    const runCycle = jest
+      .spyOn((scheduler as any).sync, 'runCycle')
+      .mockRejectedValueOnce(boom);
+
+    await scheduler.tick(); // must NOT throw out of tick
+
+    // The failure is attributed to the RUN_CYCLE stage, not left anonymous.
+    const logged = errorSpy.mock.calls.map((c) => String(c[0])).join('\n');
+    expect(logged).toMatch(/STAGE RUN_CYCLE FAILED/);
+    expect(logged).toMatch(/kaboom/);
+
+    // Lock must have been released despite the failure (next tick can proceed).
+    const rows = await prisma.$queryRawUnsafe<any[]>(
+      `SELECT locked_until <= now() AS released FROM erp_raw.sync_lock WHERE name = 'cycle'`,
+    );
+    expect(rows[0]?.released).toBe(true);
+
+    runCycle.mockRestore();
+    errorSpy.mockRestore();
   });
 });
