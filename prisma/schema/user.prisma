@@ -1,0 +1,90 @@
+enum StaffRole {
+  ADMIN
+  OFFICER
+  REGIONAL_ADMIN
+  LOADING_OFFICER
+  WAREHOUSE_OFFICER
+}
+
+enum AccountStatus {
+  ACTIVE
+  ON_HOLD
+}
+
+model Customer {
+  id                 String        @id @default(uuid())
+  erpId              String        @unique
+  name               String
+  phone              String        @unique
+  email              String?
+  password           String?
+  profilePhotoUrl    String?
+  accountStatus      AccountStatus @default(ACTIVE)
+  outstandingBalance Float         @default(0.0)
+  region             Region
+
+  failedLoginAttempts Int       @default(0)
+  lockedUntil         DateTime?
+
+  assignedOfficerId String?
+  assignedOfficer   Staff?  @relation("OfficerToCustomer", fields: [assignedOfficerId], references: [id])
+
+  officerAssignments CustomerOfficer[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  purchases        Purchase[]
+  payments         Payment[]
+  messages         Message[]
+  supportTickets   SupportTicket[]
+  ticketReplies    TicketReply[]
+  notifications    Notification[]
+  pushTokens       PushToken[]
+  loadingRequests  LoadingRequest[]
+  termsAcceptances TermsAcceptance[]
+  broadcasts       Broadcast[]       @relation("BroadcastToCustomer")
+  refreshTokens    RefreshToken[]
+}
+
+model Staff {
+  id       String    @id @default(uuid())
+  role     StaffRole
+  name     String
+  email    String    @unique
+  phone    String    @unique
+  username String?   @unique
+  erpCode  String?
+  password String?
+  isActive Boolean   @default(true)
+  region   Region?
+
+  failedLoginAttempts Int       @default(0)
+  lockedUntil         DateTime?
+  lastLoginAt         DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  customers           Customer[]        @relation("OfficerToCustomer")
+  customerAssignments CustomerOfficer[] @relation("StaffToCustomerAssignment")
+  messages            Message[]
+  ticketReplies       TicketReply[]
+  notifications       Notification[]
+  pushTokens          PushToken[]
+  loadingRequests     LoadingRequest[]  @relation("LoadingOfficerToRequest")
+  broadcastsSent      Broadcast[]       @relation("StaffToBroadcast")
+  refreshTokens       RefreshToken[]
+}
+
+model OtpVerification {
+  id          String    @id @default(uuid())
+  phone       String
+  code        String
+  expiresAt   DateTime
+  attempts    Int       @default(0)
+  lockedUntil DateTime?
+  createdAt   DateTime  @default(now())
+
+  @@index([phone])
+}

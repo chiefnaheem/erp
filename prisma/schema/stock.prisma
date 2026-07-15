@@ -1,0 +1,7 @@
+model Stock {
+  id          String   @id @default(uuid())
+  erpId       String   @unique
+  productName String
+  quantity    Int
+  updatedAt   DateTime @updatedAt
+}

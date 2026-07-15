@@ -1,0 +1,6 @@
+enum Region {
+  LAGOS
+  SOUTH_WEST
+  SOUTH_EAST
+  NORTH
+}

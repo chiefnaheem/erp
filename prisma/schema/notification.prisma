@@ -1,0 +1,14 @@
+model Notification {
+  id String @id @default(uuid())
+
+  customerId String?
+  customer   Customer? @relation(fields: [customerId], references: [id])
+
+  staffId String?
+  staff   Staff?  @relation(fields: [staffId], references: [id])
+
+  content   String
+  isRead    Boolean  @default(false)
+  type      String?
+  createdAt DateTime @default(now())
+}

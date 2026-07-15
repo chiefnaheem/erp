@@ -1,0 +1,47 @@
+enum OrderStatus {
+  PENDING
+  PROCESSING
+  SHIPPED
+  DELIVERED
+  CANCELLED
+}
+
+model Purchase {
+  id         String      @id @default(uuid())
+  erpId      String      @unique
+  customerId String
+  customer   Customer    @relation(fields: [customerId], references: [id])
+  orderDate  DateTime
+  totalItems Int
+  totalValue Float
+  status     OrderStatus
+  createdAt  DateTime    @default(now())
+  updatedAt  DateTime    @updatedAt
+
+  items           PurchaseItem[]
+  loadingRequests LoadingRequest[]
+}
+
+model PurchaseItem {
+  id          String   @id @default(uuid())
+  purchaseId  String
+  purchase    Purchase @relation(fields: [purchaseId], references: [id])
+  productName String
+  quantity    Int
+  unitPrice   Float
+  lineTotal   Float
+}
+
+model Payment {
+  id             String   @id @default(uuid())
+  erpId          String?  @unique
+  customerId     String
+  customer       Customer @relation(fields: [customerId], references: [id])
+  date           DateTime
+  amount         Float
+  reference      String?
+  runningBalance Float
+  createdAt      DateTime @default(now())
+
+  broadcast Broadcast?
+}

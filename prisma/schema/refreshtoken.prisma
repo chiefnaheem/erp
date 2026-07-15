@@ -1,0 +1,25 @@
+model RefreshToken {
+  /** This is also the jti claim on the issued refresh JWT */
+  id String @id @default(uuid())
+
+  customerId String?
+  customer   Customer? @relation(fields: [customerId], references: [id])
+  staffId    String?
+  staff      Staff?    @relation(fields: [staffId], references: [id])
+
+  expiresAt   DateTime
+  revokedAt   DateTime?
+  /** If rotated, points at the row that replaced this one */
+  replacedById String?
+
+  createdAt  DateTime  @default(now())
+  lastUsedAt DateTime?
+
+  /** Optional UA / IP captured at issue time for audit */
+  userAgent String?
+  ipAddress String?
+
+  @@index([customerId])
+  @@index([staffId])
+  @@index([expiresAt])
+}

@@ -1,0 +1,26 @@
+enum DevicePlatform {
+  IOS
+  ANDROID
+  WEB
+}
+
+model PushToken {
+  id       String         @id @default(uuid())
+  token    String         @unique
+  platform DevicePlatform
+
+  customerId String?
+  customer   Customer? @relation(fields: [customerId], references: [id])
+
+  staffId String?
+  staff   Staff?  @relation(fields: [staffId], references: [id])
+
+  isActive   Boolean   @default(true)
+  lastUsedAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([customerId])
+  @@index([staffId])
+}

@@ -1,0 +1,63 @@
+enum LoadingRequestStatus {
+  PENDING_ASSIGNMENT
+  ASSIGNED
+  LOADING_IN_PROGRESS
+  COMPLETED
+  CANCELLED
+}
+
+model LoadingRequest {
+  id        String @id @default(uuid())
+  reference String @unique
+
+  customerId String
+  customer   Customer @relation(fields: [customerId], references: [id])
+
+  region Region
+
+  linkedPurchaseId String?
+  linkedPurchase   Purchase? @relation(fields: [linkedPurchaseId], references: [id])
+
+  truckPlateNumber     String
+  driverName           String
+  driverPhone          String
+  requestedLoadingDate DateTime
+  quantityCartons      Int?
+  destination          String?
+
+  termsAcceptedAt DateTime
+  externalFormUrl String?
+
+  status LoadingRequestStatus @default(PENDING_ASSIGNMENT)
+
+  assignedOfficerId String?
+  assignedOfficer   Staff?    @relation("LoadingOfficerToRequest", fields: [assignedOfficerId], references: [id])
+  assignedAt        DateTime?
+  assignedById      String?
+
+  loadingStartedAt DateTime?
+  completedAt      DateTime?
+
+  waybillDocumentUrl String?
+  notes              String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([customerId])
+  @@index([region])
+  @@index([assignedOfficerId])
+  @@index([status])
+}
+
+model TermsAcceptance {
+  id           String   @id @default(uuid())
+  customerId   String
+  customer     Customer @relation(fields: [customerId], references: [id])
+  termsVersion String
+  acceptedAt   DateTime @default(now())
+  ipAddress    String?
+  userAgent    String?
+
+  @@index([customerId])
+}

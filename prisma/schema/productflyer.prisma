@@ -1,0 +1,14 @@
+model ProductFlyer {
+  id        String  @id @default(uuid())
+  name      String
+  imageUrl  String
+  sortOrder Int     @default(0)
+  isActive  Boolean @default(true)
+
+  createdById String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([sortOrder])
+  @@index([isActive])
+}

@@ -1,0 +1,10 @@
+node_modules/
+dist/
+.env
+.env.local
+.env.*.local
+*.log
+.DS_Store
+
+# Probe output — may contain real ERP customer data once `npm run probe` runs.
+probe-output.json
