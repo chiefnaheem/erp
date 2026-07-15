@@ -55,12 +55,12 @@ export class SyncScheduler {
       INSERT INTO erp_raw.sync_lock (name, locked_until, locked_by, acquired_at)
       VALUES (
         ${LOCK_NAME},
-        now() + make_interval(mins => ${leaseMinutes}),
+        (now() + (${leaseMinutes}::int * interval '1 minute')),
         ${this.owner},
         now()
       )
       ON CONFLICT (name) DO UPDATE SET
-        locked_until = now() + make_interval(mins => ${leaseMinutes}),
+        locked_until = (now() + (${leaseMinutes}::int * interval '1 minute')),
         locked_by    = ${this.owner},
         acquired_at  = now()
       -- Only steal the lock once the previous holder's lease has expired. This is
