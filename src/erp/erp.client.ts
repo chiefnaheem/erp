@@ -16,6 +16,23 @@ import {
 /** Stop runaway pagination if the ERP never returns a short page. */
 const MAX_PAGES = 10_000;
 
+/**
+ * The ERP issues a DIFFERENT digi-key per object. A method name is
+ * `yvijucrm.<object>.<action>`, and the key is per <object> (shared by that
+ * object's .query and .read). This maps each object to its env var; anything not
+ * listed or not set falls back to the general ERP_API_KEY.
+ */
+const OBJECT_KEY_ENV: Record<string, string> = {
+  customer: 'ERP_API_KEY_CUSTOMER',
+  customer_credit: 'ERP_API_KEY_CUSTOMER_CREDIT',
+  sales_order_doc: 'ERP_API_KEY_SALES_ORDER',
+  sales_delivery: 'ERP_API_KEY_SALES_DELIVERY',
+  sales_return: 'ERP_API_KEY_SALES_RETURN',
+  collection_doc: 'ERP_API_KEY_COLLECTION',
+  ar_refund_doc: 'ERP_API_KEY_AR_REFUND',
+  other_receivable_doc: 'ERP_API_KEY_OTHER_RECEIVABLE',
+};
+
 @Injectable()
 export class ErpClient {
   private readonly logger = new Logger(ErpClient.name);
@@ -215,6 +232,19 @@ export class ErpClient {
   }
 
   /**
+   * The digi-key for a method's object. The ERP issues one key per object, so
+   * `yvijucrm.customer.query` and `yvijucrm.customer.read` share the customer
+   * key, while a sales order uses a different one. Falls back to the general
+   * ERP_API_KEY for any object without its own key configured.
+   */
+  private apiKeyFor(method: ErpMethod): string {
+    const object = method.split('.')[1] ?? '';
+    const envName = OBJECT_KEY_ENV[object];
+    const specific = envName ? this.config.get<string>(envName)?.trim() : undefined;
+    return specific || this.config.getOrThrow<string>('ERP_API_KEY');
+  }
+
+  /**
    * Built per request, not once: digi-service carries the method name and
    * digi-host carries a fresh timestamp.
    */
@@ -241,7 +271,7 @@ export class ErpClient {
     };
 
     return {
-      'digi-key': this.config.getOrThrow<string>('ERP_API_KEY'),
+      'digi-key': this.apiKeyFor(method),
       'digi-host': JSON.stringify(digiHost),
       'digi-service': JSON.stringify(digiService),
       'digi-data-exchange-protocol': '1.0',

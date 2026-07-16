@@ -95,6 +95,25 @@ describe('ErpClient', () => {
     expect(host.timestamp).toEqual(expect.any(String));
   });
 
+  it('uses the object-specific digi-key, falling back to ERP_API_KEY', async () => {
+    const client = await build({
+      ERP_API_KEY: 'fallback-key',
+      ERP_API_KEY_CUSTOMER: 'customer-key',
+      ERP_API_KEY_SALES_ORDER: 'order-key',
+      // no ERP_API_KEY_COLLECTION → collection must fall back
+    });
+
+    await client.query(ERP_METHOD.CUSTOMER_QUERY);
+    await client.query(ERP_METHOD.SALES_ORDER_QUERY);
+    await client.query(ERP_METHOD.COLLECTION_QUERY);
+    await client.read(ERP_METHOD.CUSTOMER_READ, [{ CUSTOMER_CODE: 'C1' }]);
+
+    expect(calls[0].headers['digi-key']).toBe('customer-key'); // customer.query
+    expect(calls[1].headers['digi-key']).toBe('order-key'); // sales_order.query
+    expect(calls[2].headers['digi-key']).toBe('fallback-key'); // collection → fallback
+    expect(calls[3].headers['digi-key']).toBe('customer-key'); // customer.READ shares the key
+  });
+
   it('wraps the request in a std_data envelope', async () => {
     const client = await build();
     await client.query(ERP_METHOD.CUSTOMER_QUERY, { pageNo: 3, pageSize: 50 });

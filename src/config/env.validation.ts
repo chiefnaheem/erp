@@ -38,10 +38,48 @@ export class EnvVars {
   @IsUrl({ require_tld: false })
   ERP_BASE_URL: string;
 
-  // Sent as the `digi-key` header on every call.
+  // Fallback digi-key, used for any object that has no object-specific key set.
+  // The ERP issues a DIFFERENT key per object, so the per-object keys below take
+  // precedence; this is the default for anything not overridden.
   @IsString()
   @IsNotEmpty()
   ERP_API_KEY: string;
+
+  // ── Per-object digi-keys ────────────────────────────────────────────────
+  // The ERP gives each object its own API key. Set the ones you have; any left
+  // unset fall back to ERP_API_KEY above. Names match the object, not the method
+  // (the same key is used for that object's .query and .read).
+  @IsString()
+  @IsOptional()
+  ERP_API_KEY_CUSTOMER?: string;
+
+  @IsString()
+  @IsOptional()
+  ERP_API_KEY_CUSTOMER_CREDIT?: string;
+
+  @IsString()
+  @IsOptional()
+  ERP_API_KEY_SALES_ORDER?: string;
+
+  @IsString()
+  @IsOptional()
+  ERP_API_KEY_SALES_DELIVERY?: string;
+
+  @IsString()
+  @IsOptional()
+  ERP_API_KEY_SALES_RETURN?: string;
+
+  @IsString()
+  @IsOptional()
+  ERP_API_KEY_COLLECTION?: string;
+
+  @IsString()
+  @IsOptional()
+  ERP_API_KEY_AR_REFUND?: string;
+
+  @IsString()
+  @IsOptional()
+  ERP_API_KEY_OTHER_RECEIVABLE?: string;
 
   // Echoed inside the digi-host / digi-service JSON headers.
   @IsString()
