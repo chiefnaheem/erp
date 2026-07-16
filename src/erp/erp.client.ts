@@ -45,8 +45,18 @@ export class ErpClient {
       orders: options.orders ?? [],
     });
 
+    const rows = parameter.body.rows ?? [];
+
+    // Success log so a running sync shows exactly what each query fetched: the
+    // method, which page, how many rows, and a compact preview of the first row
+    // so we can confirm real data (and its shape) is coming back.
+    this.logger.log(
+      `${method} p${pageNo} (size ${pageSize}): fetched ${rows.length} row(s)` +
+        (rows.length ? ` — sample: ${this.preview(rows[0])}` : ''),
+    );
+
     return {
-      rows: parameter.body.rows ?? [],
+      rows,
       pageNo,
       pageSize,
       total: this.extractTotal(parameter.body),
@@ -156,7 +166,8 @@ export class ErpClient {
             timeout: this.config.getOrThrow<number>('ERP_TIMEOUT_MS'),
             // Never throw on status — business errors arrive as 200 and real
             // HTTP errors are classified below.
-            validateStatus: () => true,
+            validateStatus: () => true,          
+
           }),
         ).then((response) => {
           if (response.status >= 500) {
@@ -239,6 +250,13 @@ export class ErpClient {
       if (typeof value === 'string' && /^\d+$/.test(value)) return Number(value);
     }
     return null;
+  }
+
+  /** A compact, log-safe one-line preview of a fetched row. */
+  private preview(row: unknown): string {
+    const text = JSON.stringify(row);
+    if (text === undefined) return String(row);
+    return text.length > 300 ? `${text.slice(0, 300)}…` : text;
   }
 
   private describe(error: unknown): string {

@@ -1,5 +1,6 @@
 import { createServer, Server } from 'node:http';
 import { AddressInfo } from 'node:net';
+import { Logger } from '@nestjs/common';
 import { HttpModule } from '@nestjs/axios';
 import { ConfigModule } from '@nestjs/config';
 import { Test } from '@nestjs/testing';
@@ -200,6 +201,28 @@ describe('ErpClient', () => {
     }
     expect(seen).toHaveLength(0);
     expect(calls).toHaveLength(1);
+  });
+
+  it('logs a success line with row count and a data sample', async () => {
+    respond = () => ({
+      status: 200,
+      body: {
+        std_data: {
+          execution: { code: '0' },
+          parameter: { rows: [{ CUSTOMER_CODE: 'CODE_1', CUSTOMER_FULL_NAME: 'Acme Ltd' }] },
+        },
+      },
+    });
+
+    const logSpy = jest.spyOn(Logger.prototype, 'log').mockImplementation(() => undefined);
+    const client = await build();
+    await client.query(ERP_METHOD.CUSTOMER_QUERY, { pageNo: 1 });
+
+    const logged = logSpy.mock.calls.map((c) => String(c[0])).join('\n');
+    expect(logged).toMatch(/yvijucrm\.customer\.query p1/);
+    expect(logged).toMatch(/fetched 1 row/);
+    expect(logged).toMatch(/Acme Ltd/); // the actual data appears in the log
+    logSpy.mockRestore();
   });
 
   it('unwraps read() results from parameter.result.success', async () => {
