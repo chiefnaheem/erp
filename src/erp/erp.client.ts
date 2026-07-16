@@ -154,15 +154,27 @@ export class ErpClient {
   ): Promise<AxiosResponse> {
     const maxRetries = this.config.getOrThrow<number>('ERP_MAX_RETRIES');
     const url = this.config.getOrThrow<string>('ERP_BASE_URL');
+    const verbose = this.config.get<boolean>('ERP_VERBOSE');
     const body = { std_data: { parameter } };
 
     let lastError: unknown;
 
     for (let attempt = 1; attempt <= maxRetries + 1; attempt++) {
+      const headers = this.buildHeaders(method);
+
+      if (verbose) {
+        // digi-key is the API secret — redact it so a verbose log can't leak it.
+        this.logger.log(
+          `→ ${method} POST ${url} (attempt ${attempt})\n` +
+            `  headers: ${JSON.stringify(this.redactHeaders(headers))}\n` +
+            `  body: ${JSON.stringify(body)}`,
+        );
+      }
+
       try {
         return await firstValueFrom(
           this.http.post(url, body, {
-            headers: this.buildHeaders(method),
+            headers,
             timeout: this.config.getOrThrow<number>('ERP_TIMEOUT_MS'),
             // Never throw on status — business errors arrive as 200 and real
             // HTTP errors are classified below.
@@ -241,7 +253,7 @@ export class ErpClient {
   /**
    * The total-count field name is not documented. Rather than guess one, look
    * for any plausible numeric key so `isGetCount` still gives us something, and
-   * return null when it doesn't.
+   * return null when it doesn't
    */
   private extractTotal(body: Record<string, unknown>): number | null {
     for (const key of ['count', 'totalCount', 'total', 'recordCount', 'totalRows']) {
@@ -250,6 +262,18 @@ export class ErpClient {
       if (typeof value === 'string' && /^\d+$/.test(value)) return Number(value);
     }
     return null;
+  }
+
+  /**
+   * Copy of the headers with the digi-key (the API secret) masked. Verbose
+   * logging must never write the raw key to a log file.
+   */
+  private redactHeaders(headers: Record<string, string>): Record<string, string> {
+    const key = headers['digi-key'];
+    const masked = key
+      ? `***${key.slice(-4)} (len ${key.length})`
+      : String(key);
+    return { ...headers, 'digi-key': masked };
   }
 
   /** A compact, log-safe one-line preview of a fetched row. */

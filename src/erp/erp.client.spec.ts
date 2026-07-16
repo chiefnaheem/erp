@@ -45,7 +45,7 @@ describe('ErpClient', () => {
 
   afterEach(() => new Promise<void>((resolve) => server.close(() => resolve())));
 
-  const build = async () => {
+  const build = async (extra: Record<string, unknown> = {}) => {
     const moduleRef = await Test.createTestingModule({
       imports: [
         HttpModule,
@@ -64,6 +64,7 @@ describe('ErpClient', () => {
               ERP_TIMEOUT_MS: 2000,
               ERP_MAX_RETRIES: 2,
               ERP_PAGE_SIZE: 2,
+              ...extra,
             }),
           ],
         }),
@@ -222,6 +223,32 @@ describe('ErpClient', () => {
     expect(logged).toMatch(/yvijucrm\.customer\.query p1/);
     expect(logged).toMatch(/fetched 1 row/);
     expect(logged).toMatch(/Acme Ltd/); // the actual data appears in the log
+    logSpy.mockRestore();
+  });
+
+  it('verbose mode logs the request headers + body, with the API key redacted', async () => {
+    const logSpy = jest.spyOn(Logger.prototype, 'log').mockImplementation(() => undefined);
+    const client = await build({ ERP_VERBOSE: true });
+    await client.query(ERP_METHOD.CUSTOMER_QUERY, { pageNo: 1 });
+
+    const logged = logSpy.mock.calls.map((c) => String(c[0])).join('\n');
+    // The outgoing request is logged: method, headers, and the std_data body.
+    expect(logged).toMatch(/→ yvijucrm\.customer\.query POST/);
+    expect(logged).toMatch(/"digi-service"/);
+    expect(logged).toMatch(/"std_data"/);
+    // The raw API key must NOT appear — only the redacted form.
+    expect(logged).not.toMatch(/test-key/);
+    expect(logged).toMatch(/\*\*\*-key \(len 8\)/);
+    logSpy.mockRestore();
+  });
+
+  it('does NOT log the request body when verbose is off', async () => {
+    const logSpy = jest.spyOn(Logger.prototype, 'log').mockImplementation(() => undefined);
+    const client = await build(); // ERP_VERBOSE defaults off
+    await client.query(ERP_METHOD.CUSTOMER_QUERY, { pageNo: 1 });
+
+    const logged = logSpy.mock.calls.map((c) => String(c[0])).join('\n');
+    expect(logged).not.toMatch(/→ yvijucrm/); // no request-line log
     logSpy.mockRestore();
   });
 

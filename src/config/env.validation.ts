@@ -90,6 +90,14 @@ export class EnvVars {
   @Transform(toInt)
   ERP_PAGE_SIZE: number = 100;
 
+  // Verbose request logging: when true, every ERP call logs its method, URL,
+  // headers (with digi-key redacted), and full request body. Useful while
+  // bringing up the integration; leave off in normal operation.
+  @IsBoolean()
+  @IsOptional()
+  @Transform(toBool)
+  ERP_VERBOSE: boolean = false;
+
   // Master kill switch: when false the app boots and serves /health but runs no
   // sync jobs. Lets us deploy the worker before the ERP is reachable.
   @IsBoolean()
