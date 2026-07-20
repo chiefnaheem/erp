@@ -31,18 +31,41 @@ abstract class IngestJob extends SyncJob {
   protected async execute(): Promise<JobStats> {
     let fetched = 0;
     let changed = 0;
+    let pageNo = 0;
+
+    const table = this.raw.tableFor(this.objectType);
+    this.logger.log(
+      `${this.name}: sweeping ${this.method} → dumping into erp_raw.${table}`,
+    );
 
     // The ERP has no delta support, so this is a FULL sweep every cycle. We page
     // through and hash rather than hold the whole table in memory — content
     // hashing is what keeps the cost of re-reading everything acceptable.
     for await (const page of this.erp.queryAll<Record<string, unknown>>(this.method)) {
+      pageNo++;
       const result = await this.raw.upsertMany(this.objectType, page, (row) =>
         this.keyOf(row),
       );
       fetched += result.fetched;
       changed += result.changed;
 
+      // Per-page storage line so each endpoint's fetch→store is visible: how many
+      // rows this page had, how many were new/changed, and where they landed.
+      this.logger.log(
+        `${this.name}: page ${pageNo} — stored ${result.fetched} row(s) ` +
+          `(${result.changed} new/changed) into erp_raw.${table}`,
+      );
+
       await this.afterPage(page);
+    }
+
+    if (pageNo === 0) {
+      this.logger.log(`${this.name}: ${this.method} returned no rows`);
+    } else {
+      this.logger.log(
+        `${this.name}: done — ${fetched} row(s) total, ${changed} new/changed, ` +
+          `across ${pageNo} page(s) into erp_raw.${table}`,
+      );
     }
 
     return { fetched, changed };

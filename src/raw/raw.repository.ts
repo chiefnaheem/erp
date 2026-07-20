@@ -60,6 +60,11 @@ export class RawRepository {
     return name;
   }
 
+  /** Public accessor for the object's raw table name — used in logging. */
+  tableFor(objectType: ErpObjectType): string {
+    return this.table(objectType);
+  }
+
   /**
    * Canonical hash of an ERP payload.
    *
