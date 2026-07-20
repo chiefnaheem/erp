@@ -108,6 +108,19 @@ export class EnvVars {
   @IsOptional()
   ERP_LANG: string = 'zh_CN';
 
+  // The ERP was observed to require a python-requests-style User-Agent to
+  // respond; some gateways reject an unknown/blank UA. Overridable.
+  @IsString()
+  @IsOptional()
+  ERP_USER_AGENT: string = 'python-requests/2.34.2';
+
+  // Optional explicit Host header (e.g. "192.168.25.241:9900"). Normally the HTTP
+  // client derives Host from ERP_BASE_URL; set this only if the server needs a
+  // Host that differs from the URL (e.g. behind a proxy or IP-based vhost).
+  @IsString()
+  @IsOptional()
+  ERP_HOST_HEADER?: string;
+
   @IsInt()
   @Min(1000)
   @IsOptional()

@@ -270,14 +270,26 @@ export class ErpClient {
       id: '03_External',
     };
 
-    return {
+    const headers: Record<string, string> = {
       'digi-key': this.apiKeyFor(method),
       'digi-host': JSON.stringify(digiHost),
       'digi-service': JSON.stringify(digiService),
       'digi-data-exchange-protocol': '1.0',
       'digi-type': 'sync',
       'Content-Type': 'application/json',
+      // These make the ERP gateway respond — it was observed to require a
+      // recognised User-Agent and an explicit Accept.
+      Accept: '*/*',
+      'User-Agent': this.config.getOrThrow<string>('ERP_USER_AGENT'),
+      Connection: 'keep-alive',
     };
+
+    // Only override Host when explicitly configured; otherwise the HTTP client
+    // sets it correctly from the URL.
+    const hostHeader = this.config.get<string>('ERP_HOST_HEADER');
+    if (hostHeader) headers.Host = hostHeader;
+
+    return headers;
   }
 
   /**

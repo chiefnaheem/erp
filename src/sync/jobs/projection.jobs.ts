@@ -61,7 +61,7 @@ export class CustomerProjectionJob extends SyncJob {
 
       if (!resolved.name) {
         skipped++;
-        await this.raw.markProjectFailed(record.id, 'ERP row has no customer name');
+        await this.raw.markProjectFailed('CUSTOMER', record.id, 'ERP row has no customer name');
         continue;
       }
 
@@ -96,6 +96,7 @@ export class CustomerProjectionJob extends SyncJob {
         skipped++;
         sawMissingPhone = true;
         await this.raw.markProjectFailed(
+          'CUSTOMER',
           record.id,
           'No app customer, and no ERP_CUSTOMER_PHONE_FIELD configured — cannot create (need phone + region).',
         );
@@ -105,6 +106,7 @@ export class CustomerProjectionJob extends SyncJob {
       if (!resolved.phone || !resolved.region) {
         skipped++;
         await this.raw.markProjectFailed(
+          'CUSTOMER',
           record.id,
           `Cannot create: ${!resolved.phone ? 'phone' : 'region'} missing from ERP payload ` +
             `(phoneField=${fieldMap.phoneField}, regionField=${fieldMap.regionField}).`,
@@ -142,7 +144,7 @@ export class CustomerProjectionJob extends SyncJob {
       projected++;
     }
 
-    await this.raw.markProjected(done);
+    await this.raw.markProjected('CUSTOMER', done);
 
     if (created) this.logger.log(`created ${created} new customer(s) from ERP`);
     if (sawMissingPhone) {
@@ -187,7 +189,7 @@ export class PurchaseProjectionJob extends SyncJob {
       const guid = payload.CUSTOMER_ID as string | undefined;
       if (!guid) {
         skipped++;
-        await this.raw.markProjectFailed(record.id, 'ERP order has no CUSTOMER_ID');
+        await this.raw.markProjectFailed('SALES_ORDER', record.id, 'ERP order has no CUSTOMER_ID');
         continue;
       }
 
@@ -195,6 +197,7 @@ export class PurchaseProjectionJob extends SyncJob {
       if (!code) {
         skipped++;
         await this.raw.markProjectFailed(
+          'SALES_ORDER',
           record.id,
           `CUSTOMER_ID ${guid} not in customer_link — run ingest:customer first`,
         );
@@ -208,6 +211,7 @@ export class PurchaseProjectionJob extends SyncJob {
       if (!customer) {
         skipped++;
         await this.raw.markProjectFailed(
+          'SALES_ORDER',
           record.id,
           `No app customer for erpId ${code} — not onboarded yet`,
         );
@@ -222,6 +226,7 @@ export class PurchaseProjectionJob extends SyncJob {
         skipped++;
         unmappedStatuses.add(String(payload.ApproveStatus));
         await this.raw.markProjectFailed(
+          'SALES_ORDER',
           record.id,
           `Unmapped ApproveStatus "${String(payload.ApproveStatus)}" — add it to ERP_STATUS_MAP`,
         );
@@ -231,14 +236,14 @@ export class PurchaseProjectionJob extends SyncJob {
       const orderDate = toDate(payload.ORDER_DATE) ?? toDate(payload.DOC_DATE);
       if (!orderDate) {
         skipped++;
-        await this.raw.markProjectFailed(record.id, 'ERP order has no usable date');
+        await this.raw.markProjectFailed('SALES_ORDER', record.id, 'ERP order has no usable date');
         continue;
       }
 
       const totalValue = purchaseTotalValue(payload);
       if (totalValue === null) {
         skipped++;
-        await this.raw.markProjectFailed(record.id, 'ERP order has no AMT_UNINCLUDE_TAX_OC');
+        await this.raw.markProjectFailed('SALES_ORDER', record.id, 'ERP order has no AMT_UNINCLUDE_TAX_OC');
         continue;
       }
 
@@ -267,7 +272,7 @@ export class PurchaseProjectionJob extends SyncJob {
       projected++;
     }
 
-    await this.raw.markProjected(done);
+    await this.raw.markProjected('SALES_ORDER', done);
 
     if (unmappedStatuses.size) {
       this.logger.error(

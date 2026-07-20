@@ -64,6 +64,7 @@ describe('ErpClient', () => {
               ERP_TIMEOUT_MS: 2000,
               ERP_MAX_RETRIES: 2,
               ERP_PAGE_SIZE: 2,
+              ERP_USER_AGENT: 'python-requests/2.34.2',
               ...extra,
             }),
           ],

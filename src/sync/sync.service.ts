@@ -6,11 +6,14 @@ import {
   StockProjectionJob,
 } from './jobs/blocked.jobs';
 import {
+  ArRefundIngestJob,
   CollectionIngestJob,
   CustomerCreditIngestJob,
   CustomerIngestJob,
+  OtherReceivableIngestJob,
   SalesDeliveryIngestJob,
   SalesOrderIngestJob,
+  SalesReturnIngestJob,
 } from './jobs/ingest.jobs';
 import {
   CustomerProjectionJob,
@@ -29,6 +32,9 @@ export class SyncService {
     private readonly collectionIngest: CollectionIngestJob,
     private readonly salesDeliveryIngest: SalesDeliveryIngestJob,
     private readonly customerCreditIngest: CustomerCreditIngestJob,
+    private readonly salesReturnIngest: SalesReturnIngestJob,
+    private readonly arRefundIngest: ArRefundIngestJob,
+    private readonly otherReceivableIngest: OtherReceivableIngestJob,
     private readonly customerProjection: CustomerProjectionJob,
     private readonly purchaseProjection: PurchaseProjectionJob,
     private readonly stockProjection: StockProjectionJob,
@@ -64,6 +70,9 @@ export class SyncService {
       this.collectionIngest,
       this.salesDeliveryIngest,
       this.customerCreditIngest,
+      this.salesReturnIngest,
+      this.arRefundIngest,
+      this.otherReceivableIngest,
 
       // ── Project: erp_raw → public ──
       this.customerProjection, // must precede purchases (FK)

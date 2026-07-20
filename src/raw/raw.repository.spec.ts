@@ -27,7 +27,7 @@ describe('RawRepository (integration)', () => {
 
   afterAll(async () => {
     await prisma.$executeRawUnsafe(
-      `DELETE FROM erp_raw.raw_record WHERE erp_key LIKE 'TEST_%'`,
+      `DELETE FROM erp_raw.raw_sales_order WHERE erp_key LIKE 'TEST_%'`,
     );
     await prisma.$executeRawUnsafe(
       `DELETE FROM erp_raw.customer_link WHERE erp_customer_guid LIKE 'TEST_%'`,
@@ -38,7 +38,7 @@ describe('RawRepository (integration)', () => {
 
   beforeEach(async () => {
     await prisma.$executeRawUnsafe(
-      `DELETE FROM erp_raw.raw_record WHERE erp_key LIKE 'TEST_%'`,
+      `DELETE FROM erp_raw.raw_sales_order WHERE erp_key LIKE 'TEST_%'`,
     );
   });
 
@@ -107,7 +107,7 @@ describe('RawRepository (integration)', () => {
     const [pending] = await repo.pendingProjection('SALES_ORDER');
     expect(pending.erp_key).toBe('TEST_1');
 
-    await repo.markProjected([pending.id]);
+    await repo.markProjected('SALES_ORDER', [pending.id]);
     expect(await repo.pendingProjection('SALES_ORDER')).toHaveLength(0);
 
     // An identical sweep must NOT put it back in the queue...

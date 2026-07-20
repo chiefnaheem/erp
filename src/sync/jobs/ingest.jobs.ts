@@ -128,3 +128,39 @@ export class CustomerCreditIngestJob extends IngestJob {
     return row.CUSTOMER_CREDIT_ID as string | undefined;
   }
 }
+
+// The three below are dump-only (no projection yet): we capture every response
+// so all endpoints land in their own table, ready if/when we need them.
+
+@Injectable()
+export class SalesReturnIngestJob extends IngestJob {
+  readonly name = 'ingest:sales_return';
+  protected readonly method = ERP_METHOD.SALES_RETURN_QUERY;
+  protected readonly objectType: ErpObjectType = 'SALES_RETURN';
+
+  protected keyOf(row: Record<string, unknown>) {
+    return row.DOC_NO as string | undefined;
+  }
+}
+
+@Injectable()
+export class ArRefundIngestJob extends IngestJob {
+  readonly name = 'ingest:ar_refund';
+  protected readonly method = ERP_METHOD.AR_REFUND_QUERY;
+  protected readonly objectType: ErpObjectType = 'AR_REFUND';
+
+  protected keyOf(row: Record<string, unknown>) {
+    return row.DOC_NO as string | undefined;
+  }
+}
+
+@Injectable()
+export class OtherReceivableIngestJob extends IngestJob {
+  readonly name = 'ingest:other_receivable';
+  protected readonly method = ERP_METHOD.OTHER_RECEIVABLE_QUERY;
+  protected readonly objectType: ErpObjectType = 'OTHER_RECEIVABLE';
+
+  protected keyOf(row: Record<string, unknown>) {
+    return row.DOC_NO as string | undefined;
+  }
+}

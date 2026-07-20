@@ -68,6 +68,7 @@ describe('Sync cycle (e2e)', () => {
               ERP_ACCOUNT: 'CRM',
               ERP_TIMEZONE: '+8',
               ERP_LANG: 'zh_CN',
+              ERP_USER_AGENT: 'python-requests/2.34.2',
               ERP_TIMEOUT_MS: 5000,
               ERP_MAX_RETRIES: 0,
               ERP_PAGE_SIZE: 100,
@@ -103,7 +104,10 @@ describe('Sync cycle (e2e)', () => {
     await prisma.purchase.deleteMany({ where: { erpId: { startsWith: 'TEST_E2E_' } } });
     await prisma.customer.deleteMany({ where: { erpId: { startsWith: 'TEST_E2E_' } } });
     await prisma.$executeRawUnsafe(
-      `DELETE FROM erp_raw.raw_record WHERE erp_key LIKE 'TEST_E2E_%'`,
+      `DELETE FROM erp_raw.raw_customer WHERE erp_key LIKE 'TEST_E2E_%'`,
+    );
+    await prisma.$executeRawUnsafe(
+      `DELETE FROM erp_raw.raw_sales_order WHERE erp_key LIKE 'TEST_E2E_%'`,
     );
     await prisma.$executeRawUnsafe(
       `DELETE FROM erp_raw.customer_link WHERE erp_customer_guid LIKE 'TEST_E2E_%'`,
@@ -132,10 +136,15 @@ describe('Sync cycle (e2e)', () => {
     config.set('ERP_STATUS_MAP', undefined);
   });
 
+  // type → per-object table (only the two the e2e inspects).
+  const RAW_TABLE: Record<string, string> = {
+    CUSTOMER: 'raw_customer',
+    SALES_ORDER: 'raw_sales_order',
+  };
   const rawRow = async (type: string, key: string) =>
     (
       await prisma.$queryRawUnsafe<any[]>(
-        `SELECT * FROM erp_raw.raw_record WHERE object_type = '${type}' AND erp_key = '${key}'`,
+        `SELECT * FROM erp_raw.${RAW_TABLE[type]} WHERE erp_key = '${key}'`,
       )
     )[0];
 

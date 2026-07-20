@@ -7,11 +7,14 @@ import {
   StockProjectionJob,
 } from './jobs/blocked.jobs';
 import {
+  ArRefundIngestJob,
   CollectionIngestJob,
   CustomerCreditIngestJob,
   CustomerIngestJob,
+  OtherReceivableIngestJob,
   SalesDeliveryIngestJob,
   SalesOrderIngestJob,
+  SalesReturnIngestJob,
 } from './jobs/ingest.jobs';
 import {
   CustomerProjectionJob,
@@ -28,6 +31,9 @@ import { SyncService } from './sync.service';
     CollectionIngestJob,
     SalesDeliveryIngestJob,
     CustomerCreditIngestJob,
+    SalesReturnIngestJob,
+    ArRefundIngestJob,
+    OtherReceivableIngestJob,
     CustomerProjectionJob,
     PurchaseProjectionJob,
     StockProjectionJob,

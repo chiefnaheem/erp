@@ -1,6 +1,5 @@
 import { createHash } from 'node:crypto';
 import { Injectable, Logger } from '@nestjs/common';
-import { Prisma } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 
 export type ErpObjectType =
@@ -8,7 +7,28 @@ export type ErpObjectType =
   | 'CUSTOMER_CREDIT'
   | 'SALES_ORDER'
   | 'SALES_DELIVERY'
-  | 'COLLECTION';
+  | 'SALES_RETURN'
+  | 'COLLECTION'
+  | 'AR_REFUND'
+  | 'OTHER_RECEIVABLE';
+
+/**
+ * Each ERP object is dumped into its OWN table under erp_raw, so every
+ * endpoint's responses land separately (raw_customer, raw_sales_order, …).
+ *
+ * This is also the injection guard: table names in the dynamic SQL below only
+ * ever come from this fixed map, never from anything user- or ERP-supplied.
+ */
+const RAW_TABLE: Record<ErpObjectType, string> = {
+  CUSTOMER: 'raw_customer',
+  CUSTOMER_CREDIT: 'raw_customer_credit',
+  SALES_ORDER: 'raw_sales_order',
+  SALES_DELIVERY: 'raw_sales_delivery',
+  SALES_RETURN: 'raw_sales_return',
+  COLLECTION: 'raw_collection',
+  AR_REFUND: 'raw_ar_refund',
+  OTHER_RECEIVABLE: 'raw_other_receivable',
+};
 
 export interface RawUpsertResult {
   /** Rows the ERP handed us this sweep. */
@@ -33,6 +53,13 @@ export class RawRepository {
 
   constructor(private readonly prisma: PrismaService) {}
 
+  /** The (allowlisted) bare table name for an object. Throws on an unknown type. */
+  private table(objectType: ErpObjectType): string {
+    const name = RAW_TABLE[objectType];
+    if (!name) throw new Error(`Unknown ERP object type: ${objectType}`);
+    return name;
+  }
+
   /**
    * Canonical hash of an ERP payload.
    *
@@ -45,7 +72,7 @@ export class RawRepository {
   }
 
   /**
-   * Store a sweep's worth of ERP rows.
+   * Store a sweep's worth of ERP rows into the object's own table.
    *
    * Unchanged rows have their last_seen_at bumped but are NOT marked for
    * re-projection. Changed rows have projected_at reset to NULL, which is what
@@ -56,6 +83,7 @@ export class RawRepository {
     rows: Record<string, unknown>[],
     keyOf: (row: Record<string, unknown>) => string | undefined,
   ): Promise<RawUpsertResult> {
+    const t = this.table(objectType); // bare name, e.g. raw_customer
     let changed = 0;
     let fetched = 0;
 
@@ -74,35 +102,42 @@ export class RawRepository {
             return [];
           }
 
-          // A single per-call timestamp is what makes change detection exact:
+          // A single per-row timestamp is what makes change detection exact:
           // the row we get back reports changed_at === stamp only if it was
           // inserted or its hash genuinely moved.
           const stamp = new Date();
 
+          // Table name is from the RAW_TABLE allowlist (never user input), so
+          // interpolating it is safe; every value is a bound parameter.
           return [
-            this.prisma.$queryRaw<{ changed: boolean }[]>`
-              INSERT INTO erp_raw.raw_record
+            this.prisma.$queryRawUnsafe<{ changed: boolean }[]>(
+              `
+              INSERT INTO erp_raw.${t}
                 (object_type, erp_key, payload, content_hash,
                  first_seen_at, last_seen_at, changed_at)
               VALUES
-                (${objectType}, ${key}, ${JSON.stringify(row)}::jsonb,
-                 ${RawRepository.hash(row)}, ${stamp}, ${stamp}, ${stamp})
+                ($1, $2, $3::jsonb, $4, $5, $5, $5)
               ON CONFLICT (object_type, erp_key) DO UPDATE SET
-                last_seen_at = ${stamp},
+                last_seen_at = $5,
                 payload      = EXCLUDED.payload,
                 content_hash = EXCLUDED.content_hash,
                 changed_at = CASE
-                  WHEN raw_record.content_hash IS DISTINCT FROM EXCLUDED.content_hash
-                  THEN ${stamp} ELSE raw_record.changed_at END,
-                -- Resetting projected_at is what re-queues a changed row.
+                  WHEN ${t}.content_hash IS DISTINCT FROM EXCLUDED.content_hash
+                  THEN $5 ELSE ${t}.changed_at END,
                 projected_at = CASE
-                  WHEN raw_record.content_hash IS DISTINCT FROM EXCLUDED.content_hash
-                  THEN NULL ELSE raw_record.projected_at END,
+                  WHEN ${t}.content_hash IS DISTINCT FROM EXCLUDED.content_hash
+                  THEN NULL ELSE ${t}.projected_at END,
                 project_error = CASE
-                  WHEN raw_record.content_hash IS DISTINCT FROM EXCLUDED.content_hash
-                  THEN NULL ELSE raw_record.project_error END
-              RETURNING (changed_at = ${stamp}) AS changed
-            `,
+                  WHEN ${t}.content_hash IS DISTINCT FROM EXCLUDED.content_hash
+                  THEN NULL ELSE ${t}.project_error END
+              RETURNING (changed_at = $5) AS changed
+              `,
+              objectType,
+              key,
+              JSON.stringify(row),
+              RawRepository.hash(row),
+              stamp,
+            ),
           ];
         }),
       );
@@ -121,34 +156,44 @@ export class RawRepository {
     objectType: ErpObjectType,
     limit = 500,
   ): Promise<PendingRecord[]> {
-    return this.prisma.$queryRaw<PendingRecord[]>`
+    const t = this.table(objectType);
+    return this.prisma.$queryRawUnsafe<PendingRecord[]>(
+      `
       SELECT id, erp_key, payload
-      FROM erp_raw.raw_record
-      WHERE object_type = ${objectType} AND projected_at IS NULL
+      FROM erp_raw.${t}
+      WHERE projected_at IS NULL
       ORDER BY changed_at ASC
-      LIMIT ${limit}
-    `;
+      LIMIT $1
+      `,
+      limit,
+    );
   }
 
-  async markProjected(ids: bigint[]): Promise<void> {
+  async markProjected(objectType: ErpObjectType, ids: bigint[]): Promise<void> {
     if (ids.length === 0) return;
-    await this.prisma.$executeRaw`
-      UPDATE erp_raw.raw_record
-      SET projected_at = now(), project_error = NULL
-      WHERE id IN (${Prisma.join(ids)})
-    `;
+    const t = this.table(objectType);
+    // ids come from our own pendingProjection rows (BigInt), so joining them is
+    // numeric-only and injection-safe.
+    await this.prisma.$executeRawUnsafe(
+      `UPDATE erp_raw.${t} SET projected_at = now(), project_error = NULL
+       WHERE id IN (${ids.map((id) => id.toString()).join(',')})`,
+    );
   }
 
   /**
    * Record why a row could not be projected — and leave projected_at NULL so it
    * is retried next cycle. An unmappable row must stay visible, not vanish.
    */
-  async markProjectFailed(id: bigint, error: string): Promise<void> {
-    await this.prisma.$executeRaw`
-      UPDATE erp_raw.raw_record
-      SET project_error = ${error}
-      WHERE id = ${id}
-    `;
+  async markProjectFailed(
+    objectType: ErpObjectType,
+    id: bigint,
+    error: string,
+  ): Promise<void> {
+    const t = this.table(objectType);
+    await this.prisma.$executeRawUnsafe(
+      `UPDATE erp_raw.${t} SET project_error = $1 WHERE id = ${id.toString()}`,
+      error,
+    );
   }
 
   // ─── Customer identity mapping ───────────────────────────────────────────
