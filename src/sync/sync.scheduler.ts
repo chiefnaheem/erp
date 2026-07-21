@@ -33,7 +33,7 @@ export class SyncScheduler {
    * acquiring the lock, running the cycle, or releasing — rather than surfacing a
    * bare Prisma error with no context.
    */
-  @Cron(process.env.ERP_SYNC_CRON || '0 */15 * * * *', { name: 'erp-sync-cycle' })
+  @Cron(process.env.ERP_SYNC_CRON || '0 */1 * * * *', { name: 'erp-sync-cycle' })
   async tick(): Promise<void> {
     const tag = `tick #${++this.tickCount}`;
     const startedAt = Date.now();
