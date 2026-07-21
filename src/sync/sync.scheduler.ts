@@ -1,5 +1,9 @@
 import { hostname } from 'node:os';
-import { Injectable, Logger } from '@nestjs/common';
+import {
+  Injectable,
+  Logger,
+  OnApplicationBootstrap,
+} from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { Cron } from '@nestjs/schedule';
 import { Prisma } from '@prisma/client';
@@ -9,8 +13,9 @@ import { SyncService } from './sync.service';
 const LOCK_NAME = 'cycle';
 
 @Injectable()
-export class SyncScheduler {
+export class SyncScheduler implements OnApplicationBootstrap {
   private readonly logger = new Logger(SyncScheduler.name);
+  private readonly host = hostname();
   private readonly owner = `${hostname()}:${process.pid}`;
   private tickCount = 0;
 
@@ -19,6 +24,43 @@ export class SyncScheduler {
     private readonly prisma: PrismaService,
     private readonly config: ConfigService,
   ) {}
+
+  /**
+   * On startup, recover from a previous run of THIS worker that died mid-cycle.
+   *
+   * A hard kill (Ctrl-C, redeploy, crash) leaves the lease held until it expires
+   * — up to SYNC_LOCK_MINUTES — during which every tick stands down. Since a
+   * fresh process on this host means the previous process on this host is gone,
+   * we release any lock this host holds and close out its dangling RUNNING runs.
+   *
+   * This is safe for the normal one-worker-per-host deployment. If you ever run
+   * multiple replicas on a SINGLE host, drop this (the lease alone is enough).
+   */
+  async onApplicationBootstrap(): Promise<void> {
+    const released = await this.prisma.$executeRaw`
+      UPDATE erp_raw.sync_lock SET locked_until = now()
+      WHERE name = ${LOCK_NAME}
+        AND locked_by LIKE ${this.host + ':%'}
+        AND locked_until > now()
+    `;
+    if (released > 0) {
+      this.logger.warn(
+        `released a stale sync lock held by a previous process on ${this.host}`,
+      );
+    }
+
+    // Any run still marked RUNNING at startup belongs to a dead process — close
+    // it out so the audit trail and any "is a sync in progress?" check stay honest.
+    const closed = await this.prisma.$executeRaw`
+      UPDATE erp_raw.sync_run
+      SET status = 'FAILED', finished_at = now(),
+          error = COALESCE(error, 'process restarted before this run finished')
+      WHERE status = 'RUNNING'
+    `;
+    if (closed > 0) {
+      this.logger.warn(`marked ${closed} interrupted sync_run row(s) as FAILED`);
+    }
+  }
 
   /**
    * Interval polling.

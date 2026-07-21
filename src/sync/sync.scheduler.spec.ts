@@ -51,6 +51,37 @@ describe('SyncScheduler lock (integration)', () => {
     await prisma.$executeRawUnsafe(`DELETE FROM erp_raw.sync_lock WHERE name = 'cycle'`);
   });
 
+  it('on startup releases this host\'s stale lock and closes dangling RUNNING runs', async () => {
+    const os = require('node:os');
+    // A lock left by a previous process on THIS host, still within its lease.
+    await prisma.$executeRawUnsafe(
+      `INSERT INTO erp_raw.sync_lock (name, locked_until, locked_by)
+       VALUES ('cycle', now() + interval '25 minutes', '${os.hostname()}:99999')`,
+    );
+    const runId = await (async () => {
+      const r = await prisma.$queryRawUnsafe<any[]>(
+        `INSERT INTO erp_raw.sync_run (job, status) VALUES ('test_stale', 'RUNNING') RETURNING id`,
+      );
+      return r[0].id;
+    })();
+
+    await scheduler.onApplicationBootstrap();
+
+    // Lock is now free (expired), so a tick can proceed.
+    const lock = await prisma.$queryRawUnsafe<any[]>(
+      `SELECT locked_until <= now() AS released FROM erp_raw.sync_lock WHERE name = 'cycle'`,
+    );
+    expect(lock[0]?.released).toBe(true);
+
+    // The dangling run was closed out.
+    const run = await prisma.$queryRawUnsafe<any[]>(
+      `SELECT status FROM erp_raw.sync_run WHERE id = ${runId}`,
+    );
+    expect(run[0].status).toBe('FAILED');
+
+    await prisma.$executeRawUnsafe(`DELETE FROM erp_raw.sync_run WHERE id = ${runId}`);
+  });
+
   it('acquires the lease and runs a cycle (the make_interval bug would throw here)', async () => {
     // If the lock SQL were still broken this would throw before running the cycle.
     await scheduler.tick();
