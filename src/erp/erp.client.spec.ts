@@ -272,6 +272,18 @@ describe('ErpClient', () => {
     logSpy.mockRestore();
   });
 
+  it('puts the raw response body in the error when the ERP returns non-std_data', async () => {
+    // HTTP 200 but not the std_data envelope — e.g. an auth/gateway error page.
+    // This is exactly the "non-std_data response" the failing endpoints hit.
+    respond = () => ({ status: 200, body: '<html><body>Unauthorized: invalid digi-key</body></html>' });
+
+    const client = await build();
+    await expect(client.query(ERP_METHOD.CUSTOMER_CREDIT_QUERY)).rejects.toThrow(
+      /Unauthorized: invalid digi-key/,
+    );
+    await expect(client.query(ERP_METHOD.CUSTOMER_CREDIT_QUERY)).rejects.toThrow(/HTML\/XML/);
+  });
+
   it('unwraps read() results from parameter.result.success', async () => {
     respond = () => ({
       status: 200,
