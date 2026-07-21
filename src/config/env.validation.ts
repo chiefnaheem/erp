@@ -149,6 +149,15 @@ export class EnvVars {
   @Transform(toBool)
   ERP_VERBOSE: boolean = false;
 
+  // Logs a ready-to-run curl command for every ERP request — URL, ALL headers,
+  // and the exact body. ⚠️ Unlike ERP_VERBOSE, this prints the REAL digi-key so
+  // the curl actually works; only enable it for local debugging, never leave it
+  // on in a shared environment. Default off.
+  @IsBoolean()
+  @IsOptional()
+  @Transform(toBool)
+  ERP_LOG_CURL: boolean = false;
+
   // Master kill switch: when false the app boots and serves /health but runs no
   // sync jobs. Lets us deploy the worker before the ERP is reachable.
   @IsBoolean()
