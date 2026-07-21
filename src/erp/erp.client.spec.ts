@@ -262,6 +262,19 @@ describe('ErpClient', () => {
     logSpy.mockRestore();
   });
 
+  it('logs a runnable curl (with the real key) when ERP_LOG_CURL is on', async () => {
+    const warnSpy = jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
+    const client = await build({ ERP_LOG_CURL: true, ERP_API_KEY: 'real-secret-key' });
+    await client.query(ERP_METHOD.CUSTOMER_CREDIT_QUERY, { pageNo: 1 });
+
+    const logged = warnSpy.mock.calls.map((c) => String(c[0])).join('\n');
+    expect(logged).toMatch(/curl -X POST/);
+    expect(logged).toMatch(/-H 'digi-service:/);
+    expect(logged).toMatch(/-d '{"std_data"/);
+    expect(logged).toMatch(/real-secret-key/); // real key IS present, by design
+    warnSpy.mockRestore();
+  });
+
   it('does NOT log the request body when verbose is off', async () => {
     const logSpy = jest.spyOn(Logger.prototype, 'log').mockImplementation(() => undefined);
     const client = await build(); // ERP_VERBOSE defaults off

@@ -172,6 +172,7 @@ export class ErpClient {
     const maxRetries = this.config.getOrThrow<number>('ERP_MAX_RETRIES');
     const url = this.config.getOrThrow<string>('ERP_BASE_URL');
     const verbose = this.config.get<boolean>('ERP_VERBOSE');
+    const logCurl = this.config.get<boolean>('ERP_LOG_CURL');
     const body = { std_data: { parameter } };
 
     let lastError: unknown;
@@ -185,6 +186,15 @@ export class ErpClient {
           `→ ${method} POST ${url} (attempt ${attempt})\n` +
             `  headers: ${JSON.stringify(this.redactHeaders(headers))}\n` +
             `  body: ${JSON.stringify(body)}`,
+        );
+      }
+
+      // A copy-pasteable curl for reproducing this exact request (real key). Only
+      // on the first attempt, to avoid repeating it on every retry.
+      if (logCurl && attempt === 1) {
+        this.logger.warn(
+          `curl to reproduce ${method} (contains the real digi-key):\n` +
+            this.toCurl(url, headers, body),
         );
       }
 
@@ -316,6 +326,25 @@ export class ErpClient {
       ? `***${key.slice(-4)} (len ${key.length})`
       : String(key);
     return { ...headers, 'digi-key': masked };
+  }
+
+  /**
+   * A shell-safe, copy-pasteable curl for a request. Every value is wrapped in
+   * single quotes with embedded quotes escaped, so it can be pasted straight into
+   * a terminal. Includes the real digi-key — only reached when ERP_LOG_CURL is on.
+   */
+  private toCurl(
+    url: string,
+    headers: Record<string, string>,
+    body: unknown,
+  ): string {
+    const q = (s: string) => `'${s.replace(/'/g, `'\\''`)}'`;
+    const lines = [`curl -X POST ${q(url)}`];
+    for (const [name, value] of Object.entries(headers)) {
+      lines.push(`  -H ${q(`${name}: ${value}`)}`);
+    }
+    lines.push(`  -d ${q(JSON.stringify(body))}`);
+    return lines.join(' \\\n');
   }
 
   /** A compact, log-safe one-line preview of a fetched row. */
