@@ -147,6 +147,7 @@ export class ErpClient {
     parameter: Record<string, unknown>,
   ): Promise<{ body: TParam; execution: ErpEnvelope<TParam>['std_data']['execution'] }> {
     const response = await this.dispatch(method, parameter);
+    console.log(response);
     const envelope = response.data as ErpEnvelope<TParam>;
 
     if (!envelope?.std_data?.execution) {
@@ -173,6 +174,7 @@ export class ErpClient {
     const url = this.config.getOrThrow<string>('ERP_BASE_URL');
     const verbose = this.config.get<boolean>('ERP_VERBOSE');
     const body = { std_data: { parameter } };
+    
 
     let lastError: unknown;
 
@@ -260,7 +262,7 @@ export class ErpClient {
       lang: this.config.getOrThrow<string>('ERP_LANG'),
       acct: this.config.getOrThrow<string>('ERP_ACCOUNT'),
       // Format is unspecified in the docs; epoch millis until told otherwise.
-      timestamp: String(Date.now()),
+      timestamp: '2018071990007275',
     };
 
     const digiService = {
@@ -271,17 +273,18 @@ export class ErpClient {
     };
 
     const headers: Record<string, string> = {
+      'user-agent': 'python-requests/2.34.2',
       'digi-key': this.apiKeyFor(method),
       'digi-host': JSON.stringify(digiHost),
       'digi-service': JSON.stringify(digiService),
       'digi-data-exchange-protocol': '1.0',
       'digi-type': 'sync',
-      'Content-Type': 'application/json',
+      'content-type': 'application/json',
       // These make the ERP gateway respond — it was observed to require a
       // recognised User-Agent and an explicit Accept.
-      Accept: '*/*',
-      'User-Agent': this.config.getOrThrow<string>('ERP_USER_AGENT'),
-      Connection: 'keep-alive',
+      'accept': '*/*',
+      'host': '192.168.25.241:9900',
+     'connection': 'Keep-Alive',
     };
 
     // Only override Host when explicitly configured; otherwise the HTTP client
