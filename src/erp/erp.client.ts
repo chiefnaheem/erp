@@ -151,7 +151,7 @@ export class ErpClient {
     const envelope = response.data as ErpEnvelope<TParam>;
 
     if (!envelope?.std_data?.execution) {
-      throw new ErpProtocolError(method, response.data);
+      throw new ErpProtocolError(method, response.data, response.status);
     }
 
     const { execution, parameter: body } = envelope.std_data;
