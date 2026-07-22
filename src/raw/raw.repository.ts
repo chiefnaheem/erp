@@ -60,6 +60,40 @@ export class RawRepository {
     return name;
   }
 
+  /**
+   * Retry a DB op when the remote server drops the connection mid-sweep. The
+   * managed Postgres closes connections under sustained load (Prisma P1017 /
+   * P1001 / "Server has closed the connection"); Prisma reconnects on the next
+   * query, so a short backoff-and-retry recovers instead of failing the whole job.
+   */
+  private async withRetry<T>(op: () => Promise<T>, label: string): Promise<T> {
+    const MAX = 4;
+    let lastError: unknown;
+    for (let attempt = 1; attempt <= MAX; attempt++) {
+      try {
+        return await op();
+      } catch (error) {
+        const code = (error as { code?: string })?.code;
+        const message = error instanceof Error ? error.message : String(error);
+        const transient =
+          code === 'P1017' ||
+          code === 'P1001' ||
+          /closed the connection|reach database server|Timed out|Connection reset|ECONNRESET/i.test(
+            message,
+          );
+        if (!transient || attempt === MAX) throw error;
+
+        lastError = error;
+        const backoff = 500 * 2 ** (attempt - 1);
+        this.logger.warn(
+          `${label}: transient DB error (attempt ${attempt}/${MAX}), retrying in ${backoff}ms — ${message.split('\n')[0]}`,
+        );
+        await new Promise((r) => setTimeout(r, backoff));
+      }
+    }
+    throw lastError;
+  }
+
   /** Public accessor for the object's raw table name — used in logging. */
   tableFor(objectType: ErpObjectType): string {
     return this.table(objectType);
@@ -127,8 +161,10 @@ export class RawRepository {
 
       // Table name is from the RAW_TABLE allowlist (never user input); every value
       // is a bound parameter.
-      const results = await this.prisma.$queryRawUnsafe<{ changed: boolean }[]>(
-        `
+      const results = await this.withRetry(
+        () =>
+          this.prisma.$queryRawUnsafe<{ changed: boolean }[]>(
+            `
         INSERT INTO erp_raw.${t}
           (object_type, erp_key, payload, content_hash,
            first_seen_at, last_seen_at, changed_at)
@@ -148,7 +184,9 @@ export class RawRepository {
             THEN NULL ELSE ${t}.project_error END
         RETURNING (changed_at = $2) AS changed
         `,
-        ...params,
+            ...params,
+          ),
+        `upsert erp_raw.${t}`,
       );
 
       fetched += results.length;
@@ -235,12 +273,16 @@ export class RawRepository {
         params.push(guid, code);
         p += 2;
       }
-      await this.prisma.$executeRawUnsafe(
-        `INSERT INTO erp_raw.customer_link (erp_customer_guid, erp_customer_code, updated_at)
+      await this.withRetry(
+        () =>
+          this.prisma.$executeRawUnsafe(
+            `INSERT INTO erp_raw.customer_link (erp_customer_guid, erp_customer_code, updated_at)
          VALUES ${values.join(', ')}
          ON CONFLICT (erp_customer_guid) DO UPDATE
            SET erp_customer_code = EXCLUDED.erp_customer_code, updated_at = now()`,
-        ...params,
+            ...params,
+          ),
+        'link customers',
       );
     }
   }
