@@ -37,18 +37,19 @@ describe('ErpDebugProbe', () => {
     expect(query).not.toHaveBeenCalled();
   });
 
-  it('calls all 8 endpoints and logs a per-endpoint result', async () => {
+  it('calls all 7 endpoints (customer is skipped) and logs a per-endpoint result', async () => {
     const probe = await build({ ERP_DEBUG_STARTUP: true, ERP_BASE_URL: 'http://erp/api' });
     query.mockResolvedValue({ execution: { code: '0' }, rows: [{ DOC_NO: 'X' }] });
 
     await probe.onApplicationBootstrap();
 
-    expect(query).toHaveBeenCalledTimes(8);
+    expect(query).toHaveBeenCalledTimes(7); // customer.query commented out
     const out = logged(logSpy);
+    expect(out).not.toMatch(/\bcustomer\b(?!_credit)/); // customer itself not probed
     expect(out).toMatch(/customer_credit/);
     expect(out).toMatch(/sales_return/);
     expect(out).toMatch(/ar_refund/);
-    expect(out).toMatch(/8\/8 endpoints OK/);
+    expect(out).toMatch(/7\/7 endpoints OK/);
   });
 
   it('keeps going when one endpoint fails, and logs the failure detail', async () => {
@@ -64,9 +65,9 @@ describe('ErpDebugProbe', () => {
 
     await probe.onApplicationBootstrap();
 
-    expect(query).toHaveBeenCalledTimes(8); // did not stop at the failure
+    expect(query).toHaveBeenCalledTimes(7); // did not stop at the failure
     expect(logged(errorSpy)).toMatch(/customer_credit: FAILED/);
     expect(logged(errorSpy)).toMatch(/Unauthorized/);
-    expect(logged(logSpy)).toMatch(/7\/8 endpoints OK/);
+    expect(logged(logSpy)).toMatch(/6\/7 endpoints OK/);
   });
 });

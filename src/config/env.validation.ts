@@ -142,29 +142,32 @@ export class EnvVars {
   ERP_PAGE_SIZE: number = 100;
 
   // Verbose request logging: when true, every ERP call logs its method, URL,
-  // headers (with digi-key redacted), and full request body. Useful while
-  // bringing up the integration; leave off in normal operation.
+  // headers (with digi-key redacted), and full request body.
+  // ⚠️ Defaults to TRUE for the current debugging phase — set ERP_VERBOSE=false
+  // to quiet it down in normal operation.
   @IsBoolean()
   @IsOptional()
   @Transform(toBool)
-  ERP_VERBOSE: boolean = false;
+  ERP_VERBOSE: boolean = true;
 
   // Logs a ready-to-run curl command for every ERP request — URL, ALL headers,
-  // and the exact body. ⚠️ Unlike ERP_VERBOSE, this prints the REAL digi-key so
-  // the curl actually works; only enable it for local debugging, never leave it
-  // on in a shared environment. Default off.
+  // and the exact body.
+  // ⚠️ This prints the REAL digi-key so the curl actually works, and it defaults
+  // to TRUE for debugging — set ERP_LOG_CURL=false before running anywhere shared
+  // so the API key doesn't end up in log files.
   @IsBoolean()
   @IsOptional()
   @Transform(toBool)
-  ERP_LOG_CURL: boolean = false;
+  ERP_LOG_CURL: boolean = true;
 
   // On startup, call EVERY ERP query endpoint once (read-only, pageSize 1) with
   // step-by-step logs — so you can immediately see which endpoints respond and
-  // which fail (and why), without waiting for a scheduled sync. Debug only.
+  // which fail (and why), without waiting for a scheduled sync.
+  // ⚠️ Defaults to TRUE for debugging — set ERP_DEBUG_STARTUP=false to skip it.
   @IsBoolean()
   @IsOptional()
   @Transform(toBool)
-  ERP_DEBUG_STARTUP: boolean = false;
+  ERP_DEBUG_STARTUP: boolean = true;
 
   // Master kill switch: when false the app boots and serves /health but runs no
   // sync jobs. Lets us deploy the worker before the ERP is reachable.

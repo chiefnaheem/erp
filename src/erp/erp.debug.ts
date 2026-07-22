@@ -5,7 +5,9 @@ import { ERP_METHOD, ErpMethod } from './erp.types';
 
 /** Every query endpoint, in sync order, with its object label + target table. */
 const ENDPOINTS: { label: string; method: ErpMethod; table: string }[] = [
-  { label: 'customer', method: ERP_METHOD.CUSTOMER_QUERY, table: 'raw_customer' },
+  // customer.query already works (confirmed by ErpConnectivityService on startup),
+  // so it's skipped here to keep the probe focused on the endpoints under debug.
+  // { label: 'customer', method: ERP_METHOD.CUSTOMER_QUERY, table: 'raw_customer' },
   { label: 'customer_credit', method: ERP_METHOD.CUSTOMER_CREDIT_QUERY, table: 'raw_customer_credit' },
   { label: 'sales_order', method: ERP_METHOD.SALES_ORDER_QUERY, table: 'raw_sales_order' },
   { label: 'sales_delivery', method: ERP_METHOD.SALES_DELIVERY_QUERY, table: 'raw_sales_delivery' },
