@@ -101,24 +101,33 @@ describe('RawRepository (integration)', () => {
     expect(second).toEqual({ fetched: 2, changed: 1 });
   });
 
+  // The raw table is shared with live sync data, so scope assertions to our own
+  // TEST_ row rather than relying on pendingProjection's ordering.
+  const rawRow = async (erpKey: string) =>
+    (
+      await prisma.$queryRawUnsafe<any[]>(
+        `SELECT id, payload, projected_at FROM erp_raw.raw_sales_order WHERE erp_key = '${erpKey}'`,
+      )
+    )[0];
+
   it('re-queues a changed row for projection, and leaves an unchanged one alone', async () => {
     await repo.upsertMany('SALES_ORDER', [{ DOC_NO: 'TEST_1', AMT: 100 }], key);
 
-    const [pending] = await repo.pendingProjection('SALES_ORDER');
-    expect(pending.erp_key).toBe('TEST_1');
+    const inserted = await rawRow('TEST_1');
+    expect(inserted.projected_at).toBeNull(); // freshly ingested → pending
 
-    await repo.markProjected('SALES_ORDER', [pending.id]);
-    expect(await repo.pendingProjection('SALES_ORDER')).toHaveLength(0);
+    await repo.markProjected('SALES_ORDER', [inserted.id]);
+    expect((await rawRow('TEST_1')).projected_at).not.toBeNull();
 
-    // An identical sweep must NOT put it back in the queue...
+    // An identical sweep must NOT re-queue it...
     await repo.upsertMany('SALES_ORDER', [{ DOC_NO: 'TEST_1', AMT: 100 }], key);
-    expect(await repo.pendingProjection('SALES_ORDER')).toHaveLength(0);
+    expect((await rawRow('TEST_1')).projected_at).not.toBeNull();
 
     // ...but a real change must.
     await repo.upsertMany('SALES_ORDER', [{ DOC_NO: 'TEST_1', AMT: 555 }], key);
-    const requeued = await repo.pendingProjection('SALES_ORDER');
-    expect(requeued).toHaveLength(1);
-    expect(requeued[0].payload).toMatchObject({ AMT: 555 });
+    const requeued = await rawRow('TEST_1');
+    expect(requeued.projected_at).toBeNull();
+    expect(requeued.payload).toMatchObject({ AMT: 555 });
   });
 
   it('stores the ERP payload verbatim, including undocumented fields', async () => {
@@ -127,8 +136,9 @@ describe('RawRepository (integration)', () => {
       [{ DOC_NO: 'TEST_1', SOME_UNDOCUMENTED_FIELD: 'surprise' }],
       key,
     );
-    const [pending] = await repo.pendingProjection('SALES_ORDER');
-    expect(pending.payload).toMatchObject({ SOME_UNDOCUMENTED_FIELD: 'surprise' });
+    expect((await rawRow('TEST_1')).payload).toMatchObject({
+      SOME_UNDOCUMENTED_FIELD: 'surprise',
+    });
   });
 
   it('skips rows with no ERP key rather than inventing one', async () => {
