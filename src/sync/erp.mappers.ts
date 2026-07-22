@@ -26,12 +26,15 @@ import { OrderStatus, Region } from '@prisma/client';
  * it saw, so one live run tells us exactly what to add.
  */
 const DEFAULT_STATUS_MAP: Record<string, OrderStatus> = {
-  // Placeholders only — none of these are confirmed against the real ERP.
-  PENDING: OrderStatus.PENDING,
-  PROCESSING: OrderStatus.PROCESSING,
-  SHIPPED: OrderStatus.SHIPPED,
-  DELIVERED: OrderStatus.DELIVERED,
-  CANCELLED: OrderStatus.CANCELLED,
+  // Real Digiwin E10 ApproveStatus values. 'Y' (approved) is confirmed in the
+  // live data; 'N' (not yet approved) is the expected counterpart. An approved
+  // sales order maps to PROCESSING — true fulfilment (SHIPPED/DELIVERED) is
+  // tracked via SALES_DELIVERY, not the order's approval flag.
+  //
+  // Any other value stays unmapped and is skipped + logged, so a new status is
+  // surfaced rather than silently guessed. Override via ERP_STATUS_MAP.
+  Y: OrderStatus.PROCESSING,
+  N: OrderStatus.PENDING,
 };
 
 export function buildStatusMap(raw?: string): Record<string, OrderStatus> {

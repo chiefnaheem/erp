@@ -89,68 +89,70 @@ export class RawRepository {
     keyOf: (row: Record<string, unknown>) => string | undefined,
   ): Promise<RawUpsertResult> {
     const t = this.table(objectType); // bare name, e.g. raw_customer
+
+    // Keep only rows with a key, deduped by key (a multi-row ON CONFLICT cannot
+    // touch the same target row twice in one statement). Last write wins.
+    const keyed = new Map<string, Record<string, unknown>>();
+    for (const row of rows) {
+      const key = keyOf(row);
+      if (!key) {
+        this.logger.warn(
+          `${objectType}: row has no ERP key, skipping — ${JSON.stringify(row).slice(0, 200)}`,
+        );
+        continue;
+      }
+      keyed.set(key, row);
+    }
+    const entries = [...keyed.entries()];
+
     let changed = 0;
     let fetched = 0;
 
-    for (let i = 0; i < rows.length; i += CHUNK) {
-      const chunk = rows.slice(i, i + CHUNK);
+    for (let i = 0; i < entries.length; i += CHUNK) {
+      const chunk = entries.slice(i, i + CHUNK);
 
-      const results = await this.prisma.$transaction(
-        chunk.flatMap((row) => {
-          const key = keyOf(row);
-          if (!key) {
-            // A row with no ERP key cannot be upserted or later resolved. Drop
-            // it loudly rather than silently inventing an identifier.
-            this.logger.warn(
-              `${objectType}: row has no ERP key, skipping — ${JSON.stringify(row).slice(0, 200)}`,
-            );
-            return [];
-          }
+      // ONE multi-row upsert per chunk instead of one statement per row — this is
+      // what makes a full sweep of thousands of rows finish in seconds rather than
+      // minutes. A single per-chunk timestamp keeps change detection exact:
+      // changed_at === stamp only for rows inserted or whose hash actually moved.
+      const stamp = new Date();
+      const params: unknown[] = [objectType, stamp];
+      const valueRows: string[] = [];
+      let p = 3;
+      for (const [key, row] of chunk) {
+        valueRows.push(`($1, $${p}, $${p + 1}::jsonb, $${p + 2}, $2, $2, $2)`);
+        params.push(key, JSON.stringify(row), RawRepository.hash(row));
+        p += 3;
+      }
 
-          // A single per-row timestamp is what makes change detection exact:
-          // the row we get back reports changed_at === stamp only if it was
-          // inserted or its hash genuinely moved.
-          const stamp = new Date();
-
-          // Table name is from the RAW_TABLE allowlist (never user input), so
-          // interpolating it is safe; every value is a bound parameter.
-          return [
-            this.prisma.$queryRawUnsafe<{ changed: boolean }[]>(
-              `
-              INSERT INTO erp_raw.${t}
-                (object_type, erp_key, payload, content_hash,
-                 first_seen_at, last_seen_at, changed_at)
-              VALUES
-                ($1, $2, $3::jsonb, $4, $5, $5, $5)
-              ON CONFLICT (object_type, erp_key) DO UPDATE SET
-                last_seen_at = $5,
-                payload      = EXCLUDED.payload,
-                content_hash = EXCLUDED.content_hash,
-                changed_at = CASE
-                  WHEN ${t}.content_hash IS DISTINCT FROM EXCLUDED.content_hash
-                  THEN $5 ELSE ${t}.changed_at END,
-                projected_at = CASE
-                  WHEN ${t}.content_hash IS DISTINCT FROM EXCLUDED.content_hash
-                  THEN NULL ELSE ${t}.projected_at END,
-                project_error = CASE
-                  WHEN ${t}.content_hash IS DISTINCT FROM EXCLUDED.content_hash
-                  THEN NULL ELSE ${t}.project_error END
-              RETURNING (changed_at = $5) AS changed
-              `,
-              objectType,
-              key,
-              JSON.stringify(row),
-              RawRepository.hash(row),
-              stamp,
-            ),
-          ];
-        }),
+      // Table name is from the RAW_TABLE allowlist (never user input); every value
+      // is a bound parameter.
+      const results = await this.prisma.$queryRawUnsafe<{ changed: boolean }[]>(
+        `
+        INSERT INTO erp_raw.${t}
+          (object_type, erp_key, payload, content_hash,
+           first_seen_at, last_seen_at, changed_at)
+        VALUES ${valueRows.join(', ')}
+        ON CONFLICT (object_type, erp_key) DO UPDATE SET
+          last_seen_at = $2,
+          payload      = EXCLUDED.payload,
+          content_hash = EXCLUDED.content_hash,
+          changed_at = CASE
+            WHEN ${t}.content_hash IS DISTINCT FROM EXCLUDED.content_hash
+            THEN $2 ELSE ${t}.changed_at END,
+          projected_at = CASE
+            WHEN ${t}.content_hash IS DISTINCT FROM EXCLUDED.content_hash
+            THEN NULL ELSE ${t}.projected_at END,
+          project_error = CASE
+            WHEN ${t}.content_hash IS DISTINCT FROM EXCLUDED.content_hash
+            THEN NULL ELSE ${t}.project_error END
+        RETURNING (changed_at = $2) AS changed
+        `,
+        ...params,
       );
 
-      for (const result of results) {
-        fetched++;
-        if (result[0]?.changed) changed++;
-      }
+      fetched += results.length;
+      changed += results.filter((r) => r.changed).length;
     }
 
     return { fetched, changed };
