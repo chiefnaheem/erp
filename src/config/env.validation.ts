@@ -158,6 +158,14 @@ export class EnvVars {
   @Transform(toBool)
   ERP_LOG_CURL: boolean = false;
 
+  // On startup, call EVERY ERP query endpoint once (read-only, pageSize 1) with
+  // step-by-step logs — so you can immediately see which endpoints respond and
+  // which fail (and why), without waiting for a scheduled sync. Debug only.
+  @IsBoolean()
+  @IsOptional()
+  @Transform(toBool)
+  ERP_DEBUG_STARTUP: boolean = false;
+
   // Master kill switch: when false the app boots and serves /health but runs no
   // sync jobs. Lets us deploy the worker before the ERP is reachable.
   @IsBoolean()
