@@ -208,12 +208,41 @@ export class RawRepository {
   // CUSTOMER_CODE. Without this bridge an order cannot find its customer.
 
   async linkCustomer(guid: string, code: string): Promise<void> {
-    await this.prisma.$executeRaw`
-      INSERT INTO erp_raw.customer_link (erp_customer_guid, erp_customer_code, updated_at)
-      VALUES (${guid}, ${code}, now())
-      ON CONFLICT (erp_customer_guid) DO UPDATE
-        SET erp_customer_code = EXCLUDED.erp_customer_code, updated_at = now()
-    `;
+    await this.linkCustomers([{ guid, code }]);
+  }
+
+  /**
+   * Batched guid→code bridge. One multi-row upsert per chunk instead of one per
+   * customer — without this, building the bridge for thousands of customers was
+   * the slowest part of a sweep and kept the cycle from ever reaching the later
+   * endpoints.
+   */
+  async linkCustomers(pairs: { guid: string; code: string }[]): Promise<void> {
+    // Dedupe by guid so a multi-row ON CONFLICT can't touch the same row twice.
+    const byGuid = new Map<string, string>();
+    for (const { guid, code } of pairs) {
+      if (guid && code) byGuid.set(guid, code);
+    }
+    const entries = [...byGuid.entries()];
+
+    for (let i = 0; i < entries.length; i += CHUNK) {
+      const chunk = entries.slice(i, i + CHUNK);
+      const params: unknown[] = [];
+      const values: string[] = [];
+      let p = 1;
+      for (const [guid, code] of chunk) {
+        values.push(`($${p}, $${p + 1}, now())`);
+        params.push(guid, code);
+        p += 2;
+      }
+      await this.prisma.$executeRawUnsafe(
+        `INSERT INTO erp_raw.customer_link (erp_customer_guid, erp_customer_code, updated_at)
+         VALUES ${values.join(', ')}
+         ON CONFLICT (erp_customer_guid) DO UPDATE
+           SET erp_customer_code = EXCLUDED.erp_customer_code, updated_at = now()`,
+        ...params,
+      );
+    }
   }
 
   /** CUSTOMER_ID (Guid) → CUSTOMER_CODE, or null if we've never seen the Guid. */

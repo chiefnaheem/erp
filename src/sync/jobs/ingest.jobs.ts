@@ -92,11 +92,14 @@ export class CustomerIngestJob extends IngestJob {
    * recording the pair here, no order could ever find its customer.
    */
   protected async afterPage(page: Record<string, unknown>[]): Promise<void> {
-    for (const row of page) {
-      const guid = row.CUSTOMER_ID as string | undefined;
-      const code = row.CUSTOMER_CODE as string | undefined;
-      if (guid && code) await this.raw.linkCustomer(guid, code);
-    }
+    // One batched upsert for the whole page, not one round-trip per customer.
+    const pairs = page
+      .map((row) => ({
+        guid: row.CUSTOMER_ID as string,
+        code: row.CUSTOMER_CODE as string,
+      }))
+      .filter((x) => x.guid && x.code);
+    await this.raw.linkCustomers(pairs);
   }
 }
 
