@@ -145,10 +145,7 @@ export class RawRepository {
     for (let i = 0; i < entries.length; i += CHUNK) {
       const chunk = entries.slice(i, i + CHUNK);
 
-      // ONE multi-row upsert per chunk instead of one statement per row — this is
-      // what makes a full sweep of thousands of rows finish in seconds rather than
-      // minutes. A single per-chunk timestamp keeps change detection exact:
-      // changed_at === stamp only for rows inserted or whose hash actually moved.
+      // ONE multi-row upsert per chunk instead of one statement per row.
       const stamp = new Date();
       const params: unknown[] = [objectType, stamp];
       const valueRows: string[] = [];
@@ -159,38 +156,40 @@ export class RawRepository {
         p += 3;
       }
 
-      // Table name is from the RAW_TABLE allowlist (never user input); every value
-      // is a bound parameter.
+      // The WHERE on DO UPDATE is the disk-saver: when a row's content hash hasn't
+      // changed, the update is a NO-OP — no new row version, no WAL, no dead tuple.
+      // A steady-state sweep of unchanged rows therefore writes ~nothing, instead
+      // of rewriting all ~880k rows every cycle (which is what filled the disk).
+      // Because the update only fires when the hash differs, changed_at / projected_at
+      // / project_error can be set unconditionally — no CASE needed.
+      //
+      // RETURNING therefore yields exactly the rows that were inserted or changed,
+      // so results.length == "changed". `fetched` is the count we sent.
       const results = await this.withRetry(
         () =>
-          this.prisma.$queryRawUnsafe<{ changed: boolean }[]>(
+          this.prisma.$queryRawUnsafe<{ erp_key: string }[]>(
             `
         INSERT INTO erp_raw.${t}
           (object_type, erp_key, payload, content_hash,
            first_seen_at, last_seen_at, changed_at)
         VALUES ${valueRows.join(', ')}
         ON CONFLICT (object_type, erp_key) DO UPDATE SET
-          last_seen_at = $2,
-          payload      = EXCLUDED.payload,
-          content_hash = EXCLUDED.content_hash,
-          changed_at = CASE
-            WHEN ${t}.content_hash IS DISTINCT FROM EXCLUDED.content_hash
-            THEN $2 ELSE ${t}.changed_at END,
-          projected_at = CASE
-            WHEN ${t}.content_hash IS DISTINCT FROM EXCLUDED.content_hash
-            THEN NULL ELSE ${t}.projected_at END,
-          project_error = CASE
-            WHEN ${t}.content_hash IS DISTINCT FROM EXCLUDED.content_hash
-            THEN NULL ELSE ${t}.project_error END
-        RETURNING (changed_at = $2) AS changed
+          last_seen_at  = $2,
+          payload       = EXCLUDED.payload,
+          content_hash  = EXCLUDED.content_hash,
+          changed_at    = $2,
+          projected_at  = NULL,
+          project_error = NULL
+        WHERE ${t}.content_hash IS DISTINCT FROM EXCLUDED.content_hash
+        RETURNING erp_key
         `,
             ...params,
           ),
         `upsert erp_raw.${t}`,
       );
 
-      fetched += results.length;
-      changed += results.filter((r) => r.changed).length;
+      fetched += chunk.length;
+      changed += results.length;
     }
 
     return { fetched, changed };
