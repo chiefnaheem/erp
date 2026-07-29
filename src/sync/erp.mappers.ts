@@ -103,12 +103,13 @@ export function purchaseTotalValue(row: Record<string, unknown>): number | null 
 }
 
 /**
- * ⚠️ AMBIGUOUS. PIECES is documented only as "Number of pieces" — it may be
- * cartons or it may be the line count. Our totalItems is shown to customers, so
- * this matters. Treated as a count until confirmed.
+ * Total items on an order. The 2026-07-28 ERP update added QTY_TOTAL (total
+ * business quantity) to the sales-order header, which is the right source — the
+ * old PIECES field was 0 on ~all orders. Falls back to PIECES if QTY_TOTAL is
+ * absent.
  */
 export function purchaseTotalItems(row: Record<string, unknown>): number {
-  return toNumber(row.PIECES) ?? 0;
+  return toNumber(row.QTY_TOTAL) ?? toNumber(row.PIECES) ?? 0;
 }
 
 // ─── Customer field resolution ───────────────────────────────────────────────
@@ -162,32 +163,60 @@ export interface ResolvedCustomer {
   canCreate: boolean;
 }
 
+// As of the 2026-07-28 ERP update, customer.query returns PhoneNumber and Region
+// directly, so these are the defaults. ERP_CUSTOMER_PHONE_FIELD /
+// ERP_CUSTOMER_REGION_FIELD still override them if the ERP ever renames them.
+const DEFAULT_PHONE_FIELD = 'PhoneNumber';
+const DEFAULT_REGION_FIELD = 'Region';
+
 export function resolveCustomer(
   payload: Record<string, unknown>,
   map: CustomerFieldMap,
-): ResolvedCustomer {
+): { name: string | null; phone: string | null; region: Region | null; canCreate: boolean; rawRegion: string | null } {
   const name =
     (payload.CUSTOMER_FULL_NAME as string) ??
     (payload.CUSTOMER_NAME as string) ??
     null;
 
-  const phone = map.phoneField ? normalisePhone(payload[map.phoneField]) : null;
+  const phoneField = map.phoneField ?? DEFAULT_PHONE_FIELD;
+  const regionField = map.regionField ?? DEFAULT_REGION_FIELD;
 
-  const region =
-    map.regionField && typeof payload[map.regionField] === 'string'
-      ? (map.regionMap[payload[map.regionField] as string] ?? null)
+  const phone = normalisePhone(payload[phoneField]);
+
+  const rawRegion =
+    typeof payload[regionField] === 'string' && (payload[regionField] as string).trim()
+      ? (payload[regionField] as string).trim()
       : null;
+  const region = rawRegion ? resolveRegion(rawRegion, map.regionMap) : null;
 
   return {
     name,
     phone,
     region,
-    // Customer.phone AND Customer.region are both required with no schema default,
-    // so a real INSERT needs both resolved. canCreate signals only that we've been
-    // TOLD where to find them (a phone field is configured); the projection still
-    // verifies both values are actually present before inserting.
-    canCreate: Boolean(map.phoneField),
+    rawRegion,
+    // phone + region are both required with no schema default, so the projection
+    // verifies both are present before inserting. With PhoneNumber/Region now on
+    // the customer object, creation is possible by default.
+    canCreate: true,
   };
+}
+
+/**
+ * Map an ERP region string onto our enum. Tries the configured ERP_REGION_MAP
+ * first, then falls back to matching our own enum values directly (so a value
+ * like "LAGOS" or "South West" → SOUTH_WEST works without a full map). Returns
+ * null when it can't be resolved, so the projection can log it and skip.
+ */
+function resolveRegion(
+  value: string,
+  regionMap: Record<string, Region>,
+): Region | null {
+  if (regionMap[value]) return regionMap[value];
+
+  const normalized = value.toUpperCase().replace(/[\s-]+/g, '_');
+  if (normalized in Region) return Region[normalized as keyof typeof Region];
+
+  return null;
 }
 
 function normalisePhone(value: unknown): string | null {

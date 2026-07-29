@@ -1,7 +1,6 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import {
-  PaymentProjectionJob,
   PurchaseItemProjectionJob,
   StockProjectionJob,
 } from './jobs/blocked.jobs';
@@ -17,6 +16,7 @@ import {
 } from './jobs/ingest.jobs';
 import {
   CustomerProjectionJob,
+  PaymentProjectionJob,
   PurchaseProjectionJob,
 } from './jobs/projection.jobs';
 import { SyncJob } from './sync.job';

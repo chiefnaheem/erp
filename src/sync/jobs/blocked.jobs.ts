@@ -41,31 +41,22 @@ export class StockProjectionJob extends BlockedJob {
 }
 
 /**
- * The single most damaging gap: sales_order_doc.query returns header fields only.
+ * The 2026-07-28 ERP update DID add sales-order line items (ITEM_ID,
+ * ITEM_DESCRIPTION, BUSINESS_QTY, ...), so this is now buildable — but HOW the
+ * lines are nested in sales_order_doc.query is not specified in the docs, and it
+ * matters: if the response returns one flat row per line (header repeated), the
+ * sales_order ingest key (DOC_NO) collides and we'd keep only one line per order.
+ * Confirm the shape against a live response before wiring the projection.
  */
 @Injectable()
 export class PurchaseItemProjectionJob extends BlockedJob {
   readonly name = 'project:purchase_item';
   protected readonly reason =
-    'The ERP exposes no sales-order LINE ITEMS — only order headers. So ' +
-    'public.PurchaseItem (productName, quantity, unitPrice, lineTotal) has no source, ' +
-    'and the per-product Stock Balance Breakdown has no data behind it.';
+    'Sales-order line items now EXIST in the ERP (2026-07-28 update), but the ' +
+    'response nesting (detail array vs one flat row per line) is unconfirmed, and ' +
+    'it changes the ingest key. Not wired until a live sample confirms the shape.';
   protected readonly unblockedBy =
-    'Confirmation that sales_order_doc.read returns detail lines, or a ' +
-    'sales_order_detail method. Run `npm run probe` (check 3) to find out.';
-}
-
-/**
- * COLLECTION_DOC carries SETTLEMENT_OBJECT_TYPE but no CUSTOMER_ID, and
- * Payment.customerId is a required FK — an unattributable payment is useless.
- */
-@Injectable()
-export class PaymentProjectionJob extends BlockedJob {
-  readonly name = 'project:payment';
-  protected readonly reason =
-    'COLLECTION_DOC has no customer field, so a payment cannot be attributed to a ' +
-    'customer — and Payment.customerId is a required FK. (runningBalance is also absent.)';
-  protected readonly unblockedBy =
-    'A customer identifier on the collection document, or confirmation that the ' +
-    'customer sits on its lines. Run `npm run probe` (check 5).';
+    'One live sales_order_doc.query sample showing how line items are nested. ' +
+    'The startup debug probe now logs nested arrays/keys — restart and check its ' +
+    'sales_order output.';
 }

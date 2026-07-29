@@ -96,7 +96,9 @@ export class EnvVars {
 
   @IsString()
   @IsOptional()
-  ERP_ACCOUNT: string = 'CRM';
+  // Changed from 'CRM' to 'dcms' in the 2026-07-28 ERP API update (the `acct`
+  // value in the digi-host header). Override in .env if the ERP changes it again.
+  ERP_ACCOUNT: string = 'dcms';
 
   // The ERP is a Digiwin deployment declaring +8; Viju runs at +1. Unresolved —
   // see CONTRACT.md. Kept configurable so we can correct it without a code change.

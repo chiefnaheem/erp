@@ -149,7 +149,8 @@ describe('Sync cycle (e2e)', () => {
     )[0];
 
   // ── The single most important safety property ────────────────────────────
-  it('NEVER creates a customer from ERP data (no phone/region available)', async () => {
+  it('does NOT create a customer when the ERP row has no phone/region', async () => {
+    // Fixture has no PhoneNumber/Region, so it cannot be created.
     await sync.runCycle();
 
     const created = await prisma.customer.findUnique({ where: { erpId: CODE } });
@@ -159,8 +160,19 @@ describe('Sync cycle (e2e)', () => {
     const raw = await rawRow('CUSTOMER', CODE);
     expect(raw.payload).toMatchObject({ CUSTOMER_FULL_NAME: 'ERP Provided Name' });
     expect(raw.projected_at).toBeNull();
-    // With no phone source configured, the job cannot create — and says so.
-    expect(raw.project_error).toMatch(/no ERP_CUSTOMER_PHONE_FIELD configured/i);
+    expect(raw.project_error).toMatch(/phone \(PhoneNumber empty\)/i);
+  });
+
+  it('creates a customer from the default PhoneNumber + Region fields', async () => {
+    customers[0].PhoneNumber = '+2348090000001';
+    customers[0].Region = 'LAGOS'; // matches our enum directly → no map needed
+
+    await sync.runCycle();
+
+    const created = await prisma.customer.findUnique({ where: { erpId: CODE } });
+    expect(created).not.toBeNull();
+    expect(created!.phone).toBe('+2348090000001');
+    expect(created!.region).toBe('LAGOS');
   });
 
   it('updates an existing customer once they are onboarded in the app', async () => {

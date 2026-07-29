@@ -10,6 +10,7 @@ import {
   purchaseTotalValue,
   resolveCustomer,
   toDate,
+  toNumber,
   toOrderStatus,
 } from '../erp.mappers';
 import { JobStats, SyncJob } from '../sync.job';
@@ -54,7 +55,9 @@ export class CustomerProjectionJob extends SyncJob {
     let skipped = 0;
     let created = 0;
     const done: bigint[] = [];
-    let sawMissingPhone = false;
+    // Collected so one live run tells us the ERP's actual region strings, the way
+    // we did for ApproveStatus.
+    const unmappedRegions = new Set<string>();
 
     for (const record of pending) {
       const resolved = resolveCustomer(record.payload, fieldMap);
@@ -87,29 +90,25 @@ export class CustomerProjectionJob extends SyncJob {
         continue;
       }
 
-      // ── Customer does not exist yet ──
-      // Creating one requires phone AND region (both required, no schema default).
-      // With no phone source configured we CANNOT create — the customer stays
-      // queued, and this is a normal "not onboarded / phone source not wired yet"
-      // state, not a hard failure.
-      if (!resolved.canCreate) {
-        skipped++;
-        sawMissingPhone = true;
-        await this.raw.markProjectFailed(
-          'CUSTOMER',
-          record.id,
-          'No app customer, and no ERP_CUSTOMER_PHONE_FIELD configured — cannot create (need phone + region).',
-        );
-        continue;
-      }
-
+      // ── Customer does not exist yet: create it ──
+      // Both phone and region are required (no schema default). If either is
+      // missing or unmapped, skip and leave queued so it heals once the data or
+      // the region map is fixed.
       if (!resolved.phone || !resolved.region) {
         skipped++;
+        if (resolved.phone && resolved.rawRegion && !resolved.region) {
+          // We got a region string from the ERP but couldn't map it to our enum.
+          unmappedRegions.add(resolved.rawRegion);
+        }
+        const missing = !resolved.phone
+          ? 'phone (PhoneNumber empty)'
+          : resolved.rawRegion
+            ? `region — unmapped ERP value "${resolved.rawRegion}"`
+            : 'region (Region empty)';
         await this.raw.markProjectFailed(
           'CUSTOMER',
           record.id,
-          `Cannot create: ${!resolved.phone ? 'phone' : 'region'} missing from ERP payload ` +
-            `(phoneField=${fieldMap.phoneField}, regionField=${fieldMap.regionField}).`,
+          `Cannot create customer ${record.erp_key}: ${missing}`,
         );
         continue;
       }
@@ -147,11 +146,10 @@ export class CustomerProjectionJob extends SyncJob {
     await this.raw.markProjected('CUSTOMER', done);
 
     if (created) this.logger.log(`created ${created} new customer(s) from ERP`);
-    if (sawMissingPhone) {
-      this.logger.warn(
-        'Some ERP customers have no app account and no phone source is configured. ' +
-          'Set ERP_CUSTOMER_PHONE_FIELD (+ ERP_CUSTOMER_REGION_FIELD, ERP_REGION_MAP) ' +
-          'once the probe identifies where phone/region live.',
+    if (unmappedRegions.size) {
+      this.logger.error(
+        `Unmapped ERP Region values (add them to ERP_REGION_MAP): ${[...unmappedRegions].join(', ')}. ` +
+          `Example: ERP_REGION_MAP={"${[...unmappedRegions][0]}":"LAGOS"}`,
       );
     }
 
@@ -281,6 +279,96 @@ export class PurchaseProjectionJob extends SyncJob {
       );
     }
 
+    return { projected, skipped };
+  }
+}
+
+/**
+ * Collections → public.Payment.
+ *
+ * Unblocked by the 2026-07-28 ERP update: collection_doc.query now returns
+ * CUSTOMER_CODE, so a payment can finally be attributed to a customer (that was
+ * the whole blocker — Payment.customerId is a required FK).
+ *
+ * runningBalance has no ERP source and is a required column, so it is written as
+ * 0 for now (a placeholder, not a real ledger balance — see erp-reconciliation).
+ */
+@Injectable()
+export class PaymentProjectionJob extends SyncJob {
+  readonly name = 'project:payment';
+
+  constructor(
+    raw: RawRepository,
+    private readonly prisma: PrismaService,
+  ) {
+    super(raw);
+  }
+
+  protected async execute(): Promise<JobStats> {
+    const pending = await this.raw.pendingProjection('COLLECTION');
+
+    let projected = 0;
+    let skipped = 0;
+    const done: bigint[] = [];
+
+    for (const record of pending) {
+      const payload = record.payload;
+
+      const code = payload.CUSTOMER_CODE as string | undefined;
+      if (!code) {
+        skipped++;
+        await this.raw.markProjectFailed(
+          'COLLECTION',
+          record.id,
+          'Collection has no CUSTOMER_CODE',
+        );
+        continue;
+      }
+
+      const customer = await this.prisma.customer.findUnique({
+        where: { erpId: code },
+        select: { id: true },
+      });
+      if (!customer) {
+        skipped++;
+        await this.raw.markProjectFailed(
+          'COLLECTION',
+          record.id,
+          `No app customer for erpId ${code} — not projected yet`,
+        );
+        continue;
+      }
+
+      const date = toDate(payload.DOC_DATE);
+      const amount = toNumber(payload.COLLECTION_AMT_TC);
+      if (!date || amount === null) {
+        skipped++;
+        await this.raw.markProjectFailed(
+          'COLLECTION',
+          record.id,
+          'Collection missing DOC_DATE or COLLECTION_AMT_TC',
+        );
+        continue;
+      }
+
+      await this.prisma.payment.upsert({
+        where: { erpId: record.erp_key },
+        update: { customerId: customer.id, date, amount, reference: record.erp_key },
+        create: {
+          erpId: record.erp_key,
+          customerId: customer.id,
+          date,
+          amount,
+          reference: record.erp_key,
+          runningBalance: 0, // no ERP source; placeholder
+        },
+      });
+
+      done.push(record.id);
+      projected++;
+    }
+
+    await this.raw.markProjected('COLLECTION', done);
     return { projected, skipped };
   }
 }
