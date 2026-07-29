@@ -60,7 +60,26 @@ export class ErpDebugProbe implements OnApplicationBootstrap {
         const detail = `${page.rows.length} row(s), execution code ${page.execution.code}, ${ms}ms`;
         this.logger.log(`   ✅ ${label}: OK — ${detail}`);
         if (page.rows[0]) {
-          this.logger.log(`   ${label}: field names → ${Object.keys(page.rows[0]).join(', ')}`);
+          const row = page.rows[0] as Record<string, unknown>;
+          this.logger.log(`   ${label}: field names → ${Object.keys(row).join(', ')}`);
+
+          // Surface any nested array/object on the row — this is how we tell
+          // whether sales_order line items come back as a nested detail array
+          // (vs one flat row per line). Log the nested key and its first element.
+          const nested = Object.entries(row).filter(
+            ([, v]) => v !== null && typeof v === 'object',
+          );
+          for (const [key, value] of nested) {
+            const shape = Array.isArray(value)
+              ? `array[${value.length}], first element: ${JSON.stringify(value[0])?.slice(0, 300)}`
+              : `object: ${JSON.stringify(value)?.slice(0, 300)}`;
+            this.logger.log(`   ${label}: nested "${key}" → ${shape}`);
+          }
+          if (!nested.length) {
+            this.logger.log(
+              `   ${label}: no nested arrays/objects — any line items are flattened into the row above`,
+            );
+          }
         } else {
           this.logger.warn(`   ${label}: responded OK but returned NO rows`);
         }

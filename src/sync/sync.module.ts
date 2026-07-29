@@ -2,7 +2,6 @@ import { Module } from '@nestjs/common';
 import { ErpModule } from '../erp/erp.module';
 import { RawModule } from '../raw/raw.module';
 import {
-  PaymentProjectionJob,
   PurchaseItemProjectionJob,
   StockProjectionJob,
 } from './jobs/blocked.jobs';
@@ -18,6 +17,7 @@ import {
 } from './jobs/ingest.jobs';
 import {
   CustomerProjectionJob,
+  PaymentProjectionJob,
   PurchaseProjectionJob,
 } from './jobs/projection.jobs';
 import { SyncScheduler } from './sync.scheduler';
