@@ -58,15 +58,18 @@ export class SyncService {
    * A failed job is logged and never aborts the others; every write is an
    * idempotent upsert, so any job is safely retried next cycle.
    */
-  async runCycle(): Promise<void> {
+  private async runJobs(
+    label: string,
+    jobs: SyncJob[],
+    mode: 'parallel' | 'sequential',
+  ): Promise<void> {
     if (!this.config.get<boolean>('SYNC_ENABLED')) {
-      this.logger.warn('SYNC_ENABLED=false — skipping cycle');
+      this.logger.warn(`SYNC_ENABLED=false — skipping ${label}`);
       return;
     }
 
     const startedAt = Date.now();
     const failures: string[] = [];
-
     const runJob = async (job: SyncJob) => {
       try {
         await job.run();
@@ -80,42 +83,59 @@ export class SyncService {
       }
     };
 
-    // ── Phase 1: ingest — all in parallel ──
-    const ingestJobs: SyncJob[] = [
-      this.customerIngest, // builds customer_link (needed by projection, phase 2)
-      this.salesOrderIngest,
-      this.collectionIngest,
-      this.salesDeliveryIngest,
-      this.customerCreditIngest,
-      this.salesReturnIngest,
-      this.arRefundIngest,
-      this.otherReceivableIngest,
-    ];
-    this.logger.log(`ingest phase: running ${ingestJobs.length} jobs in parallel`);
-    await Promise.all(ingestJobs.map(runJob));
-
-    // ── Phase 2: project — sequential, dependency order (customers before purchases) ──
-    const projectionJobs: SyncJob[] = [
-      this.customerProjection,
-      this.purchaseProjection,
-      // Blocked no-ops, registered so their absence stays visible.
-      this.stockProjection,
-      this.purchaseItemProjection,
-      this.paymentProjection,
-    ];
-    for (const job of projectionJobs) {
-      await runJob(job);
-    }
-
-    const total = ingestJobs.length + projectionJobs.length;
-    const summary =
-      `cycle finished in ${Date.now() - startedAt}ms — ` +
-      `${total - failures.length}/${total} jobs ok`;
-
-    if (failures.length) {
-      this.logger.error(`${summary}; FAILED: ${failures.join(', ')}`);
+    this.logger.log(`${label}: running ${jobs.length} job(s) ${mode}`);
+    if (mode === 'parallel') {
+      await Promise.all(jobs.map(runJob));
     } else {
-      this.logger.log(summary);
+      for (const job of jobs) await runJob(job);
     }
+
+    const summary = `${label} finished in ${Date.now() - startedAt}ms — ${
+      jobs.length - failures.length
+    }/${jobs.length} ok`;
+    if (failures.length) this.logger.error(`${summary}; FAILED: ${failures.join(', ')}`);
+    else this.logger.log(summary);
+  }
+
+  /**
+   * INGEST: ERP → erp_raw. All objects are independent, so they run concurrently.
+   * This is the heavy, slow half (full sweeps of hundreds of thousands of rows).
+   */
+  async runIngest(): Promise<void> {
+    await this.runJobs(
+      'ingest',
+      [
+        this.customerIngest, // builds customer_link, needed by projection
+        this.salesOrderIngest,
+        this.collectionIngest,
+        this.salesDeliveryIngest,
+        this.customerCreditIngest,
+        this.salesReturnIngest,
+        this.arRefundIngest,
+        this.otherReceivableIngest,
+      ],
+      'parallel',
+    );
+  }
+
+  /**
+   * PROJECT: erp_raw → public.*. Decoupled from ingest and run on its own, more
+   * frequent schedule, so it drains the backlog independently instead of waiting
+   * on (and dying with) the slow sweep. Sequential + dependency-ordered:
+   * customers must exist before their orders/payments (FK).
+   */
+  async runProjection(): Promise<void> {
+    await this.runJobs(
+      'projection',
+      [
+        this.customerProjection, // all customers
+        this.purchaseProjection, // active customers' orders
+        this.paymentProjection, // active customers' payments
+        // Blocked no-ops, registered so their absence stays visible.
+        this.stockProjection,
+        this.purchaseItemProjection,
+      ],
+      'sequential',
+    );
   }
 }

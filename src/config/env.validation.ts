@@ -184,6 +184,20 @@ export class EnvVars {
   @IsOptional()
   ERP_SYNC_CRON: string = '0 */15 * * * *';
 
+  // Projection (erp_raw → public) runs on its OWN schedule, decoupled from the
+  // heavy ingest sweep, so the backlog drains independently. Every 3 min default.
+  @IsString()
+  @IsOptional()
+  ERP_PROJECT_CRON: string = '0 */3 * * * *';
+
+  // Rows projected per batch while draining the backlog.
+  @IsInt()
+  @Min(1)
+  @Max(10000)
+  @IsOptional()
+  @Transform(toInt)
+  ERP_PROJECT_BATCH: number = 1000;
+
   // Lease length for the cross-replica sync lock. Must comfortably exceed the
   // longest expected cycle, or a slow sweep would have its lock stolen mid-run.
   @IsInt()
