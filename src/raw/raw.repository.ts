@@ -195,20 +195,73 @@ export class RawRepository {
     return { fetched, changed };
   }
 
-  /** Rows the ERP has changed that `public.*` hasn't caught up with yet. */
+  /**
+   * A page of pending rows, cursor-based (id > afterId, ORDER BY id).
+   *
+   * Cursor paging (not OFFSET, not "pending until empty") is what lets a caller
+   * DRAIN the whole backlog in one run without looping forever: a row that gets
+   * skipped stays pending, but the cursor still advances past it, so the same
+   * un-projectable rows are not re-fetched within the same drain. They are simply
+   * retried on the NEXT run.
+   */
   async pendingProjection(
     objectType: ErpObjectType,
-    limit = 500,
+    afterId: bigint,
+    limit: number,
   ): Promise<PendingRecord[]> {
     const t = this.table(objectType);
     return this.prisma.$queryRawUnsafe<PendingRecord[]>(
       `
       SELECT id, erp_key, payload
       FROM erp_raw.${t}
-      WHERE projected_at IS NULL
-      ORDER BY changed_at ASC
-      LIMIT $1
+      WHERE projected_at IS NULL AND id > $1
+      ORDER BY id ASC
+      LIMIT $2
       `,
+      afterId,
+      limit,
+    );
+  }
+
+  /**
+   * Pending transaction rows whose customer is an ACTIVE app user (has a
+   * password — i.e. onboarded). This is the "transactions on-demand" scope: we
+   * only project a customer's orders/payments once they actually use the app, and
+   * the rest stay queued and project themselves the moment that customer onboards.
+   *
+   * The customer join differs by object: sales orders reference CUSTOMER_ID (a
+   * Guid, resolved via customer_link); collections carry CUSTOMER_CODE directly.
+   */
+  async pendingProjectionActive(
+    objectType: 'SALES_ORDER' | 'COLLECTION',
+    afterId: bigint,
+    limit: number,
+  ): Promise<PendingRecord[]> {
+    if (objectType === 'SALES_ORDER') {
+      return this.prisma.$queryRawUnsafe<PendingRecord[]>(
+        `
+        SELECT r.id, r.erp_key, r.payload
+        FROM erp_raw.raw_sales_order r
+        JOIN erp_raw.customer_link cl ON cl.erp_customer_guid = r.payload->>'CUSTOMER_ID'
+        JOIN public."Customer" c ON c."erpId" = cl.erp_customer_code AND c.password IS NOT NULL
+        WHERE r.projected_at IS NULL AND r.id > $1
+        ORDER BY r.id ASC
+        LIMIT $2
+        `,
+        afterId,
+        limit,
+      );
+    }
+    return this.prisma.$queryRawUnsafe<PendingRecord[]>(
+      `
+      SELECT r.id, r.erp_key, r.payload
+      FROM erp_raw.raw_collection r
+      JOIN public."Customer" c ON c."erpId" = r.payload->>'CUSTOMER_CODE' AND c.password IS NOT NULL
+      WHERE r.projected_at IS NULL AND r.id > $1
+      ORDER BY r.id ASC
+      LIMIT $2
+      `,
+      afterId,
       limit,
     );
   }

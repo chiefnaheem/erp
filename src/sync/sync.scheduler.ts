@@ -10,7 +10,8 @@ import { Prisma } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { SyncService } from './sync.service';
 
-const LOCK_NAME = 'cycle';
+const INGEST_LOCK = 'ingest';
+const PROJECT_LOCK = 'projection';
 
 @Injectable()
 export class SyncScheduler implements OnApplicationBootstrap {
@@ -39,13 +40,13 @@ export class SyncScheduler implements OnApplicationBootstrap {
   async onApplicationBootstrap(): Promise<void> {
     const released = await this.prisma.$executeRaw`
       UPDATE erp_raw.sync_lock SET locked_until = now()
-      WHERE name = ${LOCK_NAME}
+      WHERE name IN (${INGEST_LOCK}, ${PROJECT_LOCK})
         AND locked_by LIKE ${this.host + ':%'}
         AND locked_until > now()
     `;
     if (released > 0) {
       this.logger.warn(
-        `released a stale sync lock held by a previous process on ${this.host}`,
+        `released ${released} stale sync lock(s) held by a previous process on ${this.host}`,
       );
     }
 
@@ -75,9 +76,27 @@ export class SyncScheduler implements OnApplicationBootstrap {
    * acquiring the lock, running the cycle, or releasing — rather than surfacing a
    * bare Prisma error with no context.
    */
-  @Cron(process.env.ERP_SYNC_CRON || '0 */15 * * * *', { name: 'erp-sync-cycle' })
-  async tick(): Promise<void> {
-    const tag = `tick #${++this.tickCount}`;
+  // INGEST: the heavy ERP → erp_raw sweep. Every 15 min by default.
+  @Cron(process.env.ERP_SYNC_CRON || '0 */15 * * * *', { name: 'erp-ingest' })
+  async ingestTick(): Promise<void> {
+    await this.runStage(INGEST_LOCK, () => this.sync.runIngest());
+  }
+
+  // PROJECT: erp_raw → public.*. Runs on its own, more frequent schedule (every
+  // 3 min by default) so the backlog drains independently of the slow sweep — a
+  // dying ingest no longer starves projection.
+  @Cron(process.env.ERP_PROJECT_CRON || '0 */3 * * * *', { name: 'erp-project' })
+  async projectionTick(): Promise<void> {
+    await this.runStage(PROJECT_LOCK, () => this.sync.runProjection());
+  }
+
+  /**
+   * Run a stage under its own lease lock, with per-stage timing and failure
+   * naming. Ingest and projection each get an independent lock, so one can run
+   * while the other is mid-flight.
+   */
+  private async runStage(lockName: string, work: () => Promise<void>): Promise<void> {
+    const tag = `${lockName} #${++this.tickCount}`;
     const startedAt = Date.now();
 
     if (!this.config.get<boolean>('SYNC_ENABLED')) {
@@ -86,62 +105,52 @@ export class SyncScheduler implements OnApplicationBootstrap {
     }
 
     const leaseMinutes = this.config.get<number>('SYNC_LOCK_MINUTES') ?? 30;
-    this.logger.log(`${tag}: starting (owner=${this.owner}, lease=${leaseMinutes}m)`);
 
-    // ── Stage 1: acquire the lock ──
     let acquired: boolean;
     try {
-      acquired = await this.acquire(leaseMinutes);
+      acquired = await this.acquire(lockName, leaseMinutes);
     } catch (error) {
-      // This is exactly where the make_interval bug surfaced. Name the stage so
-      // it can never again look like an anonymous database error.
       this.logFailure(tag, 'ACQUIRE_LOCK', error, startedAt);
       return;
     }
 
     if (!acquired) {
       this.logger.log(
-        `${tag}: another worker holds the sync lock — standing down (${Date.now() - startedAt}ms)`,
+        `${tag}: another worker holds the ${lockName} lock — standing down (${Date.now() - startedAt}ms)`,
       );
       return;
     }
-    this.logger.log(`${tag}: lock acquired`);
 
-    // ── Stage 2: run the cycle ──
-    let cycleError: unknown;
-    const cycleStartedAt = Date.now();
+    let stageError: unknown;
+    const workStartedAt = Date.now();
     try {
-      await this.sync.runCycle();
-      this.logger.log(`${tag}: cycle completed in ${Date.now() - cycleStartedAt}ms`);
+      await work();
+      this.logger.log(`${tag}: completed in ${Date.now() - workStartedAt}ms`);
     } catch (error) {
-      cycleError = error;
-      this.logFailure(tag, 'RUN_CYCLE', error, cycleStartedAt);
-      // Fall through — the lock MUST be released even when the cycle fails.
+      stageError = error;
+      this.logFailure(tag, 'RUN', error, workStartedAt);
     }
 
-    // ── Stage 3: release the lock (always) ──
     try {
-      await this.release();
-      this.logger.log(`${tag}: lock released`);
+      await this.release(lockName);
     } catch (error) {
-      // A failed release is serious: the lease will now be held until it expires,
-      // so the next few ticks will stand down. Flag it loudly and distinctly.
       this.logFailure(tag, 'RELEASE_LOCK', error, startedAt);
     }
 
-    const outcome = cycleError ? 'FAILED' : 'ok';
-    this.logger.log(`${tag}: ${outcome} — total ${Date.now() - startedAt}ms`);
+    this.logger.log(
+      `${tag}: ${stageError ? 'FAILED' : 'ok'} — total ${Date.now() - startedAt}ms`,
+    );
   }
 
   /**
-   * Take the lease if it is free or expired. Returns false if another worker
-   * holds it, in which case this tick simply stands down.
+   * Take the named lease if it is free or expired. Returns false if another
+   * worker holds it, in which case this tick stands down.
    */
-  private async acquire(leaseMinutes: number): Promise<boolean> {
+  private async acquire(lockName: string, leaseMinutes: number): Promise<boolean> {
     const rows = await this.prisma.$queryRaw<{ name: string }[]>`
       INSERT INTO erp_raw.sync_lock (name, locked_until, locked_by, acquired_at)
       VALUES (
-        ${LOCK_NAME},
+        ${lockName},
         (now() + (${leaseMinutes}::int * interval '1 minute')),
         ${this.owner},
         now()
@@ -150,19 +159,16 @@ export class SyncScheduler implements OnApplicationBootstrap {
         locked_until = (now() + (${leaseMinutes}::int * interval '1 minute')),
         locked_by    = ${this.owner},
         acquired_at  = now()
-      -- Only steal the lock once the previous holder's lease has expired. This is
-      -- what makes a worker that died mid-sweep self-healing rather than a
-      -- permanent deadlock.
       WHERE erp_raw.sync_lock.locked_until < now()
       RETURNING name
     `;
     return rows.length > 0;
   }
 
-  private async release(): Promise<void> {
+  private async release(lockName: string): Promise<void> {
     await this.prisma.$executeRaw`
       UPDATE erp_raw.sync_lock SET locked_until = now()
-      WHERE name = ${LOCK_NAME} AND locked_by = ${this.owner}
+      WHERE name = ${lockName} AND locked_by = ${this.owner}
     `;
   }
 

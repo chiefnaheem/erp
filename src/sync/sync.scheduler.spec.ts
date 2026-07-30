@@ -24,7 +24,7 @@ describe('SyncScheduler lock (integration)', () => {
         PrismaService,
         RawMigrator,
         SyncScheduler,
-        { provide: SyncService, useValue: { runCycle: async () => void cycleRuns++ } },
+        { provide: SyncService, useValue: { runIngest: async () => void cycleRuns++, runProjection: async () => void cycleRuns++ } },
         {
           provide: ConfigService,
           useValue: {
@@ -42,13 +42,13 @@ describe('SyncScheduler lock (integration)', () => {
   });
 
   afterAll(async () => {
-    await prisma.$executeRawUnsafe(`DELETE FROM erp_raw.sync_lock WHERE name = 'cycle'`);
+    await prisma.$executeRawUnsafe(`DELETE FROM erp_raw.sync_lock WHERE name = 'ingest'`);
     await prisma.$disconnect();
   });
 
   beforeEach(async () => {
     cycleRuns = 0;
-    await prisma.$executeRawUnsafe(`DELETE FROM erp_raw.sync_lock WHERE name = 'cycle'`);
+    await prisma.$executeRawUnsafe(`DELETE FROM erp_raw.sync_lock WHERE name = 'ingest'`);
   });
 
   it('on startup releases this host\'s stale lock and closes dangling RUNNING runs', async () => {
@@ -56,7 +56,7 @@ describe('SyncScheduler lock (integration)', () => {
     // A lock left by a previous process on THIS host, still within its lease.
     await prisma.$executeRawUnsafe(
       `INSERT INTO erp_raw.sync_lock (name, locked_until, locked_by)
-       VALUES ('cycle', now() + interval '25 minutes', '${os.hostname()}:99999')`,
+       VALUES ('ingest', now() + interval '25 minutes', '${os.hostname()}:99999')`,
     );
     const runId = await (async () => {
       const r = await prisma.$queryRawUnsafe<any[]>(
@@ -69,7 +69,7 @@ describe('SyncScheduler lock (integration)', () => {
 
     // Lock is now free (expired), so a tick can proceed.
     const lock = await prisma.$queryRawUnsafe<any[]>(
-      `SELECT locked_until <= now() AS released FROM erp_raw.sync_lock WHERE name = 'cycle'`,
+      `SELECT locked_until <= now() AS released FROM erp_raw.sync_lock WHERE name = 'ingest'`,
     );
     expect(lock[0]?.released).toBe(true);
 
@@ -84,13 +84,13 @@ describe('SyncScheduler lock (integration)', () => {
 
   it('acquires the lease and runs a cycle (the make_interval bug would throw here)', async () => {
     // If the lock SQL were still broken this would throw before running the cycle.
-    await scheduler.tick();
+    await scheduler.ingestTick();
     expect(cycleRuns).toBe(1);
 
     // tick() releases the lease in its finally block, so afterwards it is no
     // longer held into the future — proving both acquire AND release ran.
     const rows = await prisma.$queryRawUnsafe<any[]>(
-      `SELECT locked_until <= now() AS released FROM erp_raw.sync_lock WHERE name = 'cycle'`,
+      `SELECT locked_until <= now() AS released FROM erp_raw.sync_lock WHERE name = 'ingest'`,
     );
     expect(rows[0]?.released).toBe(true);
   });
@@ -99,20 +99,20 @@ describe('SyncScheduler lock (integration)', () => {
     // Pretend another worker holds a fresh lease.
     await prisma.$executeRawUnsafe(
       `INSERT INTO erp_raw.sync_lock (name, locked_until, locked_by)
-       VALUES ('cycle', now() + interval '30 minutes', 'other-worker')`,
+       VALUES ('ingest', now() + interval '30 minutes', 'other-worker')`,
     );
 
-    await scheduler.tick();
+    await scheduler.ingestTick();
     expect(cycleRuns).toBe(0); // must NOT run while someone else holds it
   });
 
   it('steals an EXPIRED lease and runs (self-healing after a dead worker)', async () => {
     await prisma.$executeRawUnsafe(
       `INSERT INTO erp_raw.sync_lock (name, locked_until, locked_by)
-       VALUES ('cycle', now() - interval '1 minute', 'dead-worker')`,
+       VALUES ('ingest', now() - interval '1 minute', 'dead-worker')`,
     );
 
-    await scheduler.tick();
+    await scheduler.ingestTick();
     expect(cycleRuns).toBe(1); // expired lease → we take over
   });
 
@@ -121,24 +121,24 @@ describe('SyncScheduler lock (integration)', () => {
       .spyOn(Logger.prototype, 'error')
       .mockImplementation(() => undefined);
     const boom = new Error('kaboom');
-    const runCycle = jest
-      .spyOn((scheduler as any).sync, 'runCycle')
+    const runIngest = jest
+      .spyOn((scheduler as any).sync, 'runIngest')
       .mockRejectedValueOnce(boom);
 
-    await scheduler.tick(); // must NOT throw out of tick
+    await scheduler.ingestTick(); // must NOT throw out of tick
 
     // The failure is attributed to the RUN_CYCLE stage, not left anonymous.
     const logged = errorSpy.mock.calls.map((c) => String(c[0])).join('\n');
-    expect(logged).toMatch(/STAGE RUN_CYCLE FAILED/);
+    expect(logged).toMatch(/STAGE RUN FAILED/);
     expect(logged).toMatch(/kaboom/);
 
     // Lock must have been released despite the failure (next tick can proceed).
     const rows = await prisma.$queryRawUnsafe<any[]>(
-      `SELECT locked_until <= now() AS released FROM erp_raw.sync_lock WHERE name = 'cycle'`,
+      `SELECT locked_until <= now() AS released FROM erp_raw.sync_lock WHERE name = 'ingest'`,
     );
     expect(rows[0]?.released).toBe(true);
 
-    runCycle.mockRestore();
+    runIngest.mockRestore();
     errorSpy.mockRestore();
   });
 });

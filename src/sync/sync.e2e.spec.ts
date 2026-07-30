@@ -148,10 +148,16 @@ describe('Sync cycle (e2e)', () => {
       )
     )[0];
 
+  // Ingest and projection are now separate stages; a "full cycle" runs both.
+  const runCycle = async () => {
+    await sync.runIngest();
+    await sync.runProjection();
+  };
+
   // ── The single most important safety property ────────────────────────────
   it('does NOT create a customer when the ERP row has no phone/region', async () => {
     // Fixture has no PhoneNumber/Region, so it cannot be created.
-    await sync.runCycle();
+    await runCycle();
 
     const created = await prisma.customer.findUnique({ where: { erpId: CODE } });
     expect(created).toBeNull(); // must NOT have been inserted
@@ -167,7 +173,7 @@ describe('Sync cycle (e2e)', () => {
     customers[0].PhoneNumber = '+2348090000001';
     customers[0].Region = 'LAGOS'; // matches our enum directly → no map needed
 
-    await sync.runCycle();
+    await runCycle();
 
     const created = await prisma.customer.findUnique({ where: { erpId: CODE } });
     expect(created).not.toBeNull();
@@ -176,7 +182,7 @@ describe('Sync cycle (e2e)', () => {
   });
 
   it('updates an existing customer once they are onboarded in the app', async () => {
-    await sync.runCycle(); // customer not onboarded yet → skipped
+    await runCycle(); // customer not onboarded yet → skipped
 
     await prisma.customer.create({
       data: {
@@ -187,7 +193,7 @@ describe('Sync cycle (e2e)', () => {
       },
     });
 
-    await sync.runCycle();
+    await runCycle();
 
     const customer = await prisma.customer.findUnique({ where: { erpId: CODE } });
     expect(customer!.name).toBe('ERP Provided Name');
@@ -205,7 +211,7 @@ describe('Sync cycle (e2e)', () => {
     config.set('ERP_CUSTOMER_REGION_FIELD', 'UDF_REGION');
     config.set('ERP_REGION_MAP', '{"West":"SOUTH_WEST","Lagos":"LAGOS"}');
 
-    await sync.runCycle();
+    await runCycle();
 
     const created = await prisma.customer.findUnique({ where: { erpId: CODE } });
     expect(created).not.toBeNull();
@@ -235,7 +241,7 @@ describe('Sync cycle (e2e)', () => {
     config.set('ERP_CUSTOMER_REGION_FIELD', 'UDF_REGION');
     config.set('ERP_REGION_MAP', '{"Lagos":"LAGOS","West":"SOUTH_WEST"}');
 
-    await sync.runCycle();
+    await runCycle();
 
     // No duplicate created; the existing row is now linked to the ERP code.
     const byPhone = await prisma.customer.findUnique({ where: { phone: '+2348044455566' } });
@@ -254,7 +260,7 @@ describe('Sync cycle (e2e)', () => {
       data: { erpId: CODE, name: 'X', phone: '+2348000000002', region: 'LAGOS' },
     });
 
-    await sync.runCycle();
+    await runCycle();
 
     expect(await prisma.purchase.findUnique({ where: { erpId: DOC } })).toBeNull();
 
@@ -268,10 +274,10 @@ describe('Sync cycle (e2e)', () => {
       data: { erpId: CODE, name: 'X', phone: '+2348000000003', region: 'LAGOS' },
     });
 
-    await sync.runCycle(); // skipped: unmapped status
+    await runCycle(); // skipped: unmapped status
 
     config.set('ERP_STATUS_MAP', '{"APPROVED_BY_ERP":"PROCESSING"}');
-    await sync.runCycle();
+    await runCycle();
 
     const purchase = await prisma.purchase.findUnique({ where: { erpId: DOC } });
     expect(purchase).not.toBeNull();
@@ -288,7 +294,7 @@ describe('Sync cycle (e2e)', () => {
       data: { erpId: CODE, name: 'X', phone: '+2348000000004', region: 'LAGOS' },
     });
     config.set('ERP_STATUS_MAP', '{"APPROVED_BY_ERP":"PROCESSING"}');
-    await sync.runCycle();
+    await runCycle();
 
     const purchase = await prisma.purchase.findUniqueOrThrow({ where: { erpId: DOC } });
     // Items arrive from the main API's webhook, not the ERP pull.
@@ -304,7 +310,7 @@ describe('Sync cycle (e2e)', () => {
 
     // A later sweep sees a changed order and re-projects the header...
     salesOrders[0].AMT_UNINCLUDE_TAX_OC = 2000;
-    await sync.runCycle();
+    await runCycle();
 
     // ...and the items — which power the Stock Balance Breakdown — must survive.
     const items = await prisma.purchaseItem.findMany({ where: { purchaseId: purchase.id } });
@@ -325,11 +331,11 @@ describe('Sync cycle (e2e)', () => {
     });
     config.set('ERP_STATUS_MAP', '{"APPROVED_BY_ERP":"PROCESSING"}');
 
-    await sync.runCycle();
+    await runCycle();
     const afterFirst = await rawRow('SALES_ORDER', DOC);
     expect(afterFirst.projected_at).not.toBeNull();
 
-    await sync.runCycle(); // identical ERP data
+    await runCycle(); // identical ERP data
 
     const runs = await prisma.$queryRawUnsafe<any[]>(
       `SELECT rows_fetched, rows_changed FROM erp_raw.sync_run
@@ -341,7 +347,7 @@ describe('Sync cycle (e2e)', () => {
 
   // ── Blocked jobs stay visible ────────────────────────────────────────────
   it('records the blocked jobs as skipped instead of silently omitting them', async () => {
-    await sync.runCycle();
+    await runCycle();
 
     const blocked = await prisma.$queryRawUnsafe<any[]>(
       `SELECT DISTINCT job FROM erp_raw.sync_run
