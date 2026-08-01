@@ -232,10 +232,19 @@ export class EnvVars {
   ERP_CUSTOMER_REGION_FIELD?: string;
 
   // Maps ERP region values onto our enum, e.g.
-  //   ERP_REGION_MAP={"Lagos":"LAGOS","West":"SOUTH_WEST","East":"SOUTH_EAST","North":"NORTH"}
+  //   ERP_REGION_MAP={"南部":"SOUTH_WEST","北部":"NORTH","西部":"SOUTH_WEST"}
   @IsString()
   @IsOptional()
   ERP_REGION_MAP?: string;
+
+  // Fallback region when the ERP value is empty or unmapped. The ERP's region
+  // data is largely empty/Chinese, and region is REQUIRED with no schema default,
+  // so without a fallback nearly all customers are un-creatable. Setting this
+  // unblocks customer creation; accuracy can be refined via ERP_REGION_MAP later.
+  //   ERP_REGION_DEFAULT=LAGOS
+  @IsString()
+  @IsOptional()
+  ERP_REGION_DEFAULT?: string;
 }
 
 export function validateEnv(raw: Record<string, unknown>): EnvVars {

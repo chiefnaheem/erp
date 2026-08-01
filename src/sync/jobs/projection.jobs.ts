@@ -1,6 +1,6 @@
 import { Injectable } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { OrderStatus } from '@prisma/client';
+import { OrderStatus, Region } from '@prisma/client';
 import { PrismaService } from '../../prisma/prisma.service';
 import { RawRepository } from '../../raw/raw.repository';
 import {
@@ -49,111 +49,133 @@ export class CustomerProjectionJob extends SyncJob {
       phoneField: this.config.get<string>('ERP_CUSTOMER_PHONE_FIELD'),
       regionField: this.config.get<string>('ERP_CUSTOMER_REGION_FIELD'),
       regionMap: this.config.get<string>('ERP_REGION_MAP'),
+      regionDefault: this.config.get<string>('ERP_REGION_DEFAULT'),
     });
     const batchSize = this.config.get<number>('ERP_PROJECT_BATCH') ?? DEFAULT_BATCH;
 
     let projected = 0;
     let skipped = 0;
     let created = 0;
-    // Collected so one live run tells us the ERP's actual region strings.
     const unmappedRegions = new Set<string>();
 
-    // ALL customers project (not filtered) — they are the login/lookup base. Drain
-    // the whole backlog this run via cursor paging.
+    // ALL customers project (login/lookup base). Bulk-write per batch — a few
+    // set queries + one createMany per batch instead of ~3 round-trips per row,
+    // so thousands of customers project in seconds, not the ~28 min that blew
+    // past the lock lease.
     let afterId = 0n;
     for (let b = 0; b < MAX_BATCHES; b++) {
       const batch = await this.raw.pendingProjection('CUSTOMER', afterId, batchSize);
       if (batch.length === 0) break;
       afterId = batch[batch.length - 1].id;
-      const done: bigint[] = [];
+
+      // Resolve, and dedupe by phone within the batch (unique constraint).
+      const seenPhone = new Set<string>();
+      const creatable: {
+        rawId: bigint;
+        erpId: string;
+        name: string;
+        phone: string;
+        region: Region;
+      }[] = [];
+      const failed: bigint[] = [];
 
       for (const record of batch) {
-        const resolved = resolveCustomer(record.payload, fieldMap);
-
-        if (!resolved.name) {
-          skipped++;
-          await this.raw.markProjectFailed('CUSTOMER', record.id, 'ERP row has no customer name');
-          continue;
-        }
-
-        const existing = await this.prisma.customer.findUnique({
-          where: { erpId: record.erp_key },
-          select: { id: true },
-        });
-
-        if (existing) {
-          // Update ERP-owned fields only. App-owned fields (password, OTP state,
-          // assignedOfficer, ...) are never touched, and phone/region are only
-          // overwritten when the ERP actually gave usable values.
-          await this.prisma.customer.update({
-            where: { id: existing.id },
-            data: {
-              name: resolved.name,
-              ...(resolved.phone ? { phone: resolved.phone } : {}),
-              ...(resolved.region ? { region: resolved.region } : {}),
-            },
-          });
-          done.push(record.id);
-          projected++;
-          continue;
-        }
-
-        // ── Create: needs phone AND region (both required, no default) ──
-        if (!resolved.phone || !resolved.region) {
-          skipped++;
-          if (resolved.phone && resolved.rawRegion && !resolved.region) {
-            unmappedRegions.add(resolved.rawRegion);
-          }
-          const missing = !resolved.phone
-            ? 'phone (PhoneNumber empty)'
-            : resolved.rawRegion
-              ? `region — unmapped ERP value "${resolved.rawRegion}"`
-              : 'region (Region empty)';
+        const r = resolveCustomer(record.payload, fieldMap);
+        if (!r.name || !r.phone || !r.region) {
+          if (r.phone && r.rawRegion && !r.region) unmappedRegions.add(r.rawRegion);
+          failed.push(record.id);
           await this.raw.markProjectFailed(
             'CUSTOMER',
             record.id,
-            `Cannot create customer ${record.erp_key}: ${missing}`,
+            !r.name ? 'no name' : !r.phone ? 'no phone' : 'no region',
           );
           continue;
         }
+        if (seenPhone.has(r.phone)) {
+          // Two ERP customers share a phone in this batch — defer the dup; it
+          // retries next run once the first is committed.
+          failed.push(record.id);
+          await this.raw.markProjectFailed('CUSTOMER', record.id, `duplicate phone in batch: ${r.phone}`);
+          continue;
+        }
+        seenPhone.add(r.phone);
+        creatable.push({ rawId: record.id, erpId: record.erp_key, name: r.name, phone: r.phone, region: r.region });
+      }
+      skipped += failed.length;
 
-        // Guard the UNIQUE phone constraint: attach erpId to an existing phone
-        // rather than failing on a duplicate key.
-        const byPhone = await this.prisma.customer.findUnique({
-          where: { phone: resolved.phone },
-          select: { id: true },
-        });
-        if (byPhone) {
+      if (creatable.length === 0) continue;
+
+      // Which of these already exist (by erpId or by phone), in one query each.
+      const erpIds = creatable.map((c) => c.erpId);
+      const phones = creatable.map((c) => c.phone);
+      const [byErp, byPhone] = await Promise.all([
+        this.prisma.customer.findMany({
+          where: { erpId: { in: erpIds } },
+          select: { id: true, erpId: true },
+        }),
+        this.prisma.customer.findMany({
+          where: { phone: { in: phones } },
+          select: { id: true, erpId: true, phone: true },
+        }),
+      ]);
+      const existErpId = new Map(byErp.map((c) => [c.erpId, c.id]));
+      const phoneOwner = new Map(byPhone.map((c) => [c.phone!, c] as const));
+
+      const toCreate: typeof creatable = [];
+      const projectedIds: bigint[] = [];
+
+      for (const c of creatable) {
+        const existingId = existErpId.get(c.erpId);
+        if (existingId) {
+          // Update ONLY the name on an existing customer. phone and region are
+          // app-owned identity/login fields — and the ERP's phone is a shared
+          // placeholder — so the sync must never overwrite them once set.
           await this.prisma.customer.update({
-            where: { id: byPhone.id },
-            data: { erpId: record.erp_key, name: resolved.name, region: resolved.region },
+            where: { id: existingId },
+            data: { name: c.name },
           });
-          done.push(record.id);
+          projectedIds.push(c.rawId);
           projected++;
           continue;
         }
-
-        await this.prisma.customer.create({
-          data: {
-            erpId: record.erp_key,
-            name: resolved.name,
-            phone: resolved.phone,
-            region: resolved.region,
-          },
-        });
-        done.push(record.id);
-        created++;
-        projected++;
+        const owner = phoneOwner.get(c.phone);
+        if (owner && owner.erpId !== c.erpId) {
+          // Phone already belongs to another customer (onboarded before the ERP
+          // link). Attach this erpId to them rather than creating a duplicate.
+          await this.prisma.customer.update({
+            where: { id: owner.id },
+            data: { erpId: c.erpId, name: c.name, region: c.region },
+          });
+          projectedIds.push(c.rawId);
+          projected++;
+          continue;
+        }
+        toCreate.push(c);
       }
 
-      await this.raw.markProjected('CUSTOMER', done);
+      if (toCreate.length) {
+        await this.prisma.customer.createMany({
+          data: toCreate.map((c) => ({
+            erpId: c.erpId,
+            name: c.name,
+            phone: c.phone,
+            region: c.region,
+          })),
+          skipDuplicates: true,
+        });
+        for (const c of toCreate) projectedIds.push(c.rawId);
+        created += toCreate.length;
+        projected += toCreate.length;
+      }
+
+      await this.raw.markProjected('CUSTOMER', projectedIds);
     }
 
     if (created) this.logger.log(`created ${created} new customer(s) from ERP`);
     if (unmappedRegions.size) {
       this.logger.error(
-        `Unmapped ERP Region values (add them to ERP_REGION_MAP): ${[...unmappedRegions].join(', ')}. ` +
-          `Example: ERP_REGION_MAP={"${[...unmappedRegions][0]}":"LAGOS"}`,
+        `Unmapped ERP Region values (add to ERP_REGION_MAP or set ERP_REGION_DEFAULT): ` +
+          `${[...unmappedRegions].join(', ')}`,
       );
     }
 
