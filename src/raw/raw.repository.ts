@@ -266,6 +266,113 @@ export class RawRepository {
     );
   }
 
+  /**
+   * Bulk-project every ACTIVE customer's unprojected sales orders into
+   * public."Purchase" in a single set-based statement, and mark the raw rows
+   * projected. This replaces the per-row loop that was too slow to finish within
+   * the lock lease. Only orders whose ApproveStatus is in `statusMap` and that
+   * have a usable date are projected; the rest stay queued.
+   */
+  async bulkProjectPurchases(
+    statusMap: Record<string, string>,
+  ): Promise<{ projected: number }> {
+    const keys = Object.keys(statusMap);
+    if (keys.length === 0) return { projected: 0 };
+    const esc = (s: string) => `'${s.replace(/'/g, "''")}'`;
+    const inList = keys.map(esc).join(',');
+    const caseSql = keys
+      .map((k) => `WHEN ${esc(k)} THEN ${esc(statusMap[k])}`)
+      .join(' ');
+
+    const rows = await this.prisma.$queryRawUnsafe<{ n: number }[]>(`
+      WITH proj AS (
+        UPDATE erp_raw.raw_sales_order r
+        SET projected_at = now(), project_error = NULL
+        FROM erp_raw.customer_link cl, public."Customer" c
+        WHERE cl.erp_customer_guid = r.payload->>'CUSTOMER_ID'
+          AND c."erpId" = cl.erp_customer_code AND c.password IS NOT NULL
+          AND r.projected_at IS NULL
+          AND r.payload->>'ApproveStatus' IN (${inList})
+          AND NULLIF(r.payload->>'ORDER_DATE','') IS NOT NULL
+        RETURNING r.erp_key, r.payload, c.id AS customer_id
+      ), ins AS (
+        INSERT INTO public."Purchase"
+          (id,"erpId","customerId","orderDate","totalItems","totalValue",status,"createdAt","updatedAt")
+        SELECT (md5(random()::text||clock_timestamp()::text||erp_key))::uuid, erp_key, customer_id,
+          (payload->>'ORDER_DATE')::timestamp,
+          CASE WHEN payload->>'QTY_TOTAL' ~ '^[0-9.]+$' THEN (payload->>'QTY_TOTAL')::numeric::int ELSE 0 END,
+          COALESCE(NULLIF(payload->>'AMT_UNINCLUDE_TAX_OC','')::numeric,0)
+            + COALESCE(NULLIF(payload->>'TAX_OC','')::numeric,0),
+          (CASE payload->>'ApproveStatus' ${caseSql} END)::"OrderStatus",
+          now(), now()
+        FROM proj
+        ON CONFLICT ("erpId") DO UPDATE SET
+          status = EXCLUDED.status, "orderDate" = EXCLUDED."orderDate",
+          "totalItems" = EXCLUDED."totalItems", "totalValue" = EXCLUDED."totalValue",
+          "updatedAt" = now()
+        RETURNING 1
+      )
+      SELECT count(*)::int AS n FROM ins
+    `);
+    return { projected: Number(rows[0]?.n ?? 0) };
+  }
+
+  /**
+   * Bulk-project every ACTIVE customer's unprojected collections into
+   * public."Payment" in one statement. runningBalance is set to 0 on insert and
+   * left untouched on conflict (so any value set elsewhere is preserved).
+   */
+  async bulkProjectPayments(): Promise<{ projected: number }> {
+    const rows = await this.prisma.$queryRawUnsafe<{ n: number }[]>(`
+      WITH proj AS (
+        UPDATE erp_raw.raw_collection r
+        SET projected_at = now(), project_error = NULL
+        FROM public."Customer" c
+        WHERE c."erpId" = r.payload->>'CUSTOMER_CODE' AND c.password IS NOT NULL
+          AND r.projected_at IS NULL
+          AND NULLIF(r.payload->>'DOC_DATE','') IS NOT NULL
+        RETURNING r.erp_key, r.payload, c.id AS customer_id
+      ), ins AS (
+        INSERT INTO public."Payment"
+          (id,"erpId","customerId",date,amount,reference,"runningBalance","createdAt")
+        SELECT (md5(random()::text||clock_timestamp()::text||erp_key))::uuid, erp_key, customer_id,
+          (payload->>'DOC_DATE')::timestamp,
+          COALESCE(NULLIF(payload->>'COLLECTION_AMT_TC','')::numeric,0), erp_key, 0, now()
+        FROM proj
+        ON CONFLICT ("erpId") DO UPDATE SET
+          amount = EXCLUDED.amount, date = EXCLUDED.date
+        RETURNING 1
+      )
+      SELECT count(*)::int AS n FROM ins
+    `);
+    return { projected: Number(rows[0]?.n ?? 0) };
+  }
+
+  /**
+   * Refresh ERP-owned fields (name) on customers that ALREADY exist, in one
+   * statement. Customer CREATION is not attempted here: the ERP phone is a shared
+   * placeholder (thousands of customers share one number), so mass creation is
+   * impossible until the ERP supplies real per-customer phones. phone and region
+   * are app-owned and never touched. The IS DISTINCT FROM guard skips no-op writes.
+   */
+  async bulkRefreshCustomers(): Promise<{ updated: number }> {
+    const rows = await this.prisma.$queryRawUnsafe<{ n: number }[]>(`
+      WITH upd AS (
+        UPDATE public."Customer" c
+        SET name = COALESCE(NULLIF(rc.payload->>'CUSTOMER_FULL_NAME',''),
+                            NULLIF(rc.payload->>'CUSTOMER_NAME',''), c.name),
+            "updatedAt" = now()
+        FROM erp_raw.raw_customer rc
+        WHERE rc.erp_key = c."erpId" AND c."erpId" IS NOT NULL
+          AND c.name IS DISTINCT FROM COALESCE(NULLIF(rc.payload->>'CUSTOMER_FULL_NAME',''),
+                                               NULLIF(rc.payload->>'CUSTOMER_NAME',''), c.name)
+        RETURNING 1
+      )
+      SELECT count(*)::int AS n FROM upd
+    `);
+    return { updated: Number(rows[0]?.n ?? 0) };
+  }
+
   async markProjected(objectType: ErpObjectType, ids: bigint[]): Promise<void> {
     if (ids.length === 0) return;
     const t = this.table(objectType);
