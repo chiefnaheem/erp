@@ -298,7 +298,7 @@ export class RawRepository {
       ), ins AS (
         INSERT INTO public."Purchase"
           (id,"erpId","customerId","orderDate","totalItems","totalValue",status,"createdAt","updatedAt")
-        SELECT (md5(random()::text||clock_timestamp()::text||erp_key))::uuid, erp_key, customer_id,
+        SELECT gen_random_uuid(), erp_key, customer_id,
           (payload->>'ORDER_DATE')::timestamp,
           CASE WHEN payload->>'QTY_TOTAL' ~ '^[0-9.]+$' THEN (payload->>'QTY_TOTAL')::numeric::int ELSE 0 END,
           COALESCE(NULLIF(payload->>'AMT_UNINCLUDE_TAX_OC','')::numeric,0)
@@ -335,7 +335,7 @@ export class RawRepository {
       ), ins AS (
         INSERT INTO public."Payment"
           (id,"erpId","customerId",date,amount,reference,"runningBalance","createdAt")
-        SELECT (md5(random()::text||clock_timestamp()::text||erp_key))::uuid, erp_key, customer_id,
+        SELECT gen_random_uuid(), erp_key, customer_id,
           (payload->>'DOC_DATE')::timestamp,
           COALESCE(NULLIF(payload->>'COLLECTION_AMT_TC','')::numeric,0), erp_key, 0, now()
         FROM proj
