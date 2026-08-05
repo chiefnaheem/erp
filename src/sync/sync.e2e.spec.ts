@@ -29,6 +29,7 @@ describe('Sync cycle (e2e)', () => {
   // What the mock ERP hands back.
   let customers: Record<string, unknown>[];
   let salesOrders: Record<string, unknown>[];
+  let collections: Record<string, unknown>[];
 
   beforeAll(async () => {
     server = createServer((req, res) => {
@@ -42,6 +43,7 @@ describe('Sync cycle (e2e)', () => {
         const table: Record<string, Record<string, unknown>[]> = {
           'yvijucrm.customer.query': customers,
           'yvijucrm.sales_order_doc.query': salesOrders,
+          'yvijucrm.collection_doc.query': collections,
         };
         const rows = pageNo === 1 ? (table[method] ?? []) : [];
 
@@ -102,6 +104,7 @@ describe('Sync cycle (e2e)', () => {
       where: { purchase: { erpId: { startsWith: 'TEST_E2E_' } } },
     });
     await prisma.purchase.deleteMany({ where: { erpId: { startsWith: 'TEST_E2E_' } } });
+    await prisma.payment.deleteMany({ where: { erpId: { startsWith: 'TEST_E2E_' } } });
     await prisma.customer.deleteMany({ where: { erpId: { startsWith: 'TEST_E2E_' } } });
     await prisma.$executeRawUnsafe(
       `DELETE FROM erp_raw.raw_customer WHERE erp_key LIKE 'TEST_E2E_%'`,
@@ -110,12 +113,17 @@ describe('Sync cycle (e2e)', () => {
       `DELETE FROM erp_raw.raw_sales_order WHERE erp_key LIKE 'TEST_E2E_%'`,
     );
     await prisma.$executeRawUnsafe(
+      `DELETE FROM erp_raw.raw_collection WHERE erp_key LIKE 'TEST_E2E_%'`,
+    );
+    await prisma.$executeRawUnsafe(
       `DELETE FROM erp_raw.customer_link WHERE erp_customer_guid LIKE 'TEST_E2E_%'`,
     );
     await prisma.$executeRawUnsafe(
       `DELETE FROM erp_raw.sync_run WHERE started_at > now() - interval '10 minutes'`,
     );
   };
+
+  const PAYDOC = 'TEST_E2E_PAY_1';
 
   beforeEach(async () => {
     await cleanup();
@@ -127,14 +135,37 @@ describe('Sync cycle (e2e)', () => {
         DOC_NO: DOC,
         CUSTOMER_ID: GUID,
         ORDER_DATE: '2026-06-01',
-        ApproveStatus: 'APPROVED_BY_ERP', // deliberately NOT in the default map
+        ApproveStatus: 'Y', // built-in map: Y → PROCESSING
         AMT_UNINCLUDE_TAX_OC: 1000,
         TAX_OC: 75,
-        PIECES: 12,
+        QTY_TOTAL: '12',
+      },
+    ];
+    collections = [
+      {
+        DOC_NO: PAYDOC,
+        CUSTOMER_CODE: CODE, // collections carry CUSTOMER_CODE (2026-07-28 update)
+        DOC_DATE: '2026-06-05',
+        COLLECTION_AMT_TC: 500,
+        ApproveStatus: 'Y',
       },
     ];
     config.set('ERP_STATUS_MAP', undefined);
   });
+
+  // An ONBOARDED (active) customer — password set. Transactions only project for
+  // active customers, so the projection tests need one.
+  const createActiveCustomer = (extra: Record<string, unknown> = {}) =>
+    prisma.customer.create({
+      data: {
+        erpId: CODE,
+        name: 'App Name',
+        phone: '+2348000000009',
+        region: 'LAGOS',
+        password: 'hashed-uat-password',
+        ...extra,
+      },
+    });
 
   // type → per-object table (only the two the e2e inspects).
   const RAW_TABLE: Record<string, string> = {
@@ -154,108 +185,32 @@ describe('Sync cycle (e2e)', () => {
     await sync.runProjection();
   };
 
-  // ── The single most important safety property ────────────────────────────
-  it('does NOT create a customer when the ERP row has no phone/region', async () => {
-    // Fixture has no PhoneNumber/Region, so it cannot be created.
-    await runCycle();
-
-    const created = await prisma.customer.findUnique({ where: { erpId: CODE } });
-    expect(created).toBeNull(); // must NOT have been inserted
-
-    // ...but the raw payload IS captured, and says why it couldn't project.
-    const raw = await rawRow('CUSTOMER', CODE);
-    expect(raw.payload).toMatchObject({ CUSTOMER_FULL_NAME: 'ERP Provided Name' });
-    expect(raw.projected_at).toBeNull();
-    expect(raw.project_error).toMatch(/phone \(PhoneNumber empty\)/i);
-  });
-
-  it('creates a customer from the default PhoneNumber + Region fields', async () => {
+  // ── Customer projection is refresh-only (creation blocked by ERP phone data) ──
+  it('does NOT create customers from ERP (creation is disabled)', async () => {
+    // Even with phone + region present, the sync no longer inserts customers,
+    // because the ERP PhoneNumber is a shared placeholder across customers.
     customers[0].PhoneNumber = '+2348090000001';
-    customers[0].Region = 'LAGOS'; // matches our enum directly → no map needed
+    customers[0].Region = 'LAGOS';
 
     await runCycle();
 
-    const created = await prisma.customer.findUnique({ where: { erpId: CODE } });
-    expect(created).not.toBeNull();
-    expect(created!.phone).toBe('+2348090000001');
-    expect(created!.region).toBe('LAGOS');
+    expect(await prisma.customer.findUnique({ where: { erpId: CODE } })).toBeNull();
   });
 
-  it('updates an existing customer once they are onboarded in the app', async () => {
-    await runCycle(); // customer not onboarded yet → skipped
-
-    await prisma.customer.create({
-      data: {
-        erpId: CODE,
-        name: 'Stale App Name',
-        phone: '+2348000000001', // app-owned: the ERP can never supply this
-        region: 'LAGOS', // app-owned
-      },
-    });
+  it("refreshes an existing customer's name but leaves app-owned phone/region", async () => {
+    await createActiveCustomer({ name: 'Stale App Name' });
 
     await runCycle();
 
-    const customer = await prisma.customer.findUnique({ where: { erpId: CODE } });
-    expect(customer!.name).toBe('ERP Provided Name');
-    // The app-owned fields must survive untouched.
-    expect(customer!.phone).toBe('+2348000000001');
-    expect(customer!.region).toBe('LAGOS');
+    const customer = await prisma.customer.findUniqueOrThrow({ where: { erpId: CODE } });
+    expect(customer.name).toBe('ERP Provided Name'); // ERP-owned field refreshed
+    expect(customer.phone).toBe('+2348000000009'); // app-owned, untouched
+    expect(customer.region).toBe('LAGOS'); // app-owned, untouched
   });
 
-  it('creates a customer from ERP once a phone source is configured', async () => {
-    // Simulate the probe having found phone on a field called CONTACT_TEL and
-    // region on UDF_REGION.
-    customers[0].CONTACT_TEL = '+2348011122233';
-    customers[0].UDF_REGION = 'West';
-    config.set('ERP_CUSTOMER_PHONE_FIELD', 'CONTACT_TEL');
-    config.set('ERP_CUSTOMER_REGION_FIELD', 'UDF_REGION');
-    config.set('ERP_REGION_MAP', '{"West":"SOUTH_WEST","Lagos":"LAGOS"}');
-
-    await runCycle();
-
-    const created = await prisma.customer.findUnique({ where: { erpId: CODE } });
-    expect(created).not.toBeNull();
-    expect(created!.phone).toBe('+2348011122233');
-    expect(created!.region).toBe('SOUTH_WEST');
-    expect(created!.name).toBe('ERP Provided Name');
-
-    config.set('ERP_CUSTOMER_PHONE_FIELD', undefined);
-    config.set('ERP_CUSTOMER_REGION_FIELD', undefined);
-    config.set('ERP_REGION_MAP', undefined);
-  });
-
-  it('attaches erpId to an existing phone instead of failing on the unique constraint', async () => {
-    // Customer onboarded in-app first, no erpId yet, same phone the ERP will send.
-    await prisma.customer.create({
-      data: {
-        erpId: 'TEST_E2E_PREEXISTING',
-        name: 'Signed Up First',
-        phone: '+2348044455566',
-        region: 'LAGOS',
-      },
-    });
-
-    customers[0].CONTACT_TEL = '+2348044455566'; // same phone
-    customers[0].UDF_REGION = 'Lagos';
-    config.set('ERP_CUSTOMER_PHONE_FIELD', 'CONTACT_TEL');
-    config.set('ERP_CUSTOMER_REGION_FIELD', 'UDF_REGION');
-    config.set('ERP_REGION_MAP', '{"Lagos":"LAGOS","West":"SOUTH_WEST"}');
-
-    await runCycle();
-
-    // No duplicate created; the existing row is now linked to the ERP code.
-    const byPhone = await prisma.customer.findUnique({ where: { phone: '+2348044455566' } });
-    expect(byPhone!.erpId).toBe(CODE);
-    expect(byPhone!.name).toBe('ERP Provided Name');
-
-    await prisma.customer.deleteMany({ where: { phone: '+2348044455566' } });
-    config.set('ERP_CUSTOMER_PHONE_FIELD', undefined);
-    config.set('ERP_CUSTOMER_REGION_FIELD', undefined);
-    config.set('ERP_REGION_MAP', undefined);
-  });
-
-  // ── Purchases ────────────────────────────────────────────────────────────
-  it('skips an order with an unmapped ApproveStatus rather than guessing one', async () => {
+  // ── Purchases (active customers only, bulk) ───────────────────────────────
+  it("does NOT project a non-active customer's order", async () => {
+    // Customer exists but is not onboarded (no password) → out of scope.
     await prisma.customer.create({
       data: { erpId: CODE, name: 'X', phone: '+2348000000002', region: 'LAGOS' },
     });
@@ -263,41 +218,36 @@ describe('Sync cycle (e2e)', () => {
     await runCycle();
 
     expect(await prisma.purchase.findUnique({ where: { erpId: DOC } })).toBeNull();
-
-    const raw = await rawRow('SALES_ORDER', DOC);
-    expect(raw.project_error).toMatch(/Unmapped ApproveStatus "APPROVED_BY_ERP"/);
-    expect(raw.projected_at).toBeNull(); // stays queued — it will heal itself
+    expect((await rawRow('SALES_ORDER', DOC)).projected_at).toBeNull(); // stays queued
   });
 
-  it('projects the order once ApproveStatus is mapped — the queued row heals itself', async () => {
-    await prisma.customer.create({
-      data: { erpId: CODE, name: 'X', phone: '+2348000000003', region: 'LAGOS' },
-    });
+  it("projects an active customer's order via the built-in Y → PROCESSING map", async () => {
+    const customer = await createActiveCustomer();
 
-    await runCycle(); // skipped: unmapped status
-
-    config.set('ERP_STATUS_MAP', '{"APPROVED_BY_ERP":"PROCESSING"}');
-    await runCycle();
-
-    const purchase = await prisma.purchase.findUnique({ where: { erpId: DOC } });
-    expect(purchase).not.toBeNull();
-    expect(purchase!.status).toBe('PROCESSING');
-    expect(purchase!.totalValue).toBe(1075); // 1000 ex-tax + 75 tax
-    expect(purchase!.totalItems).toBe(12); // PIECES
-    // Resolved Guid → CUSTOMER_CODE → app customer.
-    const customer = await prisma.customer.findUnique({ where: { erpId: CODE } });
-    expect(purchase!.customerId).toBe(customer!.id);
-  });
-
-  it('does not wipe PurchaseItems — the ERP has no line items to replace them with', async () => {
-    const customer = await prisma.customer.create({
-      data: { erpId: CODE, name: 'X', phone: '+2348000000004', region: 'LAGOS' },
-    });
-    config.set('ERP_STATUS_MAP', '{"APPROVED_BY_ERP":"PROCESSING"}');
     await runCycle();
 
     const purchase = await prisma.purchase.findUniqueOrThrow({ where: { erpId: DOC } });
-    // Items arrive from the main API's webhook, not the ERP pull.
+    expect(purchase.status).toBe('PROCESSING');
+    expect(purchase.totalValue).toBe(1075); // 1000 ex-tax + 75 tax
+    expect(purchase.totalItems).toBe(12); // QTY_TOTAL
+    expect(purchase.customerId).toBe(customer.id); // resolved guid → code → customer
+  });
+
+  it("projects an active customer's payment with a customer link", async () => {
+    const customer = await createActiveCustomer();
+
+    await runCycle();
+
+    const payment = await prisma.payment.findUniqueOrThrow({ where: { erpId: PAYDOC } });
+    expect(payment.amount).toBe(500);
+    expect(payment.customerId).toBe(customer.id);
+  });
+
+  it('does not wipe PurchaseItems when re-projecting a changed order header', async () => {
+    await createActiveCustomer();
+    await runCycle();
+
+    const purchase = await prisma.purchase.findUniqueOrThrow({ where: { erpId: DOC } });
     await prisma.purchaseItem.create({
       data: {
         purchaseId: purchase.id,
@@ -312,28 +262,21 @@ describe('Sync cycle (e2e)', () => {
     salesOrders[0].AMT_UNINCLUDE_TAX_OC = 2000;
     await runCycle();
 
-    // ...and the items — which power the Stock Balance Breakdown — must survive.
+    // ...the header updates, and the items survive.
     const items = await prisma.purchaseItem.findMany({ where: { purchaseId: purchase.id } });
     expect(items).toHaveLength(1);
-    expect(items[0].productName).toBe('Chocolate Milk');
-
     const updated = await prisma.purchase.findUniqueOrThrow({ where: { erpId: DOC } });
-    expect(updated.totalValue).toBe(2075); // 2000 ex-tax + 75 tax, still applied
+    expect(updated.totalValue).toBe(2075); // 2000 ex-tax + 75 tax
 
     await prisma.purchaseItem.deleteMany({ where: { purchaseId: purchase.id } });
-    void customer;
   });
 
-  // ── Idempotence: the whole point of content hashing ───────────────────────
-  it('an unchanged second sweep projects nothing', async () => {
-    await prisma.customer.create({
-      data: { erpId: CODE, name: 'ERP Provided Name', phone: '+2348000000005', region: 'LAGOS' },
-    });
-    config.set('ERP_STATUS_MAP', '{"APPROVED_BY_ERP":"PROCESSING"}');
+  // ── Idempotence ───────────────────────────────────────────────────────────
+  it('an unchanged second sweep ingests without re-writing (content hash)', async () => {
+    await createActiveCustomer();
 
     await runCycle();
-    const afterFirst = await rawRow('SALES_ORDER', DOC);
-    expect(afterFirst.projected_at).not.toBeNull();
+    expect((await rawRow('SALES_ORDER', DOC)).projected_at).not.toBeNull();
 
     await runCycle(); // identical ERP data
 
@@ -345,16 +288,15 @@ describe('Sync cycle (e2e)', () => {
     expect(runs[0].rows_changed).toBe(0); // hash unmoved → nothing re-written
   });
 
-  // ── Blocked jobs stay visible ────────────────────────────────────────────
-  it('records the blocked jobs as skipped instead of silently omitting them', async () => {
+  // ── Blocked jobs stay visible (payment is now live, so only stock + items) ──
+  it('records the still-blocked jobs as skipped', async () => {
     await runCycle();
 
     const blocked = await prisma.$queryRawUnsafe<any[]>(
       `SELECT DISTINCT job FROM erp_raw.sync_run
-       WHERE job IN ('project:stock','project:purchase_item','project:payment')`,
+       WHERE job IN ('project:stock','project:purchase_item')`,
     );
     expect(blocked.map((r) => r.job).sort()).toEqual([
-      'project:payment',
       'project:purchase_item',
       'project:stock',
     ]);

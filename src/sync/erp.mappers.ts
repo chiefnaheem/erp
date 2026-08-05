@@ -130,14 +130,32 @@ export interface CustomerFieldMap {
   phoneField?: string;
   regionField?: string;
   regionMap: Record<string, Region>;
+  regionDefault: Region | null;
 }
+
+// Built-in mapping for the ERP's (Chinese) region values, per the ERP team's
+// key: 东部=East, 南部=South, 西部=West, 北部=North, 加纳=Ghana.
+// Nigeria has no plain "South" region in our enum, so 南部(South) → SOUTH_WEST as
+// the closest fit; override any of these via ERP_REGION_MAP.
+const BUILTIN_REGION_MAP: Record<string, Region> = {
+  '北部': Region.NORTH, // North
+  '东部': Region.SOUTH_EAST, // East
+  '西部': Region.SOUTH_WEST, // West
+  '南部': Region.SOUTH_WEST, // South (no exact enum match)
+  '加纳': Region.LAGOS, // Ghana (not a NG region — placeholder)
+  EAST: Region.SOUTH_EAST,
+  WEST: Region.SOUTH_WEST,
+  NORTH: Region.NORTH,
+  SOUTH: Region.SOUTH_WEST,
+};
 
 export function buildCustomerFieldMap(env: {
   phoneField?: string;
   regionField?: string;
   regionMap?: string;
+  regionDefault?: string;
 }): CustomerFieldMap {
-  let regionMap: Record<string, Region> = {};
+  const regionMap: Record<string, Region> = { ...BUILTIN_REGION_MAP };
   if (env.regionMap) {
     try {
       const parsed = JSON.parse(env.regionMap) as Record<string, string>;
@@ -145,13 +163,18 @@ export function buildCustomerFieldMap(env: {
         if (ours in Region) regionMap[erpValue] = Region[ours as keyof typeof Region];
       }
     } catch {
-      regionMap = {};
+      // keep built-ins
     }
   }
+  const regionDefault =
+    env.regionDefault && env.regionDefault in Region
+      ? Region[env.regionDefault as keyof typeof Region]
+      : null;
   return {
     phoneField: env.phoneField,
     regionField: env.regionField,
     regionMap,
+    regionDefault,
   };
 }
 
@@ -187,7 +210,11 @@ export function resolveCustomer(
     typeof payload[regionField] === 'string' && (payload[regionField] as string).trim()
       ? (payload[regionField] as string).trim()
       : null;
-  const region = rawRegion ? resolveRegion(rawRegion, map.regionMap) : null;
+  // Resolve via map, else fall back to the configured default (so an empty or
+  // unmapped ERP region doesn't block creation). Only truly unresolved when no
+  // default is set.
+  const region =
+    (rawRegion ? resolveRegion(rawRegion, map.regionMap) : null) ?? map.regionDefault;
 
   return {
     name,
