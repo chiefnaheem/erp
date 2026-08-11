@@ -82,29 +82,61 @@ export class ErpClient {
   }
 
   /**
-   * Walk every page of a `.query` method.
+   * Walk every page of a `.query` method, yielding `{ pageNo, rows }`.
    *
-   * Terminates on a short page rather than on a total, because the ERP's
-   * count field is undocumented and `isGetCount` may not be honoured. Yields
+   * Terminates on a short page rather than on a total, because the ERP's count
+   * field is undocumented and `isGetCount` may not be honoured. Yields
    * page-by-page so callers never hold the whole table in memory.
+   *
+   * Resilience (this is what keeps big sweeps from failing every cycle):
+   *  - `startPage` lets a caller RESUME an interrupted sweep instead of
+   *    restarting from page 1.
+   *  - Each page is retried on a transient error (a non-std_data ERP response, or
+   *    a transport drop). If it still fails after ERP_PAGE_RETRIES, that single
+   *    page is SKIPPED (logged) and the sweep continues — one bad page no longer
+   *    discards the whole sweep. The skipped rows are re-fetched next full cycle.
    */
   async *queryAll<TRow>(
     method: ErpMethod,
     options: Omit<ErpQueryOptions, 'pageNo'> = {},
-  ): AsyncGenerator<TRow[], void, void> {
+    startPage = 1,
+  ): AsyncGenerator<{ pageNo: number; rows: TRow[] }, void, void> {
     const pageSize =
       options.pageSize ?? this.config.getOrThrow<number>('ERP_PAGE_SIZE');
+    const pageRetries = this.config.get<number>('ERP_PAGE_RETRIES') ?? 3;
 
-    for (let pageNo = 1; pageNo <= MAX_PAGES; pageNo++) {
-      const page = await this.query<TRow>(method, {
-        ...options,
-        pageNo,
-        pageSize,
-      });
+    for (let pageNo = Math.max(1, startPage); pageNo <= MAX_PAGES; pageNo++) {
+      let page: ErpPage<TRow> | null = null;
+
+      for (let attempt = 1; attempt <= pageRetries; attempt++) {
+        try {
+          page = await this.query<TRow>(method, { ...options, pageNo, pageSize });
+          break;
+        } catch (error) {
+          // Only bad-response / transport hiccups are page-retryable. A business
+          // error (bad key, no permission) is fatal — rethrow it.
+          const retryable =
+            error instanceof ErpProtocolError || error instanceof ErpTransportError;
+          if (!retryable) throw error;
+
+          if (attempt === pageRetries) {
+            this.logger.error(
+              `${method} p${pageNo}: failed after ${pageRetries} attempts — SKIPPING this page, continuing sweep. ${
+                error instanceof Error ? error.message.split('\n')[0] : String(error)
+              }`,
+            );
+          } else {
+            await this.sleep(500 * 2 ** (attempt - 1));
+          }
+        }
+      }
+
+      // Page was skipped after exhausting retries — move on to the next page.
+      if (!page) continue;
 
       if (page.rows.length === 0) return;
 
-      yield page.rows;
+      yield { pageNo, rows: page.rows };
 
       // A page shorter than requested means we've reached the end.
       if (page.rows.length < pageSize) return;

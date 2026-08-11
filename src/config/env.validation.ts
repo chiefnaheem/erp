@@ -143,6 +143,16 @@ export class EnvVars {
   @Transform(toInt)
   ERP_PAGE_SIZE: number = 100;
 
+  // How many times to retry a single page (transient ERP/transport error) before
+  // skipping it and continuing the sweep. Keeps one bad page from failing the
+  // whole sweep.
+  @IsInt()
+  @Min(1)
+  @Max(10)
+  @IsOptional()
+  @Transform(toInt)
+  ERP_PAGE_RETRIES: number = 3;
+
   // Verbose request logging: when true, every ERP call logs its method, URL,
   // headers (with digi-key redacted), and full request body.
   // ⚠️ Defaults to TRUE for the current debugging phase — set ERP_VERBOSE=false

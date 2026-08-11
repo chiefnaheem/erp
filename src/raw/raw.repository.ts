@@ -204,6 +204,34 @@ export class RawRepository {
    * un-projectable rows are not re-fetched within the same drain. They are simply
    * retried on the NEXT run.
    */
+  // ─── Ingest resume cursor ────────────────────────────────────────────────
+  // The ERP has no delta support, so an interrupted sweep would otherwise restart
+  // from page 1 every time and — if the process keeps restarting before the sweep
+  // finishes — never complete. We persist the last fully-ingested page per job so
+  // a restart RESUMES. The cursor is cleared when a sweep finishes cleanly, so the
+  // next cycle starts fresh from page 1 (a full re-sweep to catch early-page changes).
+
+  async getIngestPage(job: string): Promise<number> {
+    const rows = await this.prisma.$queryRaw<{ cursor_value: string | null }[]>`
+      SELECT cursor_value FROM erp_raw.sync_cursor WHERE job = ${job}
+    `;
+    const v = rows[0]?.cursor_value;
+    const n = v ? Number(v) : 0;
+    return Number.isFinite(n) && n > 0 ? n : 1;
+  }
+
+  async setIngestPage(job: string, page: number): Promise<void> {
+    await this.prisma.$executeRaw`
+      INSERT INTO erp_raw.sync_cursor (job, cursor_value, updated_at)
+      VALUES (${job}, ${String(page)}, now())
+      ON CONFLICT (job) DO UPDATE SET cursor_value = ${String(page)}, updated_at = now()
+    `;
+  }
+
+  async clearIngestPage(job: string): Promise<void> {
+    await this.prisma.$executeRaw`DELETE FROM erp_raw.sync_cursor WHERE job = ${job}`;
+  }
+
   async pendingProjection(
     objectType: ErpObjectType,
     afterId: bigint,
