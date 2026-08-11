@@ -31,40 +31,52 @@ abstract class IngestJob extends SyncJob {
   protected async execute(): Promise<JobStats> {
     let fetched = 0;
     let changed = 0;
-    let pageNo = 0;
+    let pages = 0;
+    let lastPage = 0;
 
     const table = this.raw.tableFor(this.objectType);
+
+    // Resume an interrupted sweep instead of restarting from page 1. The cursor
+    // is only set mid-sweep; a clean finish clears it (below), so a normal cycle
+    // always starts fresh at page 1.
+    const startPage = await this.raw.getIngestPage(this.name);
     this.logger.log(
-      `${this.name}: sweeping ${this.method} → dumping into erp_raw.${table}`,
+      `${this.name}: sweeping ${this.method} → erp_raw.${table}` +
+        (startPage > 1 ? ` (resuming from page ${startPage})` : ''),
     );
 
-    // The ERP has no delta support, so this is a FULL sweep every cycle. We page
-    // through and hash rather than hold the whole table in memory — content
-    // hashing is what keeps the cost of re-reading everything acceptable.
-    for await (const page of this.erp.queryAll<Record<string, unknown>>(this.method)) {
-      pageNo++;
-      const result = await this.raw.upsertMany(this.objectType, page, (row) =>
+    for await (const { pageNo, rows } of this.erp.queryAll<Record<string, unknown>>(
+      this.method,
+      {},
+      startPage,
+    )) {
+      pages++;
+      lastPage = pageNo;
+      const result = await this.raw.upsertMany(this.objectType, rows, (row) =>
         this.keyOf(row),
       );
       fetched += result.fetched;
       changed += result.changed;
 
-      // Per-page storage line so each endpoint's fetch→store is visible: how many
-      // rows this page had, how many were new/changed, and where they landed.
       this.logger.log(
         `${this.name}: page ${pageNo} — stored ${result.fetched} row(s) ` +
           `(${result.changed} new/changed) into erp_raw.${table}`,
       );
 
-      await this.afterPage(page);
+      await this.afterPage(rows);
+      // Persist progress so a restart resumes from the next page, not page 1.
+      await this.raw.setIngestPage(this.name, pageNo + 1);
     }
 
-    if (pageNo === 0) {
+    // Swept to the end cleanly — reset so the next cycle does a full re-sweep.
+    await this.raw.clearIngestPage(this.name);
+
+    if (pages === 0) {
       this.logger.log(`${this.name}: ${this.method} returned no rows`);
     } else {
       this.logger.log(
         `${this.name}: done — ${fetched} row(s) total, ${changed} new/changed, ` +
-          `across ${pageNo} page(s) into erp_raw.${table}`,
+          `through page ${lastPage} into erp_raw.${table}`,
       );
     }
 

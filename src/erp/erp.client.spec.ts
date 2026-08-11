@@ -206,19 +206,66 @@ describe('ErpClient', () => {
 
     const client = await build();
     const seen: unknown[] = [];
-    for await (const batch of client.queryAll(ERP_METHOD.CUSTOMER_QUERY)) {
-      seen.push(...batch);
+    for await (const { rows } of client.queryAll(ERP_METHOD.CUSTOMER_QUERY)) {
+      seen.push(...rows);
     }
 
     expect(seen).toHaveLength(5);
     expect(calls).toHaveLength(3); // must not request a 4th page
   });
 
+  it('skips a persistently-bad page and continues the sweep', async () => {
+    // Page 2 always returns a non-std_data body (HTML/error page); pages 1 and 3
+    // are fine. The sweep must skip page 2 and still deliver pages 1 and 3.
+    const good = (rows: unknown[]) => ({
+      status: 200,
+      body: { std_data: { execution: { code: '0' }, parameter: { rows } } },
+    });
+    respond = (call) => {
+      const page = call.body.std_data.parameter.pageNo;
+      if (page === 1) return good([{ id: 1 }, { id: 2 }]);
+      if (page === 2) return { status: 200, body: '<html>gateway error</html>' };
+      if (page === 3) return good([{ id: 5 }]); // short → ends
+      return good([]);
+    };
+
+    const client = await build({ ERP_PAGE_RETRIES: 2 });
+    const seen: any[] = [];
+    for await (const { rows } of client.queryAll(ERP_METHOD.CUSTOMER_QUERY)) {
+      seen.push(...rows);
+    }
+
+    // Page 2's rows are lost this sweep, but the sweep COMPLETED (pages 1 + 3).
+    expect(seen.map((r) => r.id)).toEqual([1, 2, 5]);
+  });
+
+  it('resumes from startPage instead of page 1', async () => {
+    const pages: Record<number, unknown[]> = { 2: [{ id: 3 }], 3: [] };
+    respond = (call) => ({
+      status: 200,
+      body: {
+        std_data: {
+          execution: { code: '0' },
+          parameter: { rows: pages[call.body.std_data.parameter.pageNo] ?? [] },
+        },
+      },
+    });
+
+    const client = await build();
+    const seen: any[] = [];
+    for await (const { rows } of client.queryAll(ERP_METHOD.CUSTOMER_QUERY, {}, 2)) {
+      seen.push(...rows);
+    }
+
+    expect(seen).toHaveLength(1); // page 2's row
+    expect(calls[0].body.std_data.parameter.pageNo).toBe(2); // started at 2, not 1
+  });
+
   it('stops cleanly when the first page is empty', async () => {
     const client = await build();
     const seen: unknown[] = [];
-    for await (const batch of client.queryAll(ERP_METHOD.CUSTOMER_QUERY)) {
-      seen.push(...batch);
+    for await (const { rows } of client.queryAll(ERP_METHOD.CUSTOMER_QUERY)) {
+      seen.push(...rows);
     }
     expect(seen).toHaveLength(0);
     expect(calls).toHaveLength(1);
