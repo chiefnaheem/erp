@@ -163,6 +163,21 @@ export class EnvVars {
   @Transform(toInt)
   ERP_INGEST_CONCURRENCY: number = 3;
 
+  // Ingest escalation: run every 15 min for the first ERP_INGEST_FAST_MINUTES
+  // after boot (quick catch-up), then at most once per ERP_INGEST_SLOW_MINUTES
+  // (hourly) to spare the DB. Default: fast for 1h, then hourly.
+  @IsInt()
+  @Min(0)
+  @IsOptional()
+  @Transform(toInt)
+  ERP_INGEST_FAST_MINUTES: number = 60;
+
+  @IsInt()
+  @Min(1)
+  @IsOptional()
+  @Transform(toInt)
+  ERP_INGEST_SLOW_MINUTES: number = 60;
+
   // Verbose request logging: when true, every ERP call logs its method, URL,
   // headers (with digi-key redacted), and full request body.
   // ⚠️ Defaults to TRUE for the current debugging phase — set ERP_VERBOSE=false

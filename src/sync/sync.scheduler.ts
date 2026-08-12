@@ -19,6 +19,8 @@ export class SyncScheduler implements OnApplicationBootstrap {
   private readonly host = hostname();
   private readonly owner = `${hostname()}:${process.pid}`;
   private tickCount = 0;
+  private readonly bootTime = Date.now();
+  private lastIngestStartedAt = 0;
 
   constructor(
     private readonly sync: SyncService,
@@ -76,10 +78,40 @@ export class SyncScheduler implements OnApplicationBootstrap {
    * acquiring the lock, running the cycle, or releasing — rather than surfacing a
    * bare Prisma error with no context.
    */
-  // INGEST: the heavy ERP → erp_raw sweep. Every 15 min by default.
+  // INGEST: the heavy ERP → erp_raw sweep.
+  //
+  // The cron fires every 15 min (finest cadence), but an escalation gate decides
+  // whether to actually run: FAST for the first ERP_INGEST_FAST_MINUTES after boot
+  // (every 15 min — quick initial catch-up), then STEADY (at most once per
+  // ERP_INGEST_SLOW_MINUTES — hourly by default) to spare the flaky DB once caught
+  // up. A tick that's gated off just logs and stands down.
   @Cron(process.env.ERP_SYNC_CRON || '0 */15 * * * *', { name: 'erp-ingest' })
   async ingestTick(): Promise<void> {
+    const gate = this.ingestGate();
+    if (!gate.run) {
+      this.logger.log(`ingest tick skipped — ${gate.reason}`);
+      return;
+    }
+    this.lastIngestStartedAt = Date.now();
+    this.logger.log(`ingest tick — ${gate.reason}`);
     await this.runStage(INGEST_LOCK, () => this.sync.runIngest());
+  }
+
+  /** 15-min cadence during the initial catch-up window, then back off to hourly. */
+  private ingestGate(): { run: boolean; reason: string } {
+    const fastMs = (this.config.get<number>('ERP_INGEST_FAST_MINUTES') ?? 60) * 60_000;
+    const slowMs = (this.config.get<number>('ERP_INGEST_SLOW_MINUTES') ?? 60) * 60_000;
+    const now = Date.now();
+
+    if (now - this.bootTime < fastMs) {
+      return { run: true, reason: 'catch-up window (15m cadence)' };
+    }
+    const since = now - this.lastIngestStartedAt;
+    if (since >= slowMs) {
+      return { run: true, reason: 'steady window (hourly cadence)' };
+    }
+    const mins = Math.ceil((slowMs - since) / 60_000);
+    return { run: false, reason: `steady window — ~${mins}m until next run` };
   }
 
   // PROJECT: erp_raw → public.*. Runs on its own, more frequent schedule (every
