@@ -153,6 +153,16 @@ export class EnvVars {
   @Transform(toInt)
   ERP_PAGE_RETRIES: number = 3;
 
+  // How many ingest sweeps run at once. All 8 at once overloaded the flaky DB
+  // into half-open hangs; 3 keeps each sweep likelier to complete. Set to 1 for
+  // fully sequential (gentlest on the DB, slowest wall-clock).
+  @IsInt()
+  @Min(1)
+  @Max(8)
+  @IsOptional()
+  @Transform(toInt)
+  ERP_INGEST_CONCURRENCY: number = 3;
+
   // Verbose request logging: when true, every ERP call logs its method, URL,
   // headers (with digi-key redacted), and full request body.
   // ⚠️ Defaults to TRUE for the current debugging phase — set ERP_VERBOSE=false
