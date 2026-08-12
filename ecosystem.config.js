@@ -30,9 +30,12 @@ module.exports = {
       max_restarts: 1000,
       min_uptime: '20s',
 
-      // The box has been memory-starved (OOM-killed nginx/Postgres before).
-      // Recycle the worker if it balloons, rather than letting it get OOM-killed.
-      max_memory_restart: '400M',
+      // Recycle the worker only if it truly balloons — 700M gives the heavy sweep
+      // room to run to completion between recycles (400M was recycling it mid-sweep
+      // every ~30-60 min, which is why the big tables never finished a clean pass).
+      // The resume cursor makes a recycle harmless, but fewer recycles = faster
+      // completion. Lower this if the box is tight on RAM.
+      max_memory_restart: '700M',
 
       watch: false,
       time: true, // timestamp log lines
