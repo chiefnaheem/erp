@@ -77,7 +77,7 @@ export class SyncScheduler implements OnApplicationBootstrap {
    * bare Prisma error with no context.
    */
   // INGEST: the heavy ERP → erp_raw sweep. Every 15 min by default.
-  @Cron(process.env.ERP_SYNC_CRON || '0 */15 * * * *', { name: 'erp-ingest' })
+  @Cron(process.env.ERP_SYNC_CRON || '0 0 * * * *', { name: 'erp-ingest' })
   async ingestTick(): Promise<void> {
     await this.runStage(INGEST_LOCK, () => this.sync.runIngest());
   }
