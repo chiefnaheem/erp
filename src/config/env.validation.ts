@@ -178,33 +178,28 @@ export class EnvVars {
   @Transform(toInt)
   ERP_INGEST_SLOW_MINUTES: number = 60;
 
-  // Verbose request logging: when true, every ERP call logs its method, URL,
-  // headers (with digi-key redacted), and full request body.
-  // ⚠️ Defaults to TRUE for the current debugging phase — set ERP_VERBOSE=false
-  // to quiet it down in normal operation.
+  // Verbose request logging: logs every ERP call's method, URL, headers (digi-key
+  // redacted), and full request body. OFF by default — it's heavy (logs on every
+  // page of thousands) and only useful while debugging. Set ERP_VERBOSE=true to
+  // turn it on temporarily.
   @IsBoolean()
   @IsOptional()
   @Transform(toBool)
-  ERP_VERBOSE: boolean = true;
+  ERP_VERBOSE: boolean = false;
 
-  // Logs a ready-to-run curl command for every ERP request — URL, ALL headers,
-  // and the exact body.
-  // ⚠️ This prints the REAL digi-key so the curl actually works, and it defaults
-  // to TRUE for debugging — set ERP_LOG_CURL=false before running anywhere shared
-  // so the API key doesn't end up in log files.
+  // Logs a ready-to-run curl for every request. OFF by default. ⚠️ When on, it
+  // prints the REAL digi-key, so only enable it for a short local debugging session.
   @IsBoolean()
   @IsOptional()
   @Transform(toBool)
-  ERP_LOG_CURL: boolean = true;
+  ERP_LOG_CURL: boolean = false;
 
-  // On startup, call EVERY ERP query endpoint once (read-only, pageSize 1) with
-  // step-by-step logs — so you can immediately see which endpoints respond and
-  // which fail (and why), without waiting for a scheduled sync.
-  // ⚠️ Defaults to TRUE for debugging — set ERP_DEBUG_STARTUP=false to skip it.
+  // On startup, probe EVERY ERP query endpoint once (read-only) with step logs.
+  // OFF by default; a handy one-shot health check when bringing up the integration.
   @IsBoolean()
   @IsOptional()
   @Transform(toBool)
-  ERP_DEBUG_STARTUP: boolean = true;
+  ERP_DEBUG_STARTUP: boolean = false;
 
   // Master kill switch: when false the app boots and serves /health but runs no
   // sync jobs. Lets us deploy the worker before the ERP is reachable.
