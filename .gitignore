@@ -8,3 +8,6 @@ dist/
 
 # Probe output — may contain real ERP customer data once `npm run probe` runs.
 probe-output.json
+
+# pm2 logs
+logs/
