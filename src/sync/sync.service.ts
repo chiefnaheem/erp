@@ -61,7 +61,7 @@ export class SyncService {
   private async runJobs(
     label: string,
     jobs: SyncJob[],
-    mode: 'parallel' | 'sequential',
+    concurrency: number,
   ): Promise<void> {
     if (!this.config.get<boolean>('SYNC_ENABLED')) {
       this.logger.warn(`SYNC_ENABLED=false — skipping ${label}`);
@@ -83,12 +83,18 @@ export class SyncService {
       }
     };
 
-    this.logger.log(`${label}: running ${jobs.length} job(s) ${mode}`);
-    if (mode === 'parallel') {
-      await Promise.all(jobs.map(runJob));
-    } else {
-      for (const job of jobs) await runJob(job);
-    }
+    // Bounded concurrency: at most `concurrency` jobs run at once. All-8-at-once
+    // was overloading the flaky DB into half-open hangs; a smaller window keeps
+    // each sweep likelier to complete. concurrency=1 is sequential.
+    const limit = Math.max(1, Math.min(concurrency, jobs.length));
+    this.logger.log(`${label}: running ${jobs.length} job(s), ${limit} at a time`);
+    const queue = [...jobs];
+    const worker = async () => {
+      for (let job = queue.shift(); job; job = queue.shift()) {
+        await runJob(job);
+      }
+    };
+    await Promise.all(Array.from({ length: limit }, worker));
 
     const summary = `${label} finished in ${Date.now() - startedAt}ms — ${
       jobs.length - failures.length
@@ -114,7 +120,8 @@ export class SyncService {
         this.arRefundIngest,
         this.otherReceivableIngest,
       ],
-      'parallel',
+      // Bounded concurrency (default 3) so the big sweeps don't overload the DB.
+      this.config.get<number>('ERP_INGEST_CONCURRENCY') ?? 3,
     );
   }
 
@@ -135,7 +142,7 @@ export class SyncService {
         this.stockProjection,
         this.purchaseItemProjection,
       ],
-      'sequential',
+      1, // sequential — customers must exist before their orders/payments (FK)
     );
   }
 }
