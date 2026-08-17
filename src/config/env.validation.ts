@@ -45,13 +45,28 @@ export class EnvVars {
   @IsNotEmpty()
   ERP_API_KEY: string;
 
-  // ── Per-object digi-keys ────────────────────────────────────────────────
-  // The ERP gives each object its own API key. Set the ones you have; any left
-  // unset fall back to ERP_API_KEY above. Names match the object, not the method
-  // (the same key is used for that object's .query and .read).
+  // ── Per-method / per-object digi-keys ───────────────────────────────────
+  // The API doc shows a DIFFERENT digi-key for every method — including .query
+  // vs .read of the same object. Keys are resolved most-specific first:
+  //
+  //   ERP_API_KEY_<OBJECT>_QUERY  →  ERP_API_KEY_<OBJECT>  →  ERP_API_KEY
+  //
+  // So the object-level keys below still work for a deployment that only calls
+  // .query (which is all the sync does); add the _QUERY / _READ variants only
+  // where the ERP actually issued separate keys. Objects: CUSTOMER,
+  // CUSTOMER_CREDIT, CUSTOMER_CREDIT_LINE, SALES_ORDER, SALES_DELIVERY,
+  // SALES_RETURN, COLLECTION, AR_REFUND, OTHER_RECEIVABLE.
   @IsString()
   @IsOptional()
   ERP_API_KEY_CUSTOMER?: string;
+
+  @IsString()
+  @IsOptional()
+  ERP_API_KEY_CUSTOMER_QUERY?: string;
+
+  @IsString()
+  @IsOptional()
+  ERP_API_KEY_CUSTOMER_READ?: string;
 
   @IsString()
   @IsOptional()
@@ -59,7 +74,36 @@ export class EnvVars {
 
   @IsString()
   @IsOptional()
+  ERP_API_KEY_CUSTOMER_CREDIT_QUERY?: string;
+
+  @IsString()
+  @IsOptional()
+  ERP_API_KEY_CUSTOMER_CREDIT_READ?: string;
+
+  // The 9th documented object (yvijucrm.customer_credit_line.*), newly ingested.
+  @IsString()
+  @IsOptional()
+  ERP_API_KEY_CUSTOMER_CREDIT_LINE?: string;
+
+  @IsString()
+  @IsOptional()
+  ERP_API_KEY_CUSTOMER_CREDIT_LINE_QUERY?: string;
+
+  @IsString()
+  @IsOptional()
+  ERP_API_KEY_CUSTOMER_CREDIT_LINE_READ?: string;
+
+  @IsString()
+  @IsOptional()
   ERP_API_KEY_SALES_ORDER?: string;
+
+  @IsString()
+  @IsOptional()
+  ERP_API_KEY_SALES_ORDER_QUERY?: string;
+
+  @IsString()
+  @IsOptional()
+  ERP_API_KEY_SALES_ORDER_READ?: string;
 
   @IsString()
   @IsOptional()
@@ -67,7 +111,23 @@ export class EnvVars {
 
   @IsString()
   @IsOptional()
+  ERP_API_KEY_SALES_DELIVERY_QUERY?: string;
+
+  @IsString()
+  @IsOptional()
+  ERP_API_KEY_SALES_DELIVERY_READ?: string;
+
+  @IsString()
+  @IsOptional()
   ERP_API_KEY_SALES_RETURN?: string;
+
+  @IsString()
+  @IsOptional()
+  ERP_API_KEY_SALES_RETURN_QUERY?: string;
+
+  @IsString()
+  @IsOptional()
+  ERP_API_KEY_SALES_RETURN_READ?: string;
 
   @IsString()
   @IsOptional()
@@ -75,11 +135,35 @@ export class EnvVars {
 
   @IsString()
   @IsOptional()
+  ERP_API_KEY_COLLECTION_QUERY?: string;
+
+  @IsString()
+  @IsOptional()
+  ERP_API_KEY_COLLECTION_READ?: string;
+
+  @IsString()
+  @IsOptional()
   ERP_API_KEY_AR_REFUND?: string;
 
   @IsString()
   @IsOptional()
+  ERP_API_KEY_AR_REFUND_QUERY?: string;
+
+  @IsString()
+  @IsOptional()
+  ERP_API_KEY_AR_REFUND_READ?: string;
+
+  @IsString()
+  @IsOptional()
   ERP_API_KEY_OTHER_RECEIVABLE?: string;
+
+  @IsString()
+  @IsOptional()
+  ERP_API_KEY_OTHER_RECEIVABLE_QUERY?: string;
+
+  @IsString()
+  @IsOptional()
+  ERP_API_KEY_OTHER_RECEIVABLE_READ?: string;
 
   // Echoed inside the digi-host / digi-service JSON headers.
   @IsString()

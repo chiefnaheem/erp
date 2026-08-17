@@ -17,20 +17,35 @@ import {
 const MAX_PAGES = 10_000;
 
 /**
- * The ERP issues a DIFFERENT digi-key per object. A method name is
- * `yvijucrm.<object>.<action>`, and the key is per <object> (shared by that
- * object's .query and .read). This maps each object to its env var; anything not
- * listed or not set falls back to the general ERP_API_KEY.
+ * The ERP issues a DIFFERENT digi-key per METHOD, not per object.
+ *
+ * The API doc's sample requests show a distinct `digi-key` for every single
+ * method — including `.query` vs `.read` of the SAME object (e.g.
+ * sales_order_doc.query uses C57349…, sales_order_doc.read uses 8F49B6…). An
+ * earlier version of this file assumed one key per object; that only ever worked
+ * because the sync uses `.query` exclusively.
+ *
+ * A method name is `yvijucrm.<object>.<action>`. This maps each object onto the
+ * SHORT alias used in the env var names, and the key is resolved most-specific
+ * first (see apiKeyFor):
+ *
+ *   1. ERP_API_KEY_<ALIAS>_<ACTION>   e.g. ERP_API_KEY_SALES_ORDER_READ
+ *   2. ERP_API_KEY_<ALIAS>            e.g. ERP_API_KEY_SALES_ORDER   (back-compat)
+ *   3. ERP_API_KEY                    global fallback
+ *
+ * Step 2 is what keeps every existing .env working unchanged: a deployment that
+ * only ever calls .query and set the object-level key keeps resolving to it.
  */
-const OBJECT_KEY_ENV: Record<string, string> = {
-  customer: 'ERP_API_KEY_CUSTOMER',
-  customer_credit: 'ERP_API_KEY_CUSTOMER_CREDIT',
-  sales_order_doc: 'ERP_API_KEY_SALES_ORDER',
-  sales_delivery: 'ERP_API_KEY_SALES_DELIVERY',
-  sales_return: 'ERP_API_KEY_SALES_RETURN',
-  collection_doc: 'ERP_API_KEY_COLLECTION',
-  ar_refund_doc: 'ERP_API_KEY_AR_REFUND',
-  other_receivable_doc: 'ERP_API_KEY_OTHER_RECEIVABLE',
+const OBJECT_KEY_ALIAS: Record<string, string> = {
+  customer: 'CUSTOMER',
+  customer_credit: 'CUSTOMER_CREDIT',
+  customer_credit_line: 'CUSTOMER_CREDIT_LINE',
+  sales_order_doc: 'SALES_ORDER',
+  sales_delivery: 'SALES_DELIVERY',
+  sales_return: 'SALES_RETURN',
+  collection_doc: 'COLLECTION',
+  ar_refund_doc: 'AR_REFUND',
+  other_receivable_doc: 'OTHER_RECEIVABLE',
 };
 
 @Injectable()
@@ -53,22 +68,32 @@ export class ErpClient {
     const pageSize =
       options.pageSize ?? this.config.getOrThrow<number>('ERP_PAGE_SIZE');
 
+    // Body keys are snake_case, exactly as the API doc's sample requests specify
+    // (page_size / page_no / is_get_schema / is_get_count). An earlier version
+    // sent camelCase; the gateway happened to accept it, but that was undefined
+    // behaviour — and the failure mode if it ever stopped would be silent
+    // (page_no ignored → every page identical → sweep "succeeds" with page 1).
     const parameter = await this.post<ErpQueryParameter<TRow>>(method, {
-      pageSize,
-      pageNo,
-      isGetSchema: options.isGetSchema ?? false,
-      isGetCount: options.isGetCount ?? false,
+      page_size: pageSize,
+      page_no: pageNo,
+      is_get_schema: options.isGetSchema ?? false,
+      is_get_count: options.isGetCount ?? false,
       conditions: options.conditions ?? [],
       orders: options.orders ?? [],
     });
 
     const rows = parameter.body.rows ?? [];
+    const total = this.extractTotal(parameter.body);
 
     // Success log so a running sync shows exactly what each query fetched: the
     // method, which page, how many rows, and a compact preview of the first row
     // so we can confirm real data (and its shape) is coming back.
     this.logger.log(
       `${method} p${pageNo} (size ${pageSize}): fetched ${rows.length} row(s)` +
+        (total !== null ? `, total ${total}` : '') +
+        (parameter.execution.token_id
+          ? ` [token ${parameter.execution.token_id}]`
+          : '') +
         (rows.length ? ` — sample: ${this.preview(rows[0])}` : ''),
     );
 
@@ -76,7 +101,7 @@ export class ErpClient {
       rows,
       pageNo,
       pageSize,
-      total: this.extractTotal(parameter.body),
+      total,
       execution: parameter.execution,
     };
   }
@@ -105,12 +130,27 @@ export class ErpClient {
       options.pageSize ?? this.config.getOrThrow<number>('ERP_PAGE_SIZE');
     const pageRetries = this.config.get<number>('ERP_PAGE_RETRIES') ?? 3;
 
-    for (let pageNo = Math.max(1, startPage); pageNo <= MAX_PAGES; pageNo++) {
+    const firstPage = Math.max(1, startPage);
+
+    for (let pageNo = firstPage; pageNo <= MAX_PAGES; pageNo++) {
       let page: ErpPage<TRow> | null = null;
+
+      // Ask for the row count on the FIRST page of the sweep only. The doc
+      // defines is_get_count but never names the field the total comes back in,
+      // so extractTotal() probes for it — asking once per sweep is enough to
+      // learn it (and to log how much we expect) without paying for it on every
+      // page. A caller that sets isGetCount explicitly keeps control.
+      const isGetCount =
+        options.isGetCount ?? (pageNo === firstPage ? true : false);
 
       for (let attempt = 1; attempt <= pageRetries; attempt++) {
         try {
-          page = await this.query<TRow>(method, { ...options, pageNo, pageSize });
+          page = await this.query<TRow>(method, {
+            ...options,
+            pageNo,
+            pageSize,
+            isGetCount,
+          });
           break;
         } catch (error) {
           // Only bad-response / transport hiccups are page-retryable. A business
@@ -148,13 +188,22 @@ export class ErpClient {
     );
   }
 
-  /** Fetch specific records via a `.read` method's dataKeys. */
+  /**
+   * Fetch specific records via a `.read` method's data_keys.
+   *
+   * ⚠️ The required key set differs PER OBJECT and is not uniform. Some objects
+   * take a single key (sales_order_doc / sales_delivery / sales_return:
+   * `DOC_NO`; customer: `CUSTOMER_CODE`), while collection_doc, ar_refund_doc and
+   * other_receivable_doc additionally require all six `Owner_Org_*` fields, and
+   * customer_credit requires eight. See READ_KEY_FIELDS in erp.types.ts for the
+   * documented set, and readKeysFor() to build one.
+   */
   async read<TRow>(
     method: ErpMethod,
     dataKeys: Record<string, string>[],
   ): Promise<TRow[]> {
     const parameter = await this.post<ErpReadParameter<TRow>>(method, {
-      dataKeys,
+      data_keys: dataKeys,
     });
     return parameter.body.result?.success ?? [];
   }
@@ -274,16 +323,28 @@ export class ErpClient {
   }
 
   /**
-   * The digi-key for a method's object. The ERP issues one key per object, so
-   * `yvijucrm.customer.query` and `yvijucrm.customer.read` share the customer
-   * key, while a sales order uses a different one. Falls back to the general
-   * ERP_API_KEY for any object without its own key configured.
+   * The digi-key for a method. The ERP issues one key PER METHOD, so
+   * `yvijucrm.customer.query` and `yvijucrm.customer.read` have different keys.
+   *
+   * Resolved most-specific first, so an existing object-level .env keeps working:
+   *   ERP_API_KEY_CUSTOMER_QUERY → ERP_API_KEY_CUSTOMER → ERP_API_KEY
    */
   private apiKeyFor(method: ErpMethod): string {
-    const object = method.split('.')[1] ?? '';
-    const envName = OBJECT_KEY_ENV[object];
-    const specific = envName ? this.config.get<string>(envName)?.trim() : undefined;
-    return specific || this.config.getOrThrow<string>('ERP_API_KEY');
+    const [, object, action] = method.split('.');
+    const alias = OBJECT_KEY_ALIAS[object ?? ''];
+
+    if (alias) {
+      const candidates = [
+        `ERP_API_KEY_${alias}_${(action ?? '').toUpperCase()}`,
+        `ERP_API_KEY_${alias}`,
+      ];
+      for (const name of candidates) {
+        const value = this.config.get<string>(name)?.trim();
+        if (value) return value;
+      }
+    }
+
+    return this.config.getOrThrow<string>('ERP_API_KEY');
   }
 
   /**

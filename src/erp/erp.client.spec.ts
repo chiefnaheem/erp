@@ -96,7 +96,8 @@ describe('ErpClient', () => {
     expect(host.timestamp).toEqual(expect.any(String));
   });
 
-  it('uses the object-specific digi-key, falling back to ERP_API_KEY', async () => {
+  // Existing deployments only set an object-level key, so that must keep working.
+  it('uses the object-level digi-key, falling back to ERP_API_KEY', async () => {
     const client = await build({
       ERP_API_KEY: 'fallback-key',
       ERP_API_KEY_CUSTOMER: 'customer-key',
@@ -112,20 +113,48 @@ describe('ErpClient', () => {
     expect(calls[0].headers['digi-key']).toBe('customer-key'); // customer.query
     expect(calls[1].headers['digi-key']).toBe('order-key'); // sales_order.query
     expect(calls[2].headers['digi-key']).toBe('fallback-key'); // collection → fallback
-    expect(calls[3].headers['digi-key']).toBe('customer-key'); // customer.READ shares the key
+    expect(calls[3].headers['digi-key']).toBe('customer-key'); // read → object-level
   });
 
-  it('wraps the request in a std_data envelope', async () => {
+  // The API doc gives every METHOD its own digi-key — including .query vs .read
+  // of the same object — so a per-method key must win over the object-level one.
+  it('prefers a per-method digi-key over the object-level key', async () => {
+    const client = await build({
+      ERP_API_KEY: 'fallback-key',
+      ERP_API_KEY_CUSTOMER: 'customer-object-key',
+      ERP_API_KEY_CUSTOMER_QUERY: 'customer-query-key',
+      ERP_API_KEY_CUSTOMER_READ: 'customer-read-key',
+      // sales_order has only an object-level key → both methods use it
+      ERP_API_KEY_SALES_ORDER: 'order-object-key',
+    });
+
+    await client.query(ERP_METHOD.CUSTOMER_QUERY);
+    await client.read(ERP_METHOD.CUSTOMER_READ, [{ CUSTOMER_CODE: 'C1' }]);
+    await client.query(ERP_METHOD.SALES_ORDER_QUERY);
+    await client.read(ERP_METHOD.SALES_ORDER_READ, [{ DOC_NO: 'NO_1' }]);
+    await client.query(ERP_METHOD.CUSTOMER_CREDIT_LINE_QUERY);
+
+    expect(calls[0].headers['digi-key']).toBe('customer-query-key');
+    expect(calls[1].headers['digi-key']).toBe('customer-read-key');
+    expect(calls[2].headers['digi-key']).toBe('order-object-key');
+    expect(calls[3].headers['digi-key']).toBe('order-object-key');
+    expect(calls[4].headers['digi-key']).toBe('fallback-key'); // 9th object, no key set
+  });
+
+  // The API doc specifies snake_case parameter names. An earlier version sent
+  // camelCase, which the gateway happened to tolerate — but if it ever stopped,
+  // page_no would be ignored and every sweep would silently return page 1.
+  it('wraps the request in a std_data envelope with snake_case parameters', async () => {
     const client = await build();
     await client.query(ERP_METHOD.CUSTOMER_QUERY, { pageNo: 3, pageSize: 50 });
 
     expect(calls[0].body).toEqual({
       std_data: {
         parameter: {
-          pageSize: 50,
-          pageNo: 3,
-          isGetSchema: false,
-          isGetCount: false,
+          page_size: 50,
+          page_no: 3,
+          is_get_schema: false,
+          is_get_count: false,
           conditions: [],
           orders: [],
         },
@@ -199,7 +228,7 @@ describe('ErpClient', () => {
       body: {
         std_data: {
           execution: { code: '0' },
-          parameter: { rows: pages[call.body.std_data.parameter.pageNo] ?? [] },
+          parameter: { rows: pages[call.body.std_data.parameter.page_no] ?? [] },
         },
       },
     });
@@ -222,7 +251,7 @@ describe('ErpClient', () => {
       body: { std_data: { execution: { code: '0' }, parameter: { rows } } },
     });
     respond = (call) => {
-      const page = call.body.std_data.parameter.pageNo;
+      const page = call.body.std_data.parameter.page_no;
       if (page === 1) return good([{ id: 1 }, { id: 2 }]);
       if (page === 2) return { status: 200, body: '<html>gateway error</html>' };
       if (page === 3) return good([{ id: 5 }]); // short → ends
@@ -246,7 +275,7 @@ describe('ErpClient', () => {
       body: {
         std_data: {
           execution: { code: '0' },
-          parameter: { rows: pages[call.body.std_data.parameter.pageNo] ?? [] },
+          parameter: { rows: pages[call.body.std_data.parameter.page_no] ?? [] },
         },
       },
     });
@@ -258,7 +287,7 @@ describe('ErpClient', () => {
     }
 
     expect(seen).toHaveLength(1); // page 2's row
-    expect(calls[0].body.std_data.parameter.pageNo).toBe(2); // started at 2, not 1
+    expect(calls[0].body.std_data.parameter.page_no).toBe(2); // started at 2, not 1
   });
 
   it('stops cleanly when the first page is empty', async () => {
@@ -359,6 +388,6 @@ describe('ErpClient', () => {
     const rows = await client.read(ERP_METHOD.SALES_ORDER_READ, [{ DOC_NO: 'NO_1' }]);
 
     expect(rows).toEqual([{ DOC_NO: 'NO_1' }]);
-    expect(calls[0].body.std_data.parameter.dataKeys).toEqual([{ DOC_NO: 'NO_1' }]);
+    expect(calls[0].body.std_data.parameter.data_keys).toEqual([{ DOC_NO: 'NO_1' }]);
   });
 });
