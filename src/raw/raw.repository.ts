@@ -5,6 +5,7 @@ import { PrismaService } from '../prisma/prisma.service';
 export type ErpObjectType =
   | 'CUSTOMER'
   | 'CUSTOMER_CREDIT'
+  | 'CUSTOMER_CREDIT_LINE'
   | 'SALES_ORDER'
   | 'SALES_DELIVERY'
   | 'SALES_RETURN'
@@ -22,6 +23,7 @@ export type ErpObjectType =
 const RAW_TABLE: Record<ErpObjectType, string> = {
   CUSTOMER: 'raw_customer',
   CUSTOMER_CREDIT: 'raw_customer_credit',
+  CUSTOMER_CREDIT_LINE: 'raw_customer_credit_line',
   SALES_ORDER: 'raw_sales_order',
   SALES_DELIVERY: 'raw_sales_delivery',
   SALES_RETURN: 'raw_sales_return',
@@ -300,6 +302,23 @@ export class RawRepository {
    * projected. This replaces the per-row loop that was too slow to finish within
    * the lock lease. Only orders whose ApproveStatus is in `statusMap` and that
    * have a usable date are projected; the rest stay queued.
+   *
+   * ⚠️ A raw sales-order row is ONE ORDER LINE, not one order (see
+   * SalesOrderIngestJob) — a multi-line order is N rows repeating the same
+   * header. Two consequences, both handled by the `hdr` CTE below:
+   *
+   *  - Purchase.erpId comes from `payload->>'DOC_NO'`, not from `erp_key`
+   *    (which is now the detail-line id). Otherwise each line would become its
+   *    own Purchase.
+   *  - The lines are reduced to one representative row per DOC_NO. Without that,
+   *    a multi-line order would hit the same conflict target twice in one
+   *    statement, which Postgres rejects outright ("ON CONFLICT DO UPDATE command
+   *    cannot affect row a second time").
+   *
+   * The header totals (QTY_TOTAL, AMT_UNINCLUDE_TAX_OC, TAX_OC) are repeated
+   * verbatim on every line, so they are taken from that single representative
+   * row and deliberately NOT summed — summing would multiply each by the number
+   * of lines.
    */
   async bulkProjectPurchases(
     statusMap: Record<string, string>,
@@ -322,18 +341,23 @@ export class RawRepository {
           AND r.projected_at IS NULL
           AND r.payload->>'ApproveStatus' IN (${inList})
           AND NULLIF(r.payload->>'ORDER_DATE','') IS NOT NULL
-        RETURNING r.erp_key, r.payload, c.id AS customer_id
+          AND NULLIF(r.payload->>'DOC_NO','') IS NOT NULL
+        RETURNING r.id, r.payload, c.id AS customer_id
+      ), hdr AS (
+        SELECT DISTINCT ON (payload->>'DOC_NO') id, payload, customer_id
+        FROM proj
+        ORDER BY payload->>'DOC_NO', id
       ), ins AS (
         INSERT INTO public."Purchase"
           (id,"erpId","customerId","orderDate","totalItems","totalValue",status,"createdAt","updatedAt")
-        SELECT gen_random_uuid(), erp_key, customer_id,
+        SELECT gen_random_uuid(), payload->>'DOC_NO', customer_id,
           (payload->>'ORDER_DATE')::timestamp,
           CASE WHEN payload->>'QTY_TOTAL' ~ '^[0-9.]+$' THEN (payload->>'QTY_TOTAL')::numeric::int ELSE 0 END,
           COALESCE(NULLIF(payload->>'AMT_UNINCLUDE_TAX_OC','')::numeric,0)
             + COALESCE(NULLIF(payload->>'TAX_OC','')::numeric,0),
           (CASE payload->>'ApproveStatus' ${caseSql} END)::"OrderStatus",
           now(), now()
-        FROM proj
+        FROM hdr
         ON CONFLICT ("erpId") DO UPDATE SET
           status = EXCLUDED.status, "orderDate" = EXCLUDED."orderDate",
           "totalItems" = EXCLUDED."totalItems", "totalValue" = EXCLUDED."totalValue",

@@ -37,7 +37,8 @@ describe('Sync cycle (e2e)', () => {
       req.on('data', (c) => (raw += c));
       req.on('end', () => {
         const method = JSON.parse(req.headers['digi-service'] as string).name;
-        const { pageNo } = JSON.parse(raw).std_data.parameter;
+        // snake_case, as the API doc specifies and ErpClient now sends.
+        const { page_no: pageNo } = JSON.parse(raw).std_data.parameter;
 
         // Only page 1 has data; page 2 is empty so queryAll terminates.
         const table: Record<string, Record<string, unknown>[]> = {
@@ -269,6 +270,50 @@ describe('Sync cycle (e2e)', () => {
     expect(updated.totalValue).toBe(2075); // 2000 ex-tax + 75 tax
 
     await prisma.purchaseItem.deleteMany({ where: { purchaseId: purchase.id } });
+  });
+
+  // ── Multi-line orders ─────────────────────────────────────────────────────
+  // sales_order_doc.query returns HEADER + ONE DETAIL LINE per row, so a
+  // multi-line order arrives as several rows repeating the same DOC_NO. Every
+  // line must be kept in erp_raw (keyed on the detail id), while the app still
+  // gets exactly ONE Purchase whose header totals are NOT multiplied by the
+  // number of lines.
+  it('keeps every line of a multi-line order but projects a single Purchase', async () => {
+    await createActiveCustomer();
+
+    const header = {
+      DOC_NO: DOC,
+      CUSTOMER_ID: GUID,
+      ORDER_DATE: '2026-06-01',
+      ApproveStatus: 'Y',
+      AMT_UNINCLUDE_TAX_OC: 1000, // header totals repeat on every line
+      TAX_OC: 75,
+      QTY_TOTAL: '12',
+    };
+    salesOrders = [
+      { ...header, SALES_ORDER_DOC_D_ID: 'TEST_E2E_LINE_1', SequenceNumber: 1, ITEM_DESCRIPTION: 'Chocolate Milk', BUSINESS_QTY: 5 },
+      { ...header, SALES_ORDER_DOC_D_ID: 'TEST_E2E_LINE_2', SequenceNumber: 2, ITEM_DESCRIPTION: 'Strawberry Milk', BUSINESS_QTY: 7 },
+    ];
+
+    await runCycle();
+
+    // Both lines survive in the raw table, keyed on the detail id.
+    const lines = await prisma.$queryRawUnsafe<any[]>(
+      `SELECT erp_key, payload FROM erp_raw.raw_sales_order
+       WHERE erp_key LIKE 'TEST_E2E_LINE_%' ORDER BY erp_key`,
+    );
+    expect(lines).toHaveLength(2);
+    expect(lines.map((l) => l.payload.ITEM_DESCRIPTION)).toEqual([
+      'Chocolate Milk',
+      'Strawberry Milk',
+    ]);
+
+    // ...but the order projects to exactly ONE Purchase, keyed on DOC_NO.
+    const purchases = await prisma.purchase.findMany({ where: { erpId: DOC } });
+    expect(purchases).toHaveLength(1);
+    // Header totals taken once, not summed across the two lines.
+    expect(purchases[0].totalValue).toBe(1075); // 1000 + 75, NOT 2150
+    expect(purchases[0].totalItems).toBe(12); // QTY_TOTAL once, NOT 24
   });
 
   // ── Idempotence ───────────────────────────────────────────────────────────

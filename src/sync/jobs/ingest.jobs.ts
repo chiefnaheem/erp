@@ -115,6 +115,23 @@ export class CustomerIngestJob extends IngestJob {
   }
 }
 
+/**
+ * Sales orders arrive as HEADER + ONE DETAIL LINE per row, flattened.
+ *
+ * The API doc's return-field table for sales_order_doc.query lists the detail
+ * table's primary key (SALES_ORDER_DOC_D_ID) and SequenceNumber next to the
+ * header fields, and its sample response shows them in one flat object — so a
+ * five-line order comes back as five rows that all repeat the same DOC_NO.
+ *
+ * Keying on DOC_NO (as this job used to) therefore collapsed every order down to
+ * a single line: within a page the dedupe map kept only the last line, and across
+ * pages ON CONFLICT overwrote it. That silently discarded the per-product data,
+ * and made the content hash flip on every sweep — so these rows were rewritten
+ * every cycle instead of being skipped as unchanged.
+ *
+ * Keying on the detail-line id keeps every line. DOC_NO is still what the
+ * projection groups by, and it reads it from the payload rather than the key.
+ */
 @Injectable()
 export class SalesOrderIngestJob extends IngestJob {
   readonly name = 'ingest:sales_order';
@@ -122,7 +139,10 @@ export class SalesOrderIngestJob extends IngestJob {
   protected readonly objectType: ErpObjectType = 'SALES_ORDER';
 
   protected keyOf(row: Record<string, unknown>) {
-    return row.DOC_NO as string | undefined;
+    // Fall back to DOC_NO so a header-only response (no detail line) is still
+    // ingested rather than dropped as un-keyable.
+    return (row.SALES_ORDER_DOC_D_ID as string | undefined) ??
+      (row.DOC_NO as string | undefined);
   }
 }
 
@@ -164,6 +184,27 @@ export class CustomerCreditIngestJob extends IngestJob {
 
   protected keyOf(row: Record<string, unknown>) {
     return row.CUSTOMER_CREDIT_ID as string | undefined;
+  }
+}
+
+/**
+ * CUSTOMER_CREDIT_LINE — the 9th object in the API index, which was never
+ * ingested at all.
+ *
+ * It carries AR_AMT (accounts-receivable amount) per customer/company/currency,
+ * which is a more direct source for a customer's outstanding balance than the
+ * CREDIT_PAY ("used credit") figure on CUSTOMER_CREDIT that we settled for.
+ * Ingested so the two can be compared on real data before anything is
+ * re-pointed — no projection is wired to it yet.
+ */
+@Injectable()
+export class CustomerCreditLineIngestJob extends IngestJob {
+  readonly name = 'ingest:customer_credit_line';
+  protected readonly method = ERP_METHOD.CUSTOMER_CREDIT_LINE_QUERY;
+  protected readonly objectType: ErpObjectType = 'CUSTOMER_CREDIT_LINE';
+
+  protected keyOf(row: Record<string, unknown>) {
+    return row.CUSTOMER_CREDIT_LINE_ID as string | undefined;
   }
 }
 

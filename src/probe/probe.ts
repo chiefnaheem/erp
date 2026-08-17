@@ -17,7 +17,7 @@ import { Logger } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
 import { AppModule } from '../app.module';
 import { ErpClient } from '../erp/erp.client';
-import { ERP_METHOD } from '../erp/erp.types';
+import { ERP_METHOD, ErpMethod, readKeysFor } from '../erp/erp.types';
 
 const log = new Logger('Probe');
 
@@ -44,6 +44,32 @@ const WANTED = {
 
 type Findings = Record<string, unknown>;
 const findings: Findings = {};
+
+/**
+ * Issue a `.read` with the COMPLETE documented key set for that method.
+ *
+ * The key set is not uniform: sales_order_doc.read takes DOC_NO alone, but
+ * collection_doc / ar_refund_doc / other_receivable_doc each additionally
+ * require all six Owner_Org_* organisation codes, and customer_credit requires
+ * eight fields. Sending a partial set is why those reads get rejected with an
+ * unhelpful error. Any field we cannot supply is sent as '' (the doc's own
+ * sample does exactly that) and reported back so the gap is visible rather than
+ * silent.
+ */
+async function readWithKeys(
+  erp: ErpClient,
+  method: ErpMethod,
+  values: Record<string, string | undefined>,
+): Promise<{ raw: unknown; keysSent: Record<string, string>; missingKeys: string[] }> {
+  const { keys, missing } = readKeysFor(method, values);
+  if (missing.length) {
+    log.warn(
+      `  ${method}: no value for required key(s) ${missing.join(', ')} — sending '' for them`,
+    );
+  }
+  const raw = await erp.raw(method, { data_keys: [keys] });
+  return { raw, keysSent: keys, missingKeys: missing };
+}
 
 async function main() {
   const app = await NestFactory.createApplicationContext(AppModule, {
@@ -99,8 +125,8 @@ async function main() {
     const code = page.rows[0]?.CUSTOMER_CODE as string | undefined;
     if (!code) return { note: 'no CUSTOMER_CODE to read with' };
 
-    const raw = await erp.raw(ERP_METHOD.CUSTOMER_READ, {
-      dataKeys: [{ CUSTOMER_CODE: code }],
+    const { raw } = await readWithKeys(erp, ERP_METHOD.CUSTOMER_READ, {
+      CUSTOMER_CODE: code,
     });
 
     // Flatten the entire response and surface every key whose NAME or VALUE looks
@@ -172,8 +198,8 @@ async function main() {
     const queryKeys = Object.keys(row);
 
     // The decisive call: does .read return the order's detail lines?
-    const raw = await erp.raw(ERP_METHOD.SALES_ORDER_READ, {
-      dataKeys: [{ DOC_NO: docNo }],
+    const { raw } = await readWithKeys(erp, ERP_METHOD.SALES_ORDER_READ, {
+      DOC_NO: docNo,
     });
 
     const rawText = JSON.stringify(raw);
@@ -207,8 +233,12 @@ async function main() {
     const keys = Object.keys(row);
     const customerish = keys.filter((k) => WANTED.collectionCustomer.test(k));
 
-    const raw = await erp.raw(ERP_METHOD.COLLECTION_READ, {
-      dataKeys: [{ DOC_NO: row.DOC_NO as string }],
+    // collection_doc.read needs the six Owner_Org_* organisation codes as well as
+    // DOC_NO, and collection_doc.query returns none of them — so they go out
+    // blank and are reported. If the read fails, that missing-key list is the
+    // first thing to take to the ERP team.
+    const { raw, missingKeys } = await readWithKeys(erp, ERP_METHOD.COLLECTION_READ, {
+      DOC_NO: row.DOC_NO as string,
     });
 
     return {
@@ -217,17 +247,18 @@ async function main() {
       VERDICT_customerLink: customerish.length
         ? 'FOUND — payments may be attributable'
         : 'ABSENT at header level — check rawReadResponse for lines',
+      readKeysWeCouldNotSupply: missingKeys,
       rawReadResponse: raw,
     };
   });
 
   // ── Q6/Q7: pagination count + incremental filtering ─────────────────────
-  await check('6. isGetCount — does it return a total, and under what key?', async () => {
+  await check('6. is_get_count — does it return a total, and under what key?', async () => {
     const raw = await erp.raw(ERP_METHOD.CUSTOMER_QUERY, {
-      pageSize: 1,
-      pageNo: 1,
-      isGetCount: true,
-      isGetSchema: false,
+      page_size: 1,
+      page_no: 1,
+      is_get_count: true,
+      is_get_schema: false,
       conditions: [],
       orders: [],
     });
@@ -253,10 +284,10 @@ async function main() {
     for (const shape of shapes) {
       try {
         const raw = await erp.raw(ERP_METHOD.CUSTOMER_QUERY, {
-          pageSize: 1,
-          pageNo: 1,
-          isGetCount: false,
-          isGetSchema: false,
+          page_size: 1,
+          page_no: 1,
+          is_get_count: false,
+          is_get_schema: false,
           conditions: shape.value,
           orders: [],
         });
