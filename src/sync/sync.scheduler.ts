@@ -85,7 +85,7 @@ export class SyncScheduler implements OnApplicationBootstrap {
   // (every 15 min — quick initial catch-up), then STEADY (at most once per
   // ERP_INGEST_SLOW_MINUTES — hourly by default) to spare the flaky DB once caught
   // up. A tick that's gated off just logs and stands down.
-  @Cron(process.env.ERP_SYNC_CRON || '0 */15 * * * *', { name: 'erp-ingest' })
+  @Cron(process.env.ERP_SYNC_CRON || '0 0 */6 * * *', { name: 'erp-ingest' })
   async ingestTick(): Promise<void> {
     const gate = this.ingestGate();
     if (!gate.run) {
@@ -163,14 +163,20 @@ export class SyncScheduler implements OnApplicationBootstrap {
       this.logFailure(tag, 'RUN', error, workStartedAt);
     }
 
+    // A failed release is a real failure: the lease stays held until it expires,
+    // so every tick until then stands down. Reporting the stage as "ok" hid that.
+    let releaseError: unknown;
     try {
       await this.release(lockName);
     } catch (error) {
+      releaseError = error;
       this.logFailure(tag, 'RELEASE_LOCK', error, startedAt);
     }
 
+    const failed = stageError || releaseError;
     this.logger.log(
-      `${tag}: ${stageError ? 'FAILED' : 'ok'} — total ${Date.now() - startedAt}ms`,
+      `${tag}: ${failed ? 'FAILED' : 'ok'}${releaseError ? ' (lock not released — it will expire)' : ''}` +
+        ` — total ${Date.now() - startedAt}ms`,
     );
   }
 
@@ -179,7 +185,8 @@ export class SyncScheduler implements OnApplicationBootstrap {
    * worker holds it, in which case this tick stands down.
    */
   private async acquire(lockName: string, leaseMinutes: number): Promise<boolean> {
-    const rows = await this.prisma.$queryRaw<{ name: string }[]>`
+    const rows = await this.prisma.withRetry(
+      () => this.prisma.$queryRaw<{ name: string }[]>`
       INSERT INTO erp_raw.sync_lock (name, locked_until, locked_by, acquired_at)
       VALUES (
         ${lockName},
@@ -191,17 +198,22 @@ export class SyncScheduler implements OnApplicationBootstrap {
         locked_until = (now() + (${leaseMinutes}::int * interval '1 minute')),
         locked_by    = ${this.owner},
         acquired_at  = now()
-      WHERE erp_raw.sync_lock.locked_until < now()
-      RETURNING name
-    `;
+        WHERE erp_raw.sync_lock.locked_until < now()
+        RETURNING name
+      `,
+      `acquire(${lockName})`,
+    );
     return rows.length > 0;
   }
 
   private async release(lockName: string): Promise<void> {
-    await this.prisma.$executeRaw`
-      UPDATE erp_raw.sync_lock SET locked_until = now()
-      WHERE name = ${lockName} AND locked_by = ${this.owner}
-    `;
+    await this.prisma.withRetry(
+      () => this.prisma.$executeRaw`
+        UPDATE erp_raw.sync_lock SET locked_until = now()
+        WHERE name = ${lockName} AND locked_by = ${this.owner}
+      `,
+      `release(${lockName})`,
+    );
   }
 
   /**

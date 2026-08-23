@@ -41,22 +41,27 @@ export class StockProjectionJob extends BlockedJob {
 }
 
 /**
- * The 2026-07-28 ERP update DID add sales-order line items (ITEM_ID,
- * ITEM_DESCRIPTION, BUSINESS_QTY, ...), so this is now buildable — but HOW the
- * lines are nested in sales_order_doc.query is not specified in the docs, and it
- * matters: if the response returns one flat row per line (header repeated), the
- * sales_order ingest key (DOC_NO) collides and we'd keep only one line per order.
- * Confirm the shape against a live response before wiring the projection.
+ * Sales-order line items exist, and the response shape is no longer in doubt:
+ * api_docs/sales_order_doc.query.md lists the detail fields (SALES_ORDER_DOC_D_ID,
+ * SequenceNumber, ITEM_ID, BUSINESS_QTY, ...) in the SAME table as the header
+ * fields, and its sample response is one FLAT object per line. So a five-line
+ * order arrives as five rows repeating one DOC_NO — which is exactly what the
+ * ingest key (SALES_ORDER_DOC_D_ID) already accounts for.
+ *
+ * What remains is not a question about the ERP but work on our side: mapping
+ * ITEM_ID onto a product we hold, which needs the (still missing) material
+ * master, and writing the PurchaseItem rows.
  */
 @Injectable()
 export class PurchaseItemProjectionJob extends BlockedJob {
   readonly name = 'project:purchase_item';
   protected readonly reason =
-    'Sales-order line items now EXIST in the ERP (2026-07-28 update), but the ' +
-    'response nesting (detail array vs one flat row per line) is unconfirmed, and ' +
-    'it changes the ingest key. Not wired until a live sample confirms the shape.';
+    'Sales-order line items are ingested and their shape is confirmed by the API ' +
+    'docs (one flat row per line, keyed on SALES_ORDER_DOC_D_ID), but the ' +
+    'projection into public.PurchaseItem is not written yet: ITEM_ID cannot be ' +
+    'resolved to a product without a material-master endpoint.';
   protected readonly unblockedBy =
-    'One live sales_order_doc.query sample showing how line items are nested. ' +
-    'The startup debug probe now logs nested arrays/keys — restart and check its ' +
-    'sales_order output.';
+    'Either an ERP method returning the material master (so ITEM_ID resolves to a ' +
+    'product), or a decision to store the raw ITEM_ID/ITEM_DESCRIPTION as-is on ' +
+    'PurchaseItem. The line data itself is already in erp_raw.raw_sales_order.';
 }

@@ -3,8 +3,14 @@
 ERP: **YVIJUCRM**, a Digiwin **E10** external REST API (`digi-data-exchange-protocol 1.0`).
 
 This document maps every ERP method onto the data the Viju app needs, and records
-what the ERP **cannot** currently supply. Four gaps are **blocking** — they have
-no workaround on our side and need the ERP team to answer or extend the API.
+what the ERP **cannot** currently supply.
+
+> **Revised against the current API docs (`api_docs/`, 2026-08-17.)** Three of the
+> five gaps below have since CLOSED: the customer object now carries `PhoneNumber`
+> and `Region`, collections now carry `CUSTOMER_CODE`, and sales orders now return
+> their detail lines. The sections below record both the original finding and what
+> replaced it, because the reasoning behind the design decisions they forced (see
+> §1) still applies.
 
 ---
 
@@ -12,48 +18,54 @@ no workaround on our side and need the ERP team to answer or extend the API.
 
 | Our entity | ERP source | Status |
 |---|---|---|
-| **Customer** | `yvijucrm.customer.query` | ⛔ **Blocked** — no `phone`, no `region` |
+| **Customer** | `yvijucrm.customer.query` | ✅ **Unblocked** — `PhoneNumber` + `Region` now returned |
 | **Stock** | *(none)* | ⛔ **Blocked** — no product/inventory endpoint exists |
 | **Purchase** (header) | `yvijucrm.sales_order_doc.query` | ⚠️ Mappable, with caveats |
-| **PurchaseItem** (lines) | *(none)* | ⛔ **Blocked** — orders expose no line items |
-| **Payment** | `yvijucrm.collection_doc.query` | ⛔ **Blocked** — no customer link |
+| **PurchaseItem** (lines) | `yvijucrm.sales_order_doc.query` | ⚠️ Data arrives; projection not written (no material master) |
+| **Payment** | `yvijucrm.collection_doc.query` | ✅ **Unblocked** — `CUSTOMER_CODE` now returned |
 
-Only the Purchase *header* is cleanly syncable today.
+Stock remains the one hard blocker with no ERP source at all.
 
 ---
 
-## 1. Customer — ⛔ blocked
+## 1. Customer — ✅ unblocked
 
-`yvijucrm.customer.query` returns only:
+`yvijucrm.customer.query` returns:
 `CUSTOMER_ID`, `CUSTOMER_CODE`, `CUSTOMER_NAME`, `CUSTOMER_FULL_NAME`,
-`GENERAL_CURRENCY_ID`, `Owner_Dept`, `Owner_Emp`.
+`GENERAL_CURRENCY_ID`, `Owner_Dept`, `Owner_Emp`, `PhoneNumber`, `Region`,
+`BP_CLUSTER_CODE`, `BP_CLUSTER_NAME`.
 
 | Our field | ERP source | Status |
 |---|---|---|
 | `erpId` | `CUSTOMER_CODE` | ✅ |
 | `name` | `CUSTOMER_FULL_NAME` | ✅ |
-| `phone` | — | ⛔ **absent, but REQUIRED + UNIQUE in our DB** |
+| `phone` | `PhoneNumber` | ✅ (was the blocker) |
 | `email` | — | ⚠️ absent (nullable, tolerable) |
-| `region` | — | ⛔ **absent, but REQUIRED** (`LAGOS`/`SOUTH_WEST`/`SOUTH_EAST`/`NORTH`) |
+| `region` | `Region` | ✅ via `ERP_REGION_MAP` / `ERP_REGION_DEFAULT` |
 | `accountStatus` | — | ⚠️ absent (defaults to `ACTIVE`) |
 | `outstandingBalance` | `customer_credit.CREDIT_PAY`? | ⚠️ unconfirmed — see below |
 
-**Why this blocks:** `phone` is not just a column — it is the **login identifier**
-(phone + OTP auth). The ERP cannot give it to us, so **the sync cannot create
-customers.**
+**What this originally blocked, and why it still matters.** `phone` is the
+**login identifier** (phone + OTP auth). While it was absent the sync could not
+create customers at all, which forced the design now in the code: customers are
+onboarded *in the app*, then linked to the ERP by `CUSTOMER_CODE`, and the sync
+only *updates* ERP-owned fields on customers that already exist. Now that
+`PhoneNumber` is supplied, ERP-driven creation is possible — but it is still
+gated behind `ERP_CUSTOMER_PHONE_FIELD` being resolvable and a region mapping,
+and switching to create-on-sync is a decision that needs sign-off rather than a
+silent change. `Region` values are Chinese/empty in practice, hence
+`ERP_REGION_MAP` and the `ERP_REGION_DEFAULT` fallback.
 
-**Consequence — a real change of design.** Customers must be onboarded *in the
-app* (phone/OTP), then **linked** to the ERP by `CUSTOMER_CODE`. The sync job
-then only *updates* ERP-owned fields on already-existing customers
-(`name`, `outstandingBalance`) and must **never insert**. This is the opposite of
-the upsert-on-`erpId` model we assumed in Phase 1, and it needs sign-off.
-
-**`outstandingBalance`:** not on the customer object at all. Best candidate is
-`customer_credit.CREDIT_PAY` ("used credit amount"). Unconfirmed, and
-`CUSTOMER_CREDIT` may return **multiple rows per customer** (one per credit area
-/ currency), so which row wins is undefined. Note also that `SALES_RETURN`,
-`AR_REFUND_DOC` and `OTHER_RECEIVABLE_DOC` all move a customer's balance — if we
-compute rather than read the balance, all of them must be accounted for.
+**`outstandingBalance`:** still not on the customer object. Two candidates now
+exist and they identify the customer differently — `customer_credit.CREDIT_PAY`
+("used credit", joined by `CUSTOMER_CODE`) and
+`customer_credit_line.AR_AMT` ("accounts receivable", joined by the `CUSTOMER_ID`
+Guid). Both are ingested so they can be compared on real data; neither is wired
+to a projection. `CUSTOMER_CREDIT` may return **multiple rows per customer** (one
+per credit area / currency), so which row wins is still undefined. Note also that
+`SALES_RETURN`, `AR_REFUND_DOC` and `OTHER_RECEIVABLE_DOC` all move a customer's
+balance — if we compute rather than read the balance, all of them must be
+accounted for.
 
 ---
 
@@ -87,7 +99,7 @@ manually or via the existing `POST /erp/sync/stock` push webhook.
 | `totalValue` | `AMT_UNINCLUDE_TAX_OC` + `TAX_OC` | ✅ (confirm OC = NGN) |
 | `customerErpId` | `CUSTOMER_ID` (**Guid**) | ⚠️ **ID mismatch** |
 | `status` | `ApproveStatus` | ⚠️ **semantic mismatch** |
-| `totalItems` | `PIECES`? | ⚠️ ambiguous |
+| `totalItems` | `QTY_TOTAL` (header) / `BUSINESS_QTY` (line) | ⚠️ unit unconfirmed |
 
 **ID mismatch.** Orders reference the customer by `CUSTOMER_ID` (a **Guid**), but
 `customer.read` is keyed on `CUSTOMER_CODE` (a **string**) — which is what we'd
@@ -102,30 +114,40 @@ certainly come from `SALES_DELIVERY`, not from the order's approval flag. The
 possible values of `ApproveStatus` are **not documented**. We need the enumeration
 before we can map it.
 
-**`PIECES`** is described only as "Number of pieces" — unclear whether that is
-cartons or order lines. Our `totalItems` is displayed to customers, so this
-matters.
+**Quantity units.** `PIECES` is **not** a sales-order field — it is documented on
+`SALES_DELIVERY` and `SALES_RETURN` only, which fits it being a shipped-carton
+count. The order's own quantities are `QTY_TOTAL` on the header and
+`BUSINESS_QTY` per line, both in the line's `BUSINESS_UNIT_ID` unit, which is a
+Guid we cannot resolve without a unit master. Our `totalItems` is displayed to
+customers, so the unit matters.
 
-### 3b. Line items — ⛔ blocked
+### 3b. Line items — ⚠️ data arrives, projection not written
 
-`sales_order_doc.query` returns **header fields only**. No detail/line array is
-documented, and `sales_order_doc.read` is described merely as *"Returns the same
-DOC_NO on success"*, which tells us nothing about its payload.
+`sales_order_doc.query` now returns the detail line **in the same flat row as the
+header**: `SALES_ORDER_DOC_D_ID`, `SequenceNumber`, `ITEM_TYPE`, `ITEM_ID`,
+`ITEM_DESCRIPTION`, `ITEM_SPECIFICATION`, `BUSINESS_QTY`, `BUSINESS_UNIT_ID`,
+`DELIVERED_BUSINESS_QTY`, `DISTRIBUTED_BUS_QTY`. A five-line order therefore
+arrives as five rows repeating one `DOC_NO`, which is why ingest keys these rows
+on `SALES_ORDER_DOC_D_ID` and not on `DOC_NO` — keying on the document number
+silently collapsed every order to a single line.
 
-So `PurchaseItem` — `productName`, `quantity`, `unitPrice`, `lineTotal` — has
-**no source**.
+| Our field | ERP source | Status |
+|---|---|---|
+| `quantity` | `BUSINESS_QTY` | ✅ |
+| `productName` | `ITEM_DESCRIPTION` | ⚠️ description, not a product we hold |
+| `unitPrice` | — | ⛔ no per-line price documented |
+| `lineTotal` | — | ⛔ header carries the amounts, not the line |
 
-**This is the most damaging gap.** `PurchaseItem` is what powers:
-
-- the **Stock Balance Breakdown** screen (per-product "X Cartons Remaining")
-- `GET /customers/me/stock-balance`
-- the per-product officer stock view
-
-Without order lines, **the entire per-product breakdown feature has no data.**
+So the lines are captured in `erp_raw.raw_sales_order`, but `PurchaseItem` is not
+projected yet: `ITEM_ID` cannot be resolved to a product without the material
+master (§2), and there is no per-line price. The per-product breakdown —
+**Stock Balance Breakdown**, `GET /customers/me/stock-balance`, the officer
+per-product view — therefore still has no complete source, though it is now
+short of a mapping decision rather than short of data.
 
 ---
 
-## 4. Payment — ⛔ blocked, no customer link
+## 4. Payment — ✅ unblocked
 
 `yvijucrm.collection_doc.query`:
 
@@ -135,24 +157,41 @@ Without order lines, **the entire per-product breakdown feature has no data.**
 | `date` | `DOC_DATE` | ✅ |
 | `amount` | `COLLECTION_AMT_TC` | ✅ |
 | `reference` | `DOC_NO` | ✅ |
-| `customerErpId` | — | ⛔ **absent** |
+| `customerErpId` | `CUSTOMER_CODE` | ✅ (was the blocker) |
 | `runningBalance` | — | ⚠️ absent (we'd have to compute it) |
 
-**`COLLECTION_DOC` has no customer field.** The documented header carries
-`SETTLEMENT_OBJECT_TYPE` (an Int32) and `EMPLOYEE_ID` / `ADMIN_UNIT_ID`, but no
-`CUSTOMER_ID`. The customer is presumably on the document's **lines**, which are
-not exposed.
+The header now carries `CUSTOMER_CODE` and `CUSTOMER_NAME`. Note the join is by
+**code**, not by Guid — so payments map straight onto `Customer.erpId` with no
+`customer_link` lookup, unlike sales orders and deliveries which carry a
+`CUSTOMER_ID` Guid.
 
-A payment we cannot attribute to a customer is useless to us — `Payment.customerId`
-is a required FK. **Blocked.**
+There is **no `COLLECTION_DOC_ID`** in the documented field list — `DOC_ID` is
+the document *type*, not the row's identity — so the raw store keys collections
+on `DOC_NO`.
 
 ---
 
 ## 5. Cross-cutting issues
 
-**No base URL.** The docs never state the endpoint. Methods appear to dispatch
-through the `digi-service` header's `name` field against a single POST endpoint.
-**We need the actual URL** before any call can be made.
+**No base URL in the docs.** The docs still never state the endpoint; it was
+supplied separately and is `http://192.168.25.241:9990/CROSS/RESTful`. Every
+method dispatches through the `digi-service` header's `name` field against that
+single POST endpoint — confirmed in practice, and the name is **case-sensitive**
+(an uppercase variant is rejected with an empty response body).
+
+**Per-method digi-keys.** The docs issue a **different `digi-key` for every
+method**, including `.query` vs `.read` of the same object, and the gateway
+validates the key *against* the service name — a valid key paired with a
+different method's name is rejected outright. Keys resolve
+`ERP_API_KEY_<OBJECT>_<ACTION>` → `ERP_API_KEY_<OBJECT>` → `ERP_API_KEY`.
+
+**A key is also bound to an ACCOUNT.** The `digi-host` `acct` value must match the
+account the key was issued under, or the gateway rejects the request with an empty
+body. The keys issued to us belong to **`CRM`**; the `acct: "dcms"` in the
+`api_docs` samples goes with those docs' own sample keys and does **not** apply to
+ours. Verified against the live gateway: our keys are accepted under `CRM` and
+rejected under `dcms`. If the ERP team ever migrates us to `dcms`, every key must
+be re-issued at the same time.
 
 **Auth.** `digi-key: <API_KEY>` on every request, plus per-request `digi-host` and
 `digi-service` JSON headers carrying a timestamp, server IP, and the method name.

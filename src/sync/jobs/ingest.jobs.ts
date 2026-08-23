@@ -187,27 +187,6 @@ export class CustomerCreditIngestJob extends IngestJob {
   }
 }
 
-/**
- * CUSTOMER_CREDIT_LINE — the 9th object in the API index, which was never
- * ingested at all.
- *
- * It carries AR_AMT (accounts-receivable amount) per customer/company/currency,
- * which is a more direct source for a customer's outstanding balance than the
- * CREDIT_PAY ("used credit") figure on CUSTOMER_CREDIT that we settled for.
- * Ingested so the two can be compared on real data before anything is
- * re-pointed — no projection is wired to it yet.
- */
-@Injectable()
-export class CustomerCreditLineIngestJob extends IngestJob {
-  readonly name = 'ingest:customer_credit_line';
-  protected readonly method = ERP_METHOD.CUSTOMER_CREDIT_LINE_QUERY;
-  protected readonly objectType: ErpObjectType = 'CUSTOMER_CREDIT_LINE';
-
-  protected keyOf(row: Record<string, unknown>) {
-    return row.CUSTOMER_CREDIT_LINE_ID as string | undefined;
-  }
-}
-
 // The three below are dump-only (no projection yet): we capture every response
 // so all endpoints land in their own table, ready if/when we need them.
 

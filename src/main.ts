@@ -1,3 +1,8 @@
+// MUST stay first: populates process.env before any module below is imported,
+// so decorators that read process.env at import time (see SyncScheduler's @Cron)
+// get the configured value rather than their fallback.
+import './config/load-env';
+
 import { NestFactory } from '@nestjs/core';
 import { ConfigService } from '@nestjs/config';
 import { Logger } from '@nestjs/common';

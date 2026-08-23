@@ -38,7 +38,7 @@ describe('Sync cycle (e2e)', () => {
       req.on('end', () => {
         const method = JSON.parse(req.headers['digi-service'] as string).name;
         // snake_case, as the API doc specifies and ErpClient now sends.
-        const { page_no: pageNo } = JSON.parse(raw).std_data.parameter;
+        const { pageNo } = JSON.parse(raw).std_data.parameter;
 
         // Only page 1 has data; page 2 is empty so queryAll terminates.
         const table: Record<string, Record<string, unknown>[]> = {

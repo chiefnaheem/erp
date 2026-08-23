@@ -16,7 +16,6 @@ const ENDPOINTS: {
 }[] = [
   { label: 'customer', method: ERP_METHOD.CUSTOMER_QUERY, table: 'raw_customer', keyField: 'CUSTOMER_CODE' },
   { label: 'customer_credit', method: ERP_METHOD.CUSTOMER_CREDIT_QUERY, table: 'raw_customer_credit', keyField: 'CUSTOMER_CREDIT_ID' },
-  { label: 'customer_credit_line', method: ERP_METHOD.CUSTOMER_CREDIT_LINE_QUERY, table: 'raw_customer_credit_line', keyField: 'CUSTOMER_CREDIT_LINE_ID' },
   { label: 'sales_order', method: ERP_METHOD.SALES_ORDER_QUERY, table: 'raw_sales_order', keyField: 'SALES_ORDER_DOC_D_ID' },
   { label: 'sales_delivery', method: ERP_METHOD.SALES_DELIVERY_QUERY, table: 'raw_sales_delivery', keyField: 'DOC_NO' },
   { label: 'sales_return', method: ERP_METHOD.SALES_RETURN_QUERY, table: 'raw_sales_return', keyField: 'DOC_NO' },

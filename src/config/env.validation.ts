@@ -54,7 +54,7 @@ export class EnvVars {
   // So the object-level keys below still work for a deployment that only calls
   // .query (which is all the sync does); add the _QUERY / _READ variants only
   // where the ERP actually issued separate keys. Objects: CUSTOMER,
-  // CUSTOMER_CREDIT, CUSTOMER_CREDIT_LINE, SALES_ORDER, SALES_DELIVERY,
+  // CUSTOMER_CREDIT, SALES_ORDER, SALES_DELIVERY,
   // SALES_RETURN, COLLECTION, AR_REFUND, OTHER_RECEIVABLE.
   @IsString()
   @IsOptional()
@@ -79,19 +79,6 @@ export class EnvVars {
   @IsString()
   @IsOptional()
   ERP_API_KEY_CUSTOMER_CREDIT_READ?: string;
-
-  // The 9th documented object (yvijucrm.customer_credit_line.*), newly ingested.
-  @IsString()
-  @IsOptional()
-  ERP_API_KEY_CUSTOMER_CREDIT_LINE?: string;
-
-  @IsString()
-  @IsOptional()
-  ERP_API_KEY_CUSTOMER_CREDIT_LINE_QUERY?: string;
-
-  @IsString()
-  @IsOptional()
-  ERP_API_KEY_CUSTOMER_CREDIT_LINE_READ?: string;
 
   @IsString()
   @IsOptional()
@@ -182,7 +169,7 @@ export class EnvVars {
   @IsOptional()
   // Changed from 'CRM' to 'dcms' in the 2026-07-28 ERP API update (the `acct`
   // value in the digi-host header). Override in .env if the ERP changes it again.
-  ERP_ACCOUNT: string = 'dcms';
+  ERP_ACCOUNT: string = 'CRM';
 
   // The ERP is a Digiwin deployment declaring +8; Viju runs at +1. Unresolved —
   // see CONTRACT.md. Kept configurable so we can correct it without a code change.
@@ -262,10 +249,29 @@ export class EnvVars {
   @Transform(toInt)
   ERP_INGEST_SLOW_MINUTES: number = 60;
 
-  // Verbose request logging: logs every ERP call's method, URL, headers (digi-key
-  // redacted), and full request body. OFF by default — it's heavy (logs on every
-  // page of thousands) and only useful while debugging. Set ERP_VERBOSE=true to
-  // turn it on temporarily.
+  // Pre-flight request logging: before EVERY ERP call, log the service name, the
+  // exact headers (secrets masked) and the exact body, in one fixed layout.
+  // ON by default so the log always shows precisely what was sent — which is what
+  // an ERP-side investigation asks for first.
+  //
+  // ⚠️ It logs once per request, and a full sweep is thousands of requests. Set
+  // ERP_LOG_REQUESTS=false to quiet it once an integration is stable.
+  @IsBoolean()
+  @IsOptional()
+  @Transform(toBool)
+  ERP_LOG_REQUESTS: boolean = true;
+
+  // Print the digi-key IN FULL in the request log instead of masked. For testing
+  // only — it writes a live credential to the log file. OFF by default; the
+  // client warns once per process while it is on.
+  @IsBoolean()
+  @IsOptional()
+  @Transform(toBool)
+  ERP_LOG_KEY_PLAIN: boolean = false;
+
+  // Kept for back-compat: this used to be the only switch for request logging.
+  // ERP_LOG_REQUESTS now covers it and defaults ON, but setting ERP_VERBOSE=true
+  // still forces request logging even if ERP_LOG_REQUESTS is turned off.
   @IsBoolean()
   @IsOptional()
   @Transform(toBool)
@@ -284,6 +290,16 @@ export class EnvVars {
   @IsOptional()
   @Transform(toBool)
   ERP_DEBUG_STARTUP: boolean = false;
+
+  // Watchdog: if the database stays unreachable this many minutes, exit so the
+  // process manager (pm2 / Windows service) restarts the worker with a fresh
+  // client. The in-process retries handle ordinary blips; this is the backstop
+  // for a wedged client that reconnecting cannot fix. 0 disables it.
+  @IsInt()
+  @Min(0)
+  @IsOptional()
+  @Transform(toInt)
+  DB_WATCHDOG_MINUTES: number = 10;
 
   // Master kill switch: when false the app boots and serves /health but runs no
   // sync jobs. Lets us deploy the worker before the ERP is reachable.

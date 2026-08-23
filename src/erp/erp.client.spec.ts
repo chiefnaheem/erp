@@ -132,29 +132,27 @@ describe('ErpClient', () => {
     await client.read(ERP_METHOD.CUSTOMER_READ, [{ CUSTOMER_CODE: 'C1' }]);
     await client.query(ERP_METHOD.SALES_ORDER_QUERY);
     await client.read(ERP_METHOD.SALES_ORDER_READ, [{ DOC_NO: 'NO_1' }]);
-    await client.query(ERP_METHOD.CUSTOMER_CREDIT_LINE_QUERY);
 
     expect(calls[0].headers['digi-key']).toBe('customer-query-key');
     expect(calls[1].headers['digi-key']).toBe('customer-read-key');
     expect(calls[2].headers['digi-key']).toBe('order-object-key');
     expect(calls[3].headers['digi-key']).toBe('order-object-key');
-    expect(calls[4].headers['digi-key']).toBe('fallback-key'); // 9th object, no key set
   });
 
-  // The API doc specifies snake_case parameter names. An earlier version sent
-  // camelCase, which the gateway happened to tolerate — but if it ever stopped,
-  // page_no would be ignored and every sweep would silently return page 1.
-  it('wraps the request in a std_data envelope with snake_case parameters', async () => {
+  // Parameter names are camelCase, exactly as every request sample in api_docs/
+  // shows them. This is also the form the ERP demonstrably accepted in
+  // production (24,145 successful requests in the pre-outage logs).
+  it('wraps the request in a std_data envelope with camelCase parameters', async () => {
     const client = await build();
     await client.query(ERP_METHOD.CUSTOMER_QUERY, { pageNo: 3, pageSize: 50 });
 
     expect(calls[0].body).toEqual({
       std_data: {
         parameter: {
-          page_size: 50,
-          page_no: 3,
-          is_get_schema: false,
-          is_get_count: false,
+          pageSize: 50,
+          pageNo: 3,
+          isGetSchema: false,
+          isGetCount: false,
           conditions: [],
           orders: [],
         },
@@ -228,7 +226,7 @@ describe('ErpClient', () => {
       body: {
         std_data: {
           execution: { code: '0' },
-          parameter: { rows: pages[call.body.std_data.parameter.page_no] ?? [] },
+          parameter: { rows: pages[call.body.std_data.parameter.pageNo] ?? [] },
         },
       },
     });
@@ -251,7 +249,7 @@ describe('ErpClient', () => {
       body: { std_data: { execution: { code: '0' }, parameter: { rows } } },
     });
     respond = (call) => {
-      const page = call.body.std_data.parameter.page_no;
+      const page = call.body.std_data.parameter.pageNo;
       if (page === 1) return good([{ id: 1 }, { id: 2 }]);
       if (page === 2) return { status: 200, body: '<html>gateway error</html>' };
       if (page === 3) return good([{ id: 5 }]); // short → ends
@@ -275,7 +273,7 @@ describe('ErpClient', () => {
       body: {
         std_data: {
           execution: { code: '0' },
-          parameter: { rows: pages[call.body.std_data.parameter.page_no] ?? [] },
+          parameter: { rows: pages[call.body.std_data.parameter.pageNo] ?? [] },
         },
       },
     });
@@ -287,7 +285,7 @@ describe('ErpClient', () => {
     }
 
     expect(seen).toHaveLength(1); // page 2's row
-    expect(calls[0].body.std_data.parameter.page_no).toBe(2); // started at 2, not 1
+    expect(calls[0].body.std_data.parameter.pageNo).toBe(2); // started at 2, not 1
   });
 
   it('stops cleanly when the first page is empty', async () => {
@@ -322,19 +320,70 @@ describe('ErpClient', () => {
     logSpy.mockRestore();
   });
 
-  it('verbose mode logs the request headers + body, with the API key redacted', async () => {
+  it('logs name/headers/body before every request, in the fixed layout', async () => {
     const logSpy = jest.spyOn(Logger.prototype, 'log').mockImplementation(() => undefined);
-    const client = await build({ ERP_VERBOSE: true });
+    const client = await build(); // on by default — no flag needed
     await client.query(ERP_METHOD.CUSTOMER_QUERY, { pageNo: 1 });
 
     const logged = logSpy.mock.calls.map((c) => String(c[0])).join('\n');
-    // The outgoing request is logged: method, headers, and the std_data body.
-    expect(logged).toMatch(/→ yvijucrm\.customer\.query POST/);
-    expect(logged).toMatch(/"digi-service"/);
+    expect(logged).toMatch(/name: yvijucrm\.customer\.query/);
+    expect(logged).toMatch(/headers: \{/);
+    expect(logged).toMatch(/ {2}digi-data-exchange-protocol: 1\.0/);
+    expect(logged).toMatch(/ {2}digi-type: sync/);
+    // The body is logged exactly as sent — snake_case keys, pretty-printed.
+    expect(logged).toMatch(/body: \{/);
     expect(logged).toMatch(/"std_data"/);
-    // The raw API key must NOT appear — only the redacted form.
-    expect(logged).not.toMatch(/test-key/);
-    expect(logged).toMatch(/\*\*\*-key \(len 8\)/);
+    expect(logged).toMatch(/"pageSize": 2/); // the configured ERP_PAGE_SIZE
+    expect(logged).toMatch(/"pageNo": 1/);
+    logSpy.mockRestore();
+  });
+
+  it('masks the digi-key in the request log, never the real value', async () => {
+    const logSpy = jest.spyOn(Logger.prototype, 'log').mockImplementation(() => undefined);
+    const client = await build();
+    await client.query(ERP_METHOD.CUSTOMER_QUERY, { pageNo: 1 });
+
+    const logged = logSpy.mock.calls.map((c) => String(c[0])).join('\n');
+    expect(logged).not.toMatch(/test-key/); // the raw key must NOT appear
+    expect(logged).toMatch(/digi-key: \*\*\*-key \(len 8\)/);
+    logSpy.mockRestore();
+  });
+
+  it('logs the digi-key in full when ERP_LOG_KEY_PLAIN is on', async () => {
+    const logSpy = jest.spyOn(Logger.prototype, 'log').mockImplementation(() => undefined);
+    const warnSpy = jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
+    const client = await build({ ERP_LOG_KEY_PLAIN: true });
+    await client.query(ERP_METHOD.CUSTOMER_QUERY, { pageNo: 1 });
+
+    const logged = logSpy.mock.calls.map((c) => String(c[0])).join('\n');
+    expect(logged).toMatch(/digi-key: test-key/); // the real value, unmasked
+    expect(logged).not.toMatch(/\*\*\*/);
+    // ...and the operator is warned that a credential is being written out.
+    const warned = warnSpy.mock.calls.map((c) => String(c[0])).join('\n');
+    expect(warned).toMatch(/ERP_LOG_KEY_PLAIN=true/);
+    logSpy.mockRestore();
+    warnSpy.mockRestore();
+  });
+
+  it('logs the request for a .read as well, with that method name', async () => {
+    const logSpy = jest.spyOn(Logger.prototype, 'log').mockImplementation(() => undefined);
+    const client = await build();
+    await client.read(ERP_METHOD.CUSTOMER_READ, [{ CUSTOMER_CODE: 'CODE_1' }]);
+
+    const logged = logSpy.mock.calls.map((c) => String(c[0])).join('\n');
+    expect(logged).toMatch(/name: yvijucrm\.customer\.read/);
+    expect(logged).toMatch(/"dataKeys"/);
+    expect(logged).toMatch(/"CUSTOMER_CODE": "CODE_1"/);
+    logSpy.mockRestore();
+  });
+
+  it('ERP_VERBOSE still forces request logging when ERP_LOG_REQUESTS is off', async () => {
+    const logSpy = jest.spyOn(Logger.prototype, 'log').mockImplementation(() => undefined);
+    const client = await build({ ERP_LOG_REQUESTS: false, ERP_VERBOSE: true });
+    await client.query(ERP_METHOD.CUSTOMER_QUERY, { pageNo: 1 });
+
+    const logged = logSpy.mock.calls.map((c) => String(c[0])).join('\n');
+    expect(logged).toMatch(/name: yvijucrm\.customer\.query/);
     logSpy.mockRestore();
   });
 
@@ -351,13 +400,16 @@ describe('ErpClient', () => {
     warnSpy.mockRestore();
   });
 
-  it('does NOT log the request body when verbose is off', async () => {
+  it('logs no request block when ERP_LOG_REQUESTS is explicitly turned off', async () => {
     const logSpy = jest.spyOn(Logger.prototype, 'log').mockImplementation(() => undefined);
-    const client = await build(); // ERP_VERBOSE defaults off
+    const client = await build({ ERP_LOG_REQUESTS: false });
     await client.query(ERP_METHOD.CUSTOMER_QUERY, { pageNo: 1 });
 
     const logged = logSpy.mock.calls.map((c) => String(c[0])).join('\n');
-    expect(logged).not.toMatch(/→ yvijucrm/); // no request-line log
+    expect(logged).not.toMatch(/name: yvijucrm/);
+    expect(logged).not.toMatch(/body: \{/);
+    // The per-page success line is unaffected — it is not request logging.
+    expect(logged).toMatch(/yvijucrm\.customer\.query p1/);
     logSpy.mockRestore();
   });
 
@@ -388,6 +440,6 @@ describe('ErpClient', () => {
     const rows = await client.read(ERP_METHOD.SALES_ORDER_READ, [{ DOC_NO: 'NO_1' }]);
 
     expect(rows).toEqual([{ DOC_NO: 'NO_1' }]);
-    expect(calls[0].body.std_data.parameter.data_keys).toEqual([{ DOC_NO: 'NO_1' }]);
+    expect(calls[0].body.std_data.parameter.dataKeys).toEqual([{ DOC_NO: 'NO_1' }]);
   });
 });

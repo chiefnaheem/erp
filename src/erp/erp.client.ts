@@ -17,6 +17,13 @@ import {
 const MAX_PAGES = 10_000;
 
 /**
+ * Header names whose VALUE must never reach a log, matched case-insensitively
+ * on the name. Deliberately broad: `digi-key` is the only secret we send today,
+ * but anything named like a credential is masked without needing a code change.
+ */
+const SECRET_HEADER = /key|auth|token|secret|password|cookie|credential/i;
+
+/**
  * The ERP issues a DIFFERENT digi-key per METHOD, not per object.
  *
  * The API doc's sample requests show a distinct `digi-key` for every single
@@ -39,7 +46,6 @@ const MAX_PAGES = 10_000;
 const OBJECT_KEY_ALIAS: Record<string, string> = {
   customer: 'CUSTOMER',
   customer_credit: 'CUSTOMER_CREDIT',
-  customer_credit_line: 'CUSTOMER_CREDIT_LINE',
   sales_order_doc: 'SALES_ORDER',
   sales_delivery: 'SALES_DELIVERY',
   sales_return: 'SALES_RETURN',
@@ -51,6 +57,8 @@ const OBJECT_KEY_ALIAS: Record<string, string> = {
 @Injectable()
 export class ErpClient {
   private readonly logger = new Logger(ErpClient.name);
+  /** So the plain-key warning is emitted once, not on every request. */
+  private warnedPlainKey = false;
 
   constructor(
     private readonly http: HttpService,
@@ -68,19 +76,17 @@ export class ErpClient {
     const pageSize =
       options.pageSize ?? this.config.getOrThrow<number>('ERP_PAGE_SIZE');
 
-    // Body keys are snake_case, exactly as the API doc's sample requests specify
-    // (page_size / page_no / is_get_schema / is_get_count). An earlier version
-    // sent camelCase; the gateway happened to accept it, but that was undefined
-    // behaviour — and the failure mode if it ever stopped would be silent
-    // (page_no ignored → every page identical → sweep "succeeds" with page 1).
-    const parameter = await this.post<ErpQueryParameter<TRow>>(method, {
-      page_size: pageSize,
-      page_no: pageNo,
-      is_get_schema: options.isGetSchema ?? false,
-      is_get_count: options.isGetCount ?? false,
-      conditions: options.conditions ?? [],
-      orders: options.orders ?? [],
-    });
+    const parameter = await this.post<ErpQueryParameter<TRow>>(
+      method,
+      this.queryParameter(method, {
+        pageSize,
+        pageNo,
+        isGetSchema: options.isGetSchema ?? false,
+        isGetCount: options.isGetCount ?? false,
+        conditions: options.conditions ?? [],
+        orders: options.orders ?? [],
+      }),
+    );
 
     const rows = parameter.body.rows ?? [];
     const total = this.extractTotal(parameter.body);
@@ -189,7 +195,7 @@ export class ErpClient {
   }
 
   /**
-   * Fetch specific records via a `.read` method's data_keys.
+   * Fetch specific records via a `.read` method's dataKeys.
    *
    * ⚠️ The required key set differs PER OBJECT and is not uniform. Some objects
    * take a single key (sales_order_doc / sales_delivery / sales_return:
@@ -202,9 +208,10 @@ export class ErpClient {
     method: ErpMethod,
     dataKeys: Record<string, string>[],
   ): Promise<TRow[]> {
-    const parameter = await this.post<ErpReadParameter<TRow>>(method, {
-      data_keys: dataKeys,
-    });
+    const parameter = await this.post<ErpReadParameter<TRow>>(
+      method,
+      this.readParameter(method, dataKeys),
+    );
     return parameter.body.result?.success ?? [];
   }
 
@@ -223,12 +230,50 @@ export class ErpClient {
 
   // ─── Internals ───────────────────────────────────────────────────────────
 
+  /**
+   * The `parameter` object for a `.query`, named exactly as the API docs show:
+   * pageSize / pageNo / isGetSchema / isGetCount. This is also the form the ERP
+   * demonstrably accepts — sending snake_case makes the dispatcher report the
+   * service as having no implementation, which is not obviously a body problem.
+   */
+  private queryParameter(
+    method: ErpMethod,
+    values: {
+      pageSize: number;
+      pageNo: number;
+      isGetSchema: boolean;
+      isGetCount: boolean;
+      conditions: unknown[];
+      orders: unknown[];
+    },
+  ): Record<string, unknown> {
+    return {
+      pageSize: values.pageSize,
+      pageNo: values.pageNo,
+      isGetSchema: values.isGetSchema,
+      isGetCount: values.isGetCount,
+      conditions: values.conditions,
+      orders: values.orders,
+    };
+  }
+
+  /**
+   * The `parameter` object for a `.read`. The KEY NAMES INSIDE each entry
+   * (DOC_NO, Owner_Org_*, CUSTOMER_CODE …) are passed through untouched: they are
+   * documented UPPERCASE/mixed-case and must not be normalised.
+   */
+  private readParameter(
+    method: ErpMethod,
+    dataKeys: Record<string, string>[],
+  ): Record<string, unknown> {
+    return { dataKeys };
+  }
+
   private async post<TParam>(
     method: ErpMethod,
     parameter: Record<string, unknown>,
   ): Promise<{ body: TParam; execution: ErpEnvelope<TParam>['std_data']['execution'] }> {
     const response = await this.dispatch(method, parameter);
-    console.log(response);
     const envelope = response.data as ErpEnvelope<TParam>;
 
     if (!envelope?.std_data?.execution) {
@@ -253,23 +298,22 @@ export class ErpClient {
   ): Promise<AxiosResponse> {
     const maxRetries = this.config.getOrThrow<number>('ERP_MAX_RETRIES');
     const url = this.config.getOrThrow<string>('ERP_BASE_URL');
+    const logRequests = this.config.get<boolean>('ERP_LOG_REQUESTS') ?? true;
     const verbose = this.config.get<boolean>('ERP_VERBOSE');
     const logCurl = this.config.get<boolean>('ERP_LOG_CURL');
     const body = { std_data: { parameter } };
-    
+
 
     let lastError: unknown;
 
     for (let attempt = 1; attempt <= maxRetries + 1; attempt++) {
       const headers = this.buildHeaders(method);
 
-      if (verbose) {
-        // digi-key is the API secret — redact it so a verbose log can't leak it.
-        this.logger.log(
-          `→ ${method} POST ${url} (attempt ${attempt})\n` +
-            `  headers: ${JSON.stringify(this.redactHeaders(headers))}\n` +
-            `  body: ${JSON.stringify(body)}`,
-        );
+      // Every outgoing request is logged in one consistent block before it is
+      // sent. ERP_VERBOSE also forces it on, so an existing deployment that set
+      // that flag keeps the behaviour it asked for.
+      if (logRequests || verbose) {
+        this.logRequest(method, headers, body);
       }
 
       // A copy-pasteable curl for reproducing this exact request (real key). Only
@@ -386,7 +430,7 @@ export class ErpClient {
       // These make the ERP gateway respond — it was observed to require a
       // recognised User-Agent and an explicit Accept.
       'accept': '*/*',
-      'host': '192.168.25.241:9900',
+      'host': '192.168.25.241:9990',
      'connection': 'Keep-Alive',
     };
 
@@ -413,15 +457,69 @@ export class ErpClient {
   }
 
   /**
-   * Copy of the headers with the digi-key (the API secret) masked. Verbose
-   * logging must never write the raw key to a log file.
+   * The pre-flight log for a request: the service name being called, the exact
+   * headers, and the exact body — in one fixed layout, identical for every
+   * method, so two requests can be compared line by line (and pasted straight
+   * into a ticket for the ERP team).
+   *
+   * This logs what is ACTUALLY sent, not a reconstruction: `headers` and `body`
+   * are the very objects handed to the HTTP call below, so the body shows the
+   * exact parameter names that go on the wire (pageSize / pageNo / dataKeys, per
+   * api_docs). Secrets are masked on the way out — see redactHeaders.
+   */
+  private logRequest(
+    method: ErpMethod,
+    headers: Record<string, string>,
+    body: unknown,
+  ): void {
+    // ERP_LOG_KEY_PLAIN prints the digi-key in full instead of masked, so a log
+    // can be compared byte-for-byte against the API doc's sample key while
+    // testing. It writes a live credential to disk, so it warns once per process
+    // and is meant to be turned back off afterwards.
+    const plainKey = this.config.get<boolean>('ERP_LOG_KEY_PLAIN') ?? false;
+
+    if (plainKey && !this.warnedPlainKey) {
+      this.warnedPlainKey = true;
+      this.logger.warn(
+        'ERP_LOG_KEY_PLAIN=true — digi-key values are being written to the log ' +
+          'IN FULL. Set it back to false once testing is done, and treat any log ' +
+          'file produced meanwhile as containing a live credential.',
+      );
+    }
+
+    const shown = plainKey ? headers : this.redactHeaders(headers);
+    const headerLines = Object.entries(shown)
+      .map(([name, value]) => `  ${name}: ${value}`)
+      .join(',\n');
+
+    this.logger.log(
+      `\n\nname: ${method}\n\n\n` +
+        `headers: {\n${headerLines}\n}\n\n\n` +
+        `body: ${JSON.stringify(body, null, 2)}\n`,
+    );
+  }
+
+  /**
+   * Copy of the headers with every secret-looking value masked, so no log can
+   * leak a credential. Matching is by header NAME against SECRET_HEADER, which
+   * covers digi-key today and any authorization/token/cookie header that might
+   * be added later — a new secret header is redacted by default rather than
+   * silently printed in full.
+   *
+   * The masked form keeps the last 4 characters and the length, which is enough
+   * to tell two keys apart in a log without revealing either.
    */
   private redactHeaders(headers: Record<string, string>): Record<string, string> {
-    const key = headers['digi-key'];
-    const masked = key
-      ? `***${key.slice(-4)} (len ${key.length})`
-      : String(key);
-    return { ...headers, 'digi-key': masked };
+    const out: Record<string, string> = {};
+    for (const [name, value] of Object.entries(headers)) {
+      out[name] = SECRET_HEADER.test(name) ? this.mask(value) : value;
+    }
+    return out;
+  }
+
+  private mask(value: string): string {
+    if (typeof value !== 'string' || value === '') return String(value);
+    return `***${value.slice(-4)} (len ${value.length})`;
   }
 
   /**

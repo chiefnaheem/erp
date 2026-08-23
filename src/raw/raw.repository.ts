@@ -63,37 +63,16 @@ export class RawRepository {
   }
 
   /**
-   * Retry a DB op when the remote server drops the connection mid-sweep. The
-   * managed Postgres closes connections under sustained load (Prisma P1017 /
-   * P1001 / "Server has closed the connection"); Prisma reconnects on the next
-   * query, so a short backoff-and-retry recovers instead of failing the whole job.
+   * Every DB call in this repository goes through here.
+   *
+   * The managed Postgres drops all connections at once (a restart, a backup, an
+   * admin `pg_terminate_backend`), and previously only 2 of ~18 call sites were
+   * protected — so a single reset failed all eight ingest jobs plus the lock
+   * acquire/release in the same second. PrismaService.withRetry reconnects
+   * before each attempt, which is what actually recovers a dead pool.
    */
   private async withRetry<T>(op: () => Promise<T>, label: string): Promise<T> {
-    const MAX = 4;
-    let lastError: unknown;
-    for (let attempt = 1; attempt <= MAX; attempt++) {
-      try {
-        return await op();
-      } catch (error) {
-        const code = (error as { code?: string })?.code;
-        const message = error instanceof Error ? error.message : String(error);
-        const transient =
-          code === 'P1017' ||
-          code === 'P1001' ||
-          /closed the connection|reach database server|Timed out|Connection reset|ECONNRESET/i.test(
-            message,
-          );
-        if (!transient || attempt === MAX) throw error;
-
-        lastError = error;
-        const backoff = 500 * 2 ** (attempt - 1);
-        this.logger.warn(
-          `${label}: transient DB error (attempt ${attempt}/${MAX}), retrying in ${backoff}ms — ${message.split('\n')[0]}`,
-        );
-        await new Promise((r) => setTimeout(r, backoff));
-      }
-    }
-    throw lastError;
+    return this.prisma.withRetry(op, label);
   }
 
   /** Public accessor for the object's raw table name — used in logging. */
@@ -214,24 +193,33 @@ export class RawRepository {
   // next cycle starts fresh from page 1 (a full re-sweep to catch early-page changes).
 
   async getIngestPage(job: string): Promise<number> {
-    const rows = await this.prisma.$queryRaw<{ cursor_value: string | null }[]>`
-      SELECT cursor_value FROM erp_raw.sync_cursor WHERE job = ${job}
-    `;
+    const rows = await this.withRetry(
+      () => this.prisma.$queryRaw<{ cursor_value: string | null }[]>`
+        SELECT cursor_value FROM erp_raw.sync_cursor WHERE job = ${job}
+      `,
+      `getIngestPage(${job})`,
+    );
     const v = rows[0]?.cursor_value;
     const n = v ? Number(v) : 0;
     return Number.isFinite(n) && n > 0 ? n : 1;
   }
 
   async setIngestPage(job: string, page: number): Promise<void> {
-    await this.prisma.$executeRaw`
-      INSERT INTO erp_raw.sync_cursor (job, cursor_value, updated_at)
-      VALUES (${job}, ${String(page)}, now())
-      ON CONFLICT (job) DO UPDATE SET cursor_value = ${String(page)}, updated_at = now()
-    `;
+    await this.withRetry(
+      () => this.prisma.$executeRaw`
+        INSERT INTO erp_raw.sync_cursor (job, cursor_value, updated_at)
+        VALUES (${job}, ${String(page)}, now())
+        ON CONFLICT (job) DO UPDATE SET cursor_value = ${String(page)}, updated_at = now()
+      `,
+      `setIngestPage(${job})`,
+    );
   }
 
   async clearIngestPage(job: string): Promise<void> {
-    await this.prisma.$executeRaw`DELETE FROM erp_raw.sync_cursor WHERE job = ${job}`;
+    await this.withRetry(
+      () => this.prisma.$executeRaw`DELETE FROM erp_raw.sync_cursor WHERE job = ${job}`,
+      `clearIngestPage(${job})`,
+    );
   }
 
   async pendingProjection(
@@ -240,17 +228,20 @@ export class RawRepository {
     limit: number,
   ): Promise<PendingRecord[]> {
     const t = this.table(objectType);
-    return this.prisma.$queryRawUnsafe<PendingRecord[]>(
-      `
-      SELECT id, erp_key, payload
-      FROM erp_raw.${t}
-      WHERE projected_at IS NULL AND id > $1
-      ORDER BY id ASC
-      LIMIT $2
-      `,
-      afterId,
-      limit,
-    );
+    return this.withRetry(
+    () => this.prisma.$queryRawUnsafe<PendingRecord[]>(
+        `
+        SELECT id, erp_key, payload
+        FROM erp_raw.${t}
+        WHERE projected_at IS NULL AND id > $1
+        ORDER BY id ASC
+        LIMIT $2
+        `,
+        afterId,
+        limit,
+      ),
+    'pendingProjection',
+);
   }
 
   /**
@@ -268,32 +259,38 @@ export class RawRepository {
     limit: number,
   ): Promise<PendingRecord[]> {
     if (objectType === 'SALES_ORDER') {
-      return this.prisma.$queryRawUnsafe<PendingRecord[]>(
+      return this.withRetry(
+    () => this.prisma.$queryRawUnsafe<PendingRecord[]>(
+          `
+          SELECT r.id, r.erp_key, r.payload
+          FROM erp_raw.raw_sales_order r
+          JOIN erp_raw.customer_link cl ON cl.erp_customer_guid = r.payload->>'CUSTOMER_ID'
+          JOIN public."Customer" c ON c."erpId" = cl.erp_customer_code AND c.password IS NOT NULL
+          WHERE r.projected_at IS NULL AND r.id > $1
+          ORDER BY r.id ASC
+          LIMIT $2
+          `,
+          afterId,
+          limit,
+        ),
+    'pendingProjection',
+);
+    }
+    return this.withRetry(
+    () => this.prisma.$queryRawUnsafe<PendingRecord[]>(
         `
         SELECT r.id, r.erp_key, r.payload
-        FROM erp_raw.raw_sales_order r
-        JOIN erp_raw.customer_link cl ON cl.erp_customer_guid = r.payload->>'CUSTOMER_ID'
-        JOIN public."Customer" c ON c."erpId" = cl.erp_customer_code AND c.password IS NOT NULL
+        FROM erp_raw.raw_collection r
+        JOIN public."Customer" c ON c."erpId" = r.payload->>'CUSTOMER_CODE' AND c.password IS NOT NULL
         WHERE r.projected_at IS NULL AND r.id > $1
         ORDER BY r.id ASC
         LIMIT $2
         `,
         afterId,
         limit,
-      );
-    }
-    return this.prisma.$queryRawUnsafe<PendingRecord[]>(
-      `
-      SELECT r.id, r.erp_key, r.payload
-      FROM erp_raw.raw_collection r
-      JOIN public."Customer" c ON c."erpId" = r.payload->>'CUSTOMER_CODE' AND c.password IS NOT NULL
-      WHERE r.projected_at IS NULL AND r.id > $1
-      ORDER BY r.id ASC
-      LIMIT $2
-      `,
-      afterId,
-      limit,
-    );
+      ),
+    'pendingProjection',
+);
   }
 
   /**
@@ -331,41 +328,44 @@ export class RawRepository {
       .map((k) => `WHEN ${esc(k)} THEN ${esc(statusMap[k])}`)
       .join(' ');
 
-    const rows = await this.prisma.$queryRawUnsafe<{ n: number }[]>(`
-      WITH proj AS (
-        UPDATE erp_raw.raw_sales_order r
-        SET projected_at = now(), project_error = NULL
-        FROM erp_raw.customer_link cl, public."Customer" c
-        WHERE cl.erp_customer_guid = r.payload->>'CUSTOMER_ID'
-          AND c."erpId" = cl.erp_customer_code AND c.password IS NOT NULL
-          AND r.projected_at IS NULL
-          AND r.payload->>'ApproveStatus' IN (${inList})
-          AND NULLIF(r.payload->>'ORDER_DATE','') IS NOT NULL
-          AND NULLIF(r.payload->>'DOC_NO','') IS NOT NULL
-        RETURNING r.id, r.payload, c.id AS customer_id
-      ), hdr AS (
-        SELECT DISTINCT ON (payload->>'DOC_NO') id, payload, customer_id
-        FROM proj
-        ORDER BY payload->>'DOC_NO', id
-      ), ins AS (
-        INSERT INTO public."Purchase"
-          (id,"erpId","customerId","orderDate","totalItems","totalValue",status,"createdAt","updatedAt")
-        SELECT gen_random_uuid(), payload->>'DOC_NO', customer_id,
-          (payload->>'ORDER_DATE')::timestamp,
-          CASE WHEN payload->>'QTY_TOTAL' ~ '^[0-9.]+$' THEN (payload->>'QTY_TOTAL')::numeric::int ELSE 0 END,
-          COALESCE(NULLIF(payload->>'AMT_UNINCLUDE_TAX_OC','')::numeric,0)
-            + COALESCE(NULLIF(payload->>'TAX_OC','')::numeric,0),
-          (CASE payload->>'ApproveStatus' ${caseSql} END)::"OrderStatus",
-          now(), now()
-        FROM hdr
-        ON CONFLICT ("erpId") DO UPDATE SET
-          status = EXCLUDED.status, "orderDate" = EXCLUDED."orderDate",
-          "totalItems" = EXCLUDED."totalItems", "totalValue" = EXCLUDED."totalValue",
-          "updatedAt" = now()
-        RETURNING 1
-      )
-      SELECT count(*)::int AS n FROM ins
-    `);
+    const rows = await this.withRetry(
+    () => this.prisma.$queryRawUnsafe<{ n: number }[]>(`
+        WITH proj AS (
+          UPDATE erp_raw.raw_sales_order r
+          SET projected_at = now(), project_error = NULL
+          FROM erp_raw.customer_link cl, public."Customer" c
+          WHERE cl.erp_customer_guid = r.payload->>'CUSTOMER_ID'
+            AND c."erpId" = cl.erp_customer_code AND c.password IS NOT NULL
+            AND r.projected_at IS NULL
+            AND r.payload->>'ApproveStatus' IN (${inList})
+            AND NULLIF(r.payload->>'ORDER_DATE','') IS NOT NULL
+            AND NULLIF(r.payload->>'DOC_NO','') IS NOT NULL
+          RETURNING r.id, r.payload, c.id AS customer_id
+        ), hdr AS (
+          SELECT DISTINCT ON (payload->>'DOC_NO') id, payload, customer_id
+          FROM proj
+          ORDER BY payload->>'DOC_NO', id
+        ), ins AS (
+          INSERT INTO public."Purchase"
+            (id,"erpId","customerId","orderDate","totalItems","totalValue",status,"createdAt","updatedAt")
+          SELECT gen_random_uuid(), payload->>'DOC_NO', customer_id,
+            (payload->>'ORDER_DATE')::timestamp,
+            CASE WHEN payload->>'QTY_TOTAL' ~ '^[0-9.]+$' THEN (payload->>'QTY_TOTAL')::numeric::int ELSE 0 END,
+            COALESCE(NULLIF(payload->>'AMT_UNINCLUDE_TAX_OC','')::numeric,0)
+              + COALESCE(NULLIF(payload->>'TAX_OC','')::numeric,0),
+            (CASE payload->>'ApproveStatus' ${caseSql} END)::"OrderStatus",
+            now(), now()
+          FROM hdr
+          ON CONFLICT ("erpId") DO UPDATE SET
+            status = EXCLUDED.status, "orderDate" = EXCLUDED."orderDate",
+            "totalItems" = EXCLUDED."totalItems", "totalValue" = EXCLUDED."totalValue",
+            "updatedAt" = now()
+          RETURNING 1
+        )
+        SELECT count(*)::int AS n FROM ins
+      `),
+    'bulkProject',
+);
     return { projected: Number(rows[0]?.n ?? 0) };
   }
 
@@ -375,28 +375,31 @@ export class RawRepository {
    * left untouched on conflict (so any value set elsewhere is preserved).
    */
   async bulkProjectPayments(): Promise<{ projected: number }> {
-    const rows = await this.prisma.$queryRawUnsafe<{ n: number }[]>(`
-      WITH proj AS (
-        UPDATE erp_raw.raw_collection r
-        SET projected_at = now(), project_error = NULL
-        FROM public."Customer" c
-        WHERE c."erpId" = r.payload->>'CUSTOMER_CODE' AND c.password IS NOT NULL
-          AND r.projected_at IS NULL
-          AND NULLIF(r.payload->>'DOC_DATE','') IS NOT NULL
-        RETURNING r.erp_key, r.payload, c.id AS customer_id
-      ), ins AS (
-        INSERT INTO public."Payment"
-          (id,"erpId","customerId",date,amount,reference,"runningBalance","createdAt")
-        SELECT gen_random_uuid(), erp_key, customer_id,
-          (payload->>'DOC_DATE')::timestamp,
-          COALESCE(NULLIF(payload->>'COLLECTION_AMT_TC','')::numeric,0), erp_key, 0, now()
-        FROM proj
-        ON CONFLICT ("erpId") DO UPDATE SET
-          amount = EXCLUDED.amount, date = EXCLUDED.date
-        RETURNING 1
-      )
-      SELECT count(*)::int AS n FROM ins
-    `);
+    const rows = await this.withRetry(
+    () => this.prisma.$queryRawUnsafe<{ n: number }[]>(`
+        WITH proj AS (
+          UPDATE erp_raw.raw_collection r
+          SET projected_at = now(), project_error = NULL
+          FROM public."Customer" c
+          WHERE c."erpId" = r.payload->>'CUSTOMER_CODE' AND c.password IS NOT NULL
+            AND r.projected_at IS NULL
+            AND NULLIF(r.payload->>'DOC_DATE','') IS NOT NULL
+          RETURNING r.erp_key, r.payload, c.id AS customer_id
+        ), ins AS (
+          INSERT INTO public."Payment"
+            (id,"erpId","customerId",date,amount,reference,"runningBalance","createdAt")
+          SELECT gen_random_uuid(), erp_key, customer_id,
+            (payload->>'DOC_DATE')::timestamp,
+            COALESCE(NULLIF(payload->>'COLLECTION_AMT_TC','')::numeric,0), erp_key, 0, now()
+          FROM proj
+          ON CONFLICT ("erpId") DO UPDATE SET
+            amount = EXCLUDED.amount, date = EXCLUDED.date
+          RETURNING 1
+        )
+        SELECT count(*)::int AS n FROM ins
+      `),
+    'bulkProject',
+);
     return { projected: Number(rows[0]?.n ?? 0) };
   }
 
@@ -408,20 +411,23 @@ export class RawRepository {
    * are app-owned and never touched. The IS DISTINCT FROM guard skips no-op writes.
    */
   async bulkRefreshCustomers(): Promise<{ updated: number }> {
-    const rows = await this.prisma.$queryRawUnsafe<{ n: number }[]>(`
-      WITH upd AS (
-        UPDATE public."Customer" c
-        SET name = COALESCE(NULLIF(rc.payload->>'CUSTOMER_FULL_NAME',''),
-                            NULLIF(rc.payload->>'CUSTOMER_NAME',''), c.name),
-            "updatedAt" = now()
-        FROM erp_raw.raw_customer rc
-        WHERE rc.erp_key = c."erpId" AND c."erpId" IS NOT NULL
-          AND c.name IS DISTINCT FROM COALESCE(NULLIF(rc.payload->>'CUSTOMER_FULL_NAME',''),
-                                               NULLIF(rc.payload->>'CUSTOMER_NAME',''), c.name)
-        RETURNING 1
-      )
-      SELECT count(*)::int AS n FROM upd
-    `);
+    const rows = await this.withRetry(
+    () => this.prisma.$queryRawUnsafe<{ n: number }[]>(`
+        WITH upd AS (
+          UPDATE public."Customer" c
+          SET name = COALESCE(NULLIF(rc.payload->>'CUSTOMER_FULL_NAME',''),
+                              NULLIF(rc.payload->>'CUSTOMER_NAME',''), c.name),
+              "updatedAt" = now()
+          FROM erp_raw.raw_customer rc
+          WHERE rc.erp_key = c."erpId" AND c."erpId" IS NOT NULL
+            AND c.name IS DISTINCT FROM COALESCE(NULLIF(rc.payload->>'CUSTOMER_FULL_NAME',''),
+                                                 NULLIF(rc.payload->>'CUSTOMER_NAME',''), c.name)
+          RETURNING 1
+        )
+        SELECT count(*)::int AS n FROM upd
+      `),
+    'bulkProject',
+);
     return { updated: Number(rows[0]?.n ?? 0) };
   }
 
@@ -430,9 +436,13 @@ export class RawRepository {
     const t = this.table(objectType);
     // ids come from our own pendingProjection rows (BigInt), so joining them is
     // numeric-only and injection-safe.
-    await this.prisma.$executeRawUnsafe(
-      `UPDATE erp_raw.${t} SET projected_at = now(), project_error = NULL
-       WHERE id IN (${ids.map((id) => id.toString()).join(',')})`,
+    await this.withRetry(
+      () =>
+        this.prisma.$executeRawUnsafe(
+          `UPDATE erp_raw.${t} SET projected_at = now(), project_error = NULL
+           WHERE id IN (${ids.map((id) => id.toString()).join(',')})`,
+        ),
+      `markProjected(${t})`,
     );
   }
 
@@ -446,9 +456,13 @@ export class RawRepository {
     error: string,
   ): Promise<void> {
     const t = this.table(objectType);
-    await this.prisma.$executeRawUnsafe(
-      `UPDATE erp_raw.${t} SET project_error = $1 WHERE id = ${id.toString()}`,
-      error,
+    await this.withRetry(
+      () =>
+        this.prisma.$executeRawUnsafe(
+          `UPDATE erp_raw.${t} SET project_error = $1 WHERE id = ${id.toString()}`,
+          error,
+        ),
+      `markProjectFailed(${t})`,
     );
   }
 
@@ -500,20 +514,26 @@ export class RawRepository {
 
   /** CUSTOMER_ID (Guid) → CUSTOMER_CODE, or null if we've never seen the Guid. */
   async resolveCustomerCode(guid: string): Promise<string | null> {
-    const rows = await this.prisma.$queryRaw<{ erp_customer_code: string }[]>`
-      SELECT erp_customer_code FROM erp_raw.customer_link
-      WHERE erp_customer_guid = ${guid}
-    `;
+    const rows = await this.withRetry(
+      () => this.prisma.$queryRaw<{ erp_customer_code: string }[]>`
+        SELECT erp_customer_code FROM erp_raw.customer_link
+        WHERE erp_customer_guid = ${guid}
+      `,
+      'resolveCustomerCode',
+    );
     return rows[0]?.erp_customer_code ?? null;
   }
 
   // ─── Sync run bookkeeping ────────────────────────────────────────────────
 
   async startRun(job: string): Promise<bigint> {
-    const rows = await this.prisma.$queryRaw<{ id: bigint }[]>`
-      INSERT INTO erp_raw.sync_run (job, status) VALUES (${job}, 'RUNNING')
-      RETURNING id
-    `;
+    const rows = await this.withRetry(
+      () => this.prisma.$queryRaw<{ id: bigint }[]>`
+        INSERT INTO erp_raw.sync_run (job, status) VALUES (${job}, 'RUNNING')
+        RETURNING id
+      `,
+      `startRun(${job})`,
+    );
     return rows[0].id;
   }
 
@@ -528,17 +548,20 @@ export class RawRepository {
       error?: string;
     },
   ): Promise<void> {
-    await this.prisma.$executeRaw`
-      UPDATE erp_raw.sync_run SET
-        status         = ${stats.status},
-        finished_at    = now(),
-        rows_fetched   = ${stats.fetched ?? 0},
-        rows_changed   = ${stats.changed ?? 0},
-        rows_projected = ${stats.projected ?? 0},
-        rows_skipped   = ${stats.skipped ?? 0},
-        error          = ${stats.error ?? null}
-      WHERE id = ${id}
-    `;
+    await this.withRetry(
+      () => this.prisma.$executeRaw`
+        UPDATE erp_raw.sync_run SET
+          status         = ${stats.status},
+          finished_at    = now(),
+          rows_fetched   = ${stats.fetched ?? 0},
+          rows_changed   = ${stats.changed ?? 0},
+          rows_projected = ${stats.projected ?? 0},
+          rows_skipped   = ${stats.skipped ?? 0},
+          error          = ${stats.error ?? null}
+        WHERE id = ${id}
+      `,
+      'finishRun',
+    );
   }
 }
 

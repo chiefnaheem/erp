@@ -25,12 +25,32 @@ function withTimeouts(url: string): string {
   }
 }
 
+/**
+ * The useful part of a Prisma error, for a one-line log.
+ *
+ * Prisma prefixes every message with "Invalid `prisma.$queryRaw()` invocation:",
+ * so the FIRST line says nothing — the cause is on the last line ("Server has
+ * closed the connection.", "Raw query failed. Code: `57P01` …").
+ */
+function errorDetail(error: unknown): string {
+  const meta = (error as { meta?: { code?: string; message?: string } })?.meta;
+  if (meta?.code) return `${meta.code} ${meta.message ?? ''}`.trim();
+
+  const text = error instanceof Error ? error.message : String(error);
+  const lines = text.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+  return lines[lines.length - 1] ?? text;
+}
+
 @Injectable()
 export class PrismaService
   extends PrismaClient
   implements OnModuleInit, OnModuleDestroy
 {
   private readonly logger = new Logger(PrismaService.name);
+  /** False after any connection-class failure; the next call re-dials. */
+  private connected = false;
+  private lastOkAt: number | null = null;
+  private lastError: string | null = null;
 
   constructor() {
     super({
@@ -48,6 +68,8 @@ export class PrismaService
     for (let attempt = 1; attempt <= MAX; attempt++) {
       try {
         await this.$connect();
+        this.connected = true;
+        this.lastOkAt = Date.now();
         if (attempt > 1) this.logger.log(`database connected on attempt ${attempt}`);
         return;
       } catch (error) {
@@ -65,6 +87,143 @@ export class PrismaService
         await new Promise((r) => setTimeout(r, backoff));
       }
     }
+  }
+
+  /**
+   * Postgres SQLSTATEs that mean "this connection is gone / the server is busy
+   * or restarting", not "your query is wrong". Prisma surfaces these inside a
+   * P2010 raw-query error, with the real code in `meta.code` — which is why
+   * matching only on the Prisma code missed them entirely and turned a routine
+   * connection reset into eight failed jobs.
+   *
+   *   57P01 admin shutdown        — "terminating connection due to administrator command"
+   *   57P02 crash shutdown        57P03 cannot connect now (server starting up)
+   *   08xxx connection exceptions 53300 too many connections
+   */
+  private static readonly TRANSIENT_SQLSTATE = new Set([
+    '57P01', '57P02', '57P03', '08000', '08003', '08006', '08001', '08004', '53300',
+  ]);
+
+  /** Prisma-level codes for an unreachable/closed connection or an exhausted pool. */
+  private static readonly TRANSIENT_PRISMA = new Set([
+    'P1001', 'P1002', 'P1008', 'P1017', 'P2024',
+  ]);
+
+  /** True when a failure is worth retrying on a fresh connection. */
+  isTransient(error: unknown): boolean {
+    const e = error as { code?: string; meta?: { code?: string; message?: string } };
+    if (e?.code && PrismaService.TRANSIENT_PRISMA.has(e.code)) return true;
+    if (e?.meta?.code && PrismaService.TRANSIENT_SQLSTATE.has(e.meta.code)) return true;
+
+    const message = error instanceof Error ? error.message : String(error);
+    // "Engine is not yet connected" is what a client left disconnected by a
+    // failed reconnect reports forever. Treating it as transient is what lets
+    // the app dig itself out instead of needing a manual restart.
+    return /closed the connection|terminating connection|server is shutting down|system is shutting down|reach database server|Timed out fetching|Connection reset|ECONNRESET|EPIPE|connection is closed|Engine is not yet connected|Response from the Engine was empty/i.test(
+      message,
+    );
+  }
+
+  /**
+   * Run a DB operation, retrying on a dropped connection with a FRESH pool.
+   *
+   * The reconnect is the part that matters. When the server terminates its
+   * backends every pooled connection is dead at once, so an immediate retry just
+   * draws another corpse from the pool and fails with "Server has closed the
+   * connection". Disconnecting first forces Prisma to dial again.
+   *
+   * The backoff also has to outlast a real restart: the old 500ms/1s/2s ladder
+   * gave up 3.5s in, while the database was still coming back. This one spans
+   * ~60s, which covers the resets seen in production.
+   */
+  /**
+   * Run a DB operation, reconnecting and retrying when the connection drops.
+   *
+   * ⚠️ The ordering here is the whole point. An earlier version disconnected and
+   * reconnected inside a `try {} catch {}` that swallowed the connect failure —
+   * so when the database was still down, the client was left DISCONNECTED, and
+   * every later query failed instantly with "Engine is not yet connected". That
+   * state was permanent: the app stayed up, doing nothing, until restarted by
+   * hand. Now the connect happens at the TOP of each attempt, so any later call
+   * re-establishes the pool on its own however long the outage lasted.
+   */
+  async withRetry<T>(op: () => Promise<T>, label: string): Promise<T> {
+    const MAX = 6;
+
+    for (let attempt = 1; attempt <= MAX; attempt++) {
+      try {
+        // If a previous failure left us disconnected, dial again before working.
+        if (!this.connected) {
+          await this.reconnect();
+          this.connected = true;
+          this.logger.log(`${label}: database connection re-established`);
+        }
+
+        const result = await op();
+        this.connected = true;
+        this.lastOkAt = Date.now();
+        return result;
+      } catch (error) {
+        const message = errorDetail(error);
+
+        if (!this.isTransient(error)) throw error;
+
+        // Any connection-class failure invalidates the pool. Marking it here is
+        // what makes the NEXT attempt (and every future call) reconnect.
+        this.connected = false;
+        this.lastError = message;
+
+        if (attempt === MAX) {
+          this.logger.error(
+            `${label}: giving up after ${MAX} attempts — ${message}. ` +
+              `The next call will try to reconnect.`,
+          );
+          throw error;
+        }
+
+        const backoff = Math.min(1000 * 2 ** (attempt - 1), 20_000);
+        this.logger.warn(
+          `${label}: database connection lost (attempt ${attempt}/${MAX}), ` +
+            `retrying in ${backoff}ms — ${message}`,
+        );
+        await new Promise((r) => setTimeout(r, backoff));
+      }
+    }
+
+    // Unreachable: the loop either returns or throws.
+    throw new Error(`${label}: exhausted DB retries`);
+  }
+
+  /** Drop the (possibly dead) pool and dial again. Throws if still unreachable. */
+  private async reconnect(): Promise<void> {
+    try {
+      await this.$disconnect();
+    } catch {
+      // Already down — nothing to drop.
+    }
+    await this.$connect();
+  }
+
+  /**
+   * Liveness for the watchdog and /health: a cheap round-trip that also repairs
+   * the connection as a side effect, since it goes through withRetry.
+   */
+  async ping(): Promise<boolean> {
+    try {
+      await this.withRetry(() => this.$queryRaw`SELECT 1`, 'ping');
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /** ms since the last successful DB call, or null if there has never been one. */
+  msSinceLastOk(): number | null {
+    return this.lastOkAt === null ? null : Date.now() - this.lastOkAt;
+  }
+
+  lastFailure(): string | null {
+    return this.lastError;
   }
 
   async onModuleDestroy() {

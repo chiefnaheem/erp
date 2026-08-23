@@ -31,6 +31,12 @@ const DOCUMENTED: Record<string, string[]> = {
     'GENERAL_CURRENCY_ID',
     'Owner_Dept',
     'Owner_Emp',
+    // Documented since the 2026-07-28 update — without these listed here the
+    // probe reports them as undocumented discoveries every run.
+    'PhoneNumber',
+    'Region',
+    'BP_CLUSTER_CODE',
+    'BP_CLUSTER_NAME',
   ],
 };
 
@@ -67,7 +73,7 @@ async function readWithKeys(
       `  ${method}: no value for required key(s) ${missing.join(', ')} — sending '' for them`,
     );
   }
-  const raw = await erp.raw(method, { data_keys: [keys] });
+  const raw = await erp.raw(method, { dataKeys: [keys] });
   return { raw, keysSent: keys, missingKeys: missing };
 }
 
@@ -211,7 +217,10 @@ async function main() {
       docNoUsed: docNo,
       queryKeys,
       approveStatusSample: row.ApproveStatus,
-      piecesSample: row.PIECES,
+      // PIECES is documented on SALES_DELIVERY / SALES_RETURN, not on the order —
+      // the order's own quantity fields are QTY_TOTAL (header) and BUSINESS_QTY
+      // (per line), so sample those instead.
+      qtySamples: { QTY_TOTAL: row.QTY_TOTAL, BUSINESS_QTY: row.BUSINESS_QTY },
       dateSamples: { DOC_DATE: row.DOC_DATE, ORDER_DATE: row.ORDER_DATE },
       lineLikeKeysInReadResponse: lineLikeKeysInRead,
       VERDICT_lineItems: lineLikeKeysInRead.length
@@ -255,10 +264,10 @@ async function main() {
   // ── Q6/Q7: pagination count + incremental filtering ─────────────────────
   await check('6. is_get_count — does it return a total, and under what key?', async () => {
     const raw = await erp.raw(ERP_METHOD.CUSTOMER_QUERY, {
-      page_size: 1,
-      page_no: 1,
-      is_get_count: true,
-      is_get_schema: false,
+      pageSize: 1,
+      pageNo: 1,
+      isGetCount: true,
+      isGetSchema: false,
       conditions: [],
       orders: [],
     });
@@ -284,10 +293,10 @@ async function main() {
     for (const shape of shapes) {
       try {
         const raw = await erp.raw(ERP_METHOD.CUSTOMER_QUERY, {
-          page_size: 1,
-          page_no: 1,
-          is_get_count: false,
-          is_get_schema: false,
+          pageSize: 1,
+          pageNo: 1,
+          isGetCount: false,
+          isGetSchema: false,
           conditions: shape.value,
           orders: [],
         });
@@ -332,14 +341,17 @@ async function main() {
     );
     return {
       rowsReturned: page.rows.length,
+      // CUSTOMER_CREDIT identifies the customer by CODE (unlike CUSTOMER_CREDIT_LINE,
+      // which uses the CUSTOMER_ID Guid), and has no modified-date field at all —
+      // sampling CUSTOMER_ID / LastModifiedDate here only ever printed undefined.
       rowsPerCustomer: page.rows.map((r) => ({
-        CUSTOMER_ID: r.CUSTOMER_ID,
+        CUSTOMER_CODE: r.CUSTOMER_CODE,
+        COMPANY_CODE: r.COMPANY_CODE,
         CREDIT_AMT: r.CREDIT_AMT,
         CREDIT_PAY: r.CREDIT_PAY,
         CURRENCY_ID: r.CURRENCY_ID,
-        LastModifiedDate: r.LastModifiedDate,
       })),
-      note: 'multiple rows for one CUSTOMER_ID means we must decide which wins',
+      note: 'multiple rows for one CUSTOMER_CODE means we must decide which wins',
     };
   });
 

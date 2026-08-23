@@ -23,8 +23,6 @@ export const ERP_METHOD = {
   AR_REFUND_READ: 'yvijucrm.ar_refund_doc.read',
   OTHER_RECEIVABLE_QUERY: 'yvijucrm.other_receivable_doc.query',
   OTHER_RECEIVABLE_READ: 'yvijucrm.other_receivable_doc.read',
-  CUSTOMER_CREDIT_LINE_QUERY: 'yvijucrm.customer_credit_line.query',
-  CUSTOMER_CREDIT_LINE_READ: 'yvijucrm.customer_credit_line.read',
 } as const;
 
 export type ErpMethod = (typeof ERP_METHOD)[keyof typeof ERP_METHOD];
@@ -39,11 +37,10 @@ export const ERP_QUERY_METHODS: ErpMethod[] = [
   ERP_METHOD.AR_REFUND_QUERY,
   ERP_METHOD.OTHER_RECEIVABLE_QUERY,
   ERP_METHOD.CUSTOMER_QUERY,
-  ERP_METHOD.CUSTOMER_CREDIT_LINE_QUERY,
 ];
 
 /**
- * The `data_keys` fields each `.read` method REQUIRES, per the API doc's "输入字段"
+ * The `dataKeys` fields each `.read` method REQUIRES, per the API doc's "输入字段"
  * (input fields) table. These are NOT uniform: a sales order is keyed on DOC_NO
  * alone, but a collection additionally needs all six organisation codes, and
  * customer_credit needs eight fields including the credit area.
@@ -73,16 +70,10 @@ export const READ_KEY_FIELDS: Record<string, readonly string[]> = {
     'CREDIT_AREA_ID_CREDIT_AREA_CODE',
     'CUSTOMER_ID_CUSTOMER_CODE',
   ],
-  [ERP_METHOD.CUSTOMER_CREDIT_LINE_READ]: [
-    'CUSTOMER_ID_CUSTOMER_CODE',
-    'COMPANY_ID_COMPANY_CODE',
-    'CURRENCY_ID_CURRENCY_CODE',
-    'CREDIT_MODE',
-  ],
 };
 
 /**
- * Build a complete `data_keys` entry for a `.read`, reporting which documented
+ * Build a complete `dataKeys` entry for a `.read`, reporting which documented
  * fields are missing rather than letting the ERP reject the call opaquely.
  *
  * Values not supplied are emitted as '' — the doc's own sample for
@@ -174,6 +165,16 @@ export interface ErpCustomerRow {
   GENERAL_CURRENCY_ID?: string;
   Owner_Dept?: string;
   Owner_Emp?: string;
+  /**
+   * PhoneNumber and Region are what unblocked customer creation — the customer
+   * object carries both directly (api_docs/customer.query.md), so the sync no
+   * longer depends on ERP_CUSTOMER_PHONE_FIELD / ERP_CUSTOMER_REGION_FIELD being
+   * pointed at some other field. Those env vars remain as overrides only.
+   */
+  PhoneNumber?: string; // → Customer.phone (the login identifier)
+  Region?: string; // → Customer.region, via the region map
+  BP_CLUSTER_CODE?: string; // trading-partner group
+  BP_CLUSTER_NAME?: string;
   [key: string]: unknown;
 }
 
@@ -192,32 +193,38 @@ export interface ErpSalesOrderRow {
   SALES_ORDER_DOC_D_ID?: string;
   SequenceNumber?: number;
   DOC_NO: string; // → our Purchase.erpId (repeats across a multi-line order)
+  DOC_ID?: string;
+  DOC_Sequence?: string | number;
   DOC_DATE?: string;
   ORDER_DATE?: string;
+  ROid?: string;
   CUSTOMER_ID?: string; // Guid, NOT the CUSTOMER_CODE — see CONTRACT.md
   ApproveStatus?: string; // values undocumented
+  CLOSE?: string;
   AMT_UNINCLUDE_TAX_OC?: string | number;
   TAX_OC?: string | number;
   QTY_TOTAL?: string | number; // header total (2026-07-28 update)
-  PIECES?: number; // cartons or line count? undocumented
   // ── Detail-line fields ────────────────────────────────────────────────────
+  ITEM_TYPE?: string;
   ITEM_ID?: string;
   ITEM_DESCRIPTION?: string;
   ITEM_SPECIFICATION?: string;
   BUSINESS_QTY?: string | number;
   BUSINESS_UNIT_ID?: string;
   DELIVERED_BUSINESS_QTY?: string | number;
+  DISTRIBUTED_BUS_QTY?: string | number;
   [key: string]: unknown;
 }
 
 /**
- * CUSTOMER_CREDIT_LINE — the 9th documented object, per customer/company/currency.
+ * CUSTOMER_CREDIT_LINE — NO LONGER CALLED.
  *
- * Carries AR_AMT (应收账款金额, accounts-receivable amount), which is a more
- * direct source for a customer's outstanding balance than CUSTOMER_CREDIT's
- * CREDIT_PAY ("used credit") that we settled for. Ingested so the two can be
- * compared on real data.
- */
+ * yvijucrm.customer_credit_line.query/.read were removed from the sync: the only
+ * digi-key we ever had for them belonged to a different ERP account, so the
+ * gateway rejected every call. The type is kept because erp_raw.raw_customer_credit_line
+ * still holds rows ingested before the object was dropped; nothing writes to it now.
+ * To bring it back, re-add the methods to ERP_METHOD and a CRM-account key to .env.
+ */
 export interface ErpCustomerCreditLineRow {
   CUSTOMER_CREDIT_LINE_ID: string;
   COMPANY_ID?: string;
@@ -226,43 +233,80 @@ export interface ErpCustomerCreditLineRow {
   CURRENCY_ID?: string;
   AR_AMT?: string | number; // accounts receivable
   ADV_AMT?: string | number; // advance receipts
+  ADV_TAX?: string | number; // tax on advance receipts
   BD_AMT?: string | number; // bad debt
   BR_AMT?: string | number; // notes receivable
+  CO_AMT?: string | number; // contracted but not yet ordered
   SO_AMT?: string | number; // undelivered order value
   SD_AMT?: string | number; // unsettled delivery value
   SR_AMT?: string | number; // unsettled return value
+  SO_PRESETTLEMENT_ARRIVE?: string | number;
   [key: string]: unknown;
 }
 
+/**
+ * A collection (receipt) document — our Payment source.
+ *
+ * The customer link is CUSTOMER_CODE, a code and NOT a Guid, so payments join
+ * straight onto Customer.erpId with no customer_link lookup (unlike sales
+ * orders, which carry a CUSTOMER_ID Guid). There is no COLLECTION_DOC_ID in the
+ * documented field list — DOC_ID is the document TYPE, not the row's identity —
+ * which is why the raw store keys these rows on DOC_NO.
+ */
 export interface ErpCollectionRow {
-  COLLECTION_DOC_ID: string;
-  DOC_NO: string; // → our Payment.erpId
+  DOC_NO: string; // → our Payment.erpId, and the raw key
+  DOC_ID?: string; // document type (Guid), not a row identifier
   DOC_DATE?: string;
-  COLLECTION_AMT_TC?: string | number;
-  COLLECTION_AMT_FC?: string | number;
-  SETTLEMENT_OBJECT_TYPE?: number;
-  // NOTE: no CUSTOMER_ID is documented on this object. That is the blocker.
+  BOOKKEEPING_DATE?: string;
+  ApproveStatus?: string;
+  COMPANY_NAME?: string;
+  CUSTOMER_CODE?: string; // → Customer.erpId
+  CUSTOMER_NAME?: string;
+  CURRENCY_ID?: string;
+  EXCHANGE_RATE?: string | number;
+  COLLECTION_AMT_TC?: string | number; // received, original currency
+  COLLECTION_AMT_FC?: string | number; // received, base currency
+  CASH_DISCOUNT_AMT_TC?: string | number;
+  CASH_DISCOUNT_AMT_FC?: string | number;
+  REMARK?: string;
   [key: string]: unknown;
 }
 
 export interface ErpSalesDeliveryRow {
   SALES_DELIVERY_ID: string;
-  DOC_NO: string;
+  DOC_NO: string; // the raw key for this object
   DOC_DATE?: string;
   TRANSACTION_DATE?: string;
-  CUSTOMER_ID?: string;
+  CATEGORY?: string;
+  CUSTOMER_ID?: string; // Guid — resolve via customer_link
   ISSUED_STATUS?: string;
   DESTINATION?: string;
+  TELEPHONE?: string; // per-shipment contact number, NOT the customer master
+  AMOUNT_UNINCLUDE_TAX_OC?: string | number;
   PIECES?: number; // likely the true source of "loaded cartons"
   [key: string]: unknown;
 }
 
+/**
+ * ⚠️ The two credit objects identify the customer DIFFERENTLY, which decides how
+ * each one joins: CUSTOMER_CREDIT carries CUSTOMER_CODE (a code, joins straight
+ * onto Customer.erpId), while CUSTOMER_CREDIT_LINE carries CUSTOMER_ID (a Guid,
+ * needs the customer_link bridge). Whichever we settle on as the balance source,
+ * the join is not interchangeable between them.
+ */
 export interface ErpCustomerCreditRow {
   CUSTOMER_CREDIT_ID: string;
-  CUSTOMER_ID?: string;
+  CUSTOMER_CODE?: string; // → Customer.erpId (a code, not a Guid)
+  CUSTOMER_NAME?: string;
+  COMPANY_CODE?: string;
+  COMPANY_NAME?: string;
+  ApproveStatus?: string;
   CREDIT_AMT?: string | number; // credit limit
   CREDIT_PAY?: string | number; // used credit → candidate for outstandingBalance
+  OVERFLOW_AMT?: string | number;
+  ALARM_LINE?: string | number;
   CURRENCY_ID?: string;
-  LastModifiedDate?: string;
+  EFFECTIVE_DATE?: string;
+  INEFFECTIVE_DATE?: string;
   [key: string]: unknown;
 }

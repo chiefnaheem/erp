@@ -11,3 +11,4 @@ probe-output.json
 
 # pm2 logs
 logs/
+api_docs/
