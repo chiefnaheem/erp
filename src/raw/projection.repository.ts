@@ -371,6 +371,21 @@ export class ProjectionRepository {
             FROM erp_raw.raw_customer_credit c
             WHERE NULLIF(btrim(coalesce(c.payload->>'CUSTOMER_CODE', '')), '') IS NOT NULL
               AND c.payload->>'CUSTOMER_CODE' IN (SELECT erp_id FROM src)
+              -- Ignore credit records no longer in force. The ERP gives each record a
+              -- validity window, and an expired one says nothing about what the customer
+              -- owes today. Without this we published balances from credit lines that
+              -- ended long ago: customer 10110003 showed 10,125,600 from a record that
+              -- expired 2026-09-05, and 10110270 from one that expired in 2023.
+              AND (
+                NULLIF(btrim(coalesce(c.payload->>'INEFFECTIVE_DATE', '')), '') IS NULL
+                OR c.payload->>'INEFFECTIVE_DATE' = '0001-01-01 00:00:00'
+                OR ${ts("c.payload->>'INEFFECTIVE_DATE'")} >= now()
+              )
+              AND (
+                NULLIF(btrim(coalesce(c.payload->>'EFFECTIVE_DATE', '')), '') IS NULL
+                OR c.payload->>'EFFECTIVE_DATE' = '0001-01-01 00:00:00'
+                OR ${ts("c.payload->>'EFFECTIVE_DATE'")} <= now()
+              )
             ORDER BY c.payload->>'CUSTOMER_CODE',
                      ${ts("c.payload->>'EFFECTIVE_DATE'")} DESC NULLS LAST,
                      c.id DESC
