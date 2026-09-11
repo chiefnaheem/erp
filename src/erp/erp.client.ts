@@ -132,9 +132,10 @@ export class ErpClient {
     options: Omit<ErpQueryOptions, 'pageNo'> = {},
     startPage = 1,
   ): AsyncGenerator<{ pageNo: number; rows: TRow[] }, void, void> {
-    const pageSize =
+    const pageSize = 
       options.pageSize ?? this.config.getOrThrow<number>('ERP_PAGE_SIZE');
     const pageRetries = this.config.get<number>('ERP_PAGE_RETRIES') ?? 3;
+    const pageDelayMs = this.config.get<number>('ERP_PAGE_DELAY_MS') ?? 1500;
 
     const firstPage = Math.max(1, startPage);
 
@@ -186,6 +187,13 @@ export class ErpClient {
 
       // A page shorter than requested means we've reached the end.
       if (page.rows.length < pageSize) return;
+
+      // Breathe between pages. The ERP team measured our requests arriving every
+      // ~2s while a single E10 query takes them ~60s to answer — so pages queued
+      // up faster than they could be served and some never got a response. This
+      // pause is the direct control on that; it costs wall-clock we can afford
+      // now that sweeps are incremental.
+      if (pageDelayMs > 0) await this.sleep(pageDelayMs);
     }
 
     this.logger.error(

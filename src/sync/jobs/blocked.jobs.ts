@@ -48,20 +48,39 @@ export class StockProjectionJob extends BlockedJob {
  * order arrives as five rows repeating one DOC_NO — which is exactly what the
  * ingest key (SALES_ORDER_DOC_D_ID) already accounts for.
  *
- * What remains is not a question about the ERP but work on our side: mapping
- * ITEM_ID onto a product we hold, which needs the (still missing) material
- * master, and writing the PurchaseItem rows.
+ * ⚠️ NEW FINDING (2026-08-23), measured against the live feed. The blocker is no
+ * longer only ITEM_ID → product resolution. The feed has NO PER-LINE MONEY AT
+ * ALL: AMT_UNINCLUDE_TAX_OC and TAX_OC are HEADER totals repeated verbatim on
+ * every line of an order (0 of 5,000 sampled DOC_NOs carry more than one distinct
+ * value across their lines), and there is no unit-price field anywhere on the
+ * row. PurchaseItem.unitPrice and PurchaseItem.lineTotal are both NOT NULL, so
+ * projecting lines today means writing zeros or apportioning the header total by
+ * quantity — inventing prices — into a screen a distributor reads as an invoice.
+ *
+ * Quantity and description ARE available per line (BUSINESS_QTY,
+ * ITEM_DESCRIPTION), so this becomes a small job the moment a price arrives.
+ *
+ * When it does, the write must be DELETE-then-INSERT inside the parent
+ * Purchase's transaction, not an upsert: PurchaseItem has no natural key and no
+ * unique constraint, so there is nothing to conflict-target, and re-inserting
+ * without deleting is how you get a line duplicated on every sync. Deleting
+ * first is also what makes a line REMOVED in the ERP disappear here.
+ *
+ * Until then nothing in this service writes public."PurchaseItem" — the seeded
+ * and app-created rows that exist today are left strictly alone.
  */
 @Injectable()
 export class PurchaseItemProjectionJob extends BlockedJob {
   readonly name = 'project:purchase_item';
   protected readonly reason =
-    'Sales-order line items are ingested and their shape is confirmed by the API ' +
-    'docs (one flat row per line, keyed on SALES_ORDER_DOC_D_ID), but the ' +
-    'projection into public.PurchaseItem is not written yet: ITEM_ID cannot be ' +
-    'resolved to a product without a material-master endpoint.';
+    'Sales-order line items are ingested and their shape is confirmed, but the ERP ' +
+    'sends no per-line price or amount — AMT_UNINCLUDE_TAX_OC/TAX_OC are header ' +
+    'totals repeated on every line. PurchaseItem.unitPrice and .lineTotal are NOT ' +
+    'NULL, so projecting lines would mean fabricating the money on a customer-facing ' +
+    'order. ITEM_ID also still has no material master to resolve against.';
   protected readonly unblockedBy =
-    'Either an ERP method returning the material master (so ITEM_ID resolves to a ' +
-    'product), or a decision to store the raw ITEM_ID/ITEM_DESCRIPTION as-is on ' +
-    'PurchaseItem. The line data itself is already in erp_raw.raw_sales_order.';
+    'A per-line amount or unit price on sales_order_doc.query (e.g. an AMT/PRICE ' +
+    'field on the detail row). Once present, project with DELETE-then-INSERT of the ' +
+    "purchase's items inside the parent's transaction — PurchaseItem has no unique " +
+    'key to upsert on. The line data itself is already in erp_raw.raw_sales_order.';
 }

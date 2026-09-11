@@ -37,6 +37,14 @@ module.exports = {
       // completion. Lower this if the box is tight on RAM.
       max_memory_restart: '700M',
 
+      // Windows + a worker that is often mid-sweep: pm2's default 1.6s kill window
+      // expires before the process has closed its HTTP socket, so the replacement
+      // starts while port 3100 is still held and dies with EADDRINUSE — leaving an
+      // orphan running the OLD code that pm2 no longer manages. Seen three times.
+      kill_timeout: 20000, // give it time to finish the page it is on and exit
+      restart_delay: 5000, // and let the socket actually close before rebinding
+      listen_timeout: 20000,
+
       watch: false,
       time: true, // timestamp log lines
       merge_logs: true,

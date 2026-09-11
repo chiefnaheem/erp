@@ -1,4 +1,4 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, Optional } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { Interval } from '@nestjs/schedule';
 import { PrismaService } from './prisma.service';
@@ -29,7 +29,14 @@ export class DbWatchdog {
   constructor(
     private readonly prisma: PrismaService,
     private readonly config: ConfigService,
-    /** Injected so tests can assert on it instead of killing the runner. */
+    /**
+     * Injected so tests can assert on it instead of killing the runner.
+     * @Optional() is REQUIRED: a default value does NOT stop Nest trying to
+     * resolve this parameter, and it cannot resolve a bare function type — the
+     * app then fails to boot with UnknownDependenciesException on every start,
+     * which pm2 sees as a crash loop.
+     */
+    @Optional()
     private readonly exit: (code: number) => void = (code) => process.exit(code),
   ) {}
 

@@ -21,7 +21,7 @@ what the ERP **cannot** currently supply.
 | **Customer** | `yvijucrm.customer.query` | ✅ **Unblocked** — `PhoneNumber` + `Region` now returned |
 | **Stock** | *(none)* | ⛔ **Blocked** — no product/inventory endpoint exists |
 | **Purchase** (header) | `yvijucrm.sales_order_doc.query` | ⚠️ Mappable, with caveats |
-| **PurchaseItem** (lines) | `yvijucrm.sales_order_doc.query` | ⚠️ Data arrives; projection not written (no material master) |
+| **PurchaseItem** (lines) | `yvijucrm.sales_order_doc.query` | ⛔ **Blocked** — no per-line amount in the feed (§1b) |
 | **Payment** | `yvijucrm.collection_doc.query` | ✅ **Unblocked** — `CUSTOMER_CODE` now returned |
 
 Stock remains the one hard blocker with no ERP source at all.
@@ -41,9 +41,9 @@ Stock remains the one hard blocker with no ERP source at all.
 | `name` | `CUSTOMER_FULL_NAME` | ✅ |
 | `phone` | `PhoneNumber` | ✅ (was the blocker) |
 | `email` | — | ⚠️ absent (nullable, tolerable) |
-| `region` | `Region` | ✅ via `ERP_REGION_MAP` / `ERP_REGION_DEFAULT` |
-| `accountStatus` | — | ⚠️ absent (defaults to `ACTIVE`) |
-| `outstandingBalance` | `customer_credit.CREDIT_PAY`? | ⚠️ unconfirmed — see below |
+| `region` | `BP_CLUSTER_CODE` | ✅ resolved 2026-08-23 — **not** `Region`, see §1a |
+| `accountStatus` | — | ⚠️ absent (app-owned; sync never writes it) |
+| `outstandingBalance` | `customer_credit` | ✅ resolved 2026-08-23 — computed, see §1a |
 
 **What this originally blocked, and why it still matters.** `phone` is the
 **login identifier** (phone + OTP auth). While it was absent the sync could not
@@ -66,6 +66,112 @@ per credit area / currency), so which row wins is still undefined. Note also tha
 `SALES_RETURN`, `AR_REFUND_DOC` and `OTHER_RECEIVABLE_DOC` all move a customer's
 balance — if we compute rather than read the balance, all of them must be
 accounted for.
+
+---
+
+## 1a. Customer — measured against the live feed (2026-08-23)
+
+Three of the questions above were answered by querying `erp_raw` directly rather
+than by re-reading the docs. All three are now implemented in
+`ProjectionRepository`.
+
+**`region` comes from `BP_CLUSTER_CODE`, not `Region`.** The documented `Region`
+field is blank on essentially every row, which is why the old design needed
+`ERP_REGION_MAP` and an `ERP_REGION_DEFAULT` fallback. The real key is the
+numeric cluster code:
+
+| `BP_CLUSTER_CODE` | Region | Customers |
+|---|---|---|
+| `1` | `LAGOS` | 734 |
+| `2` | `EASTERN` | 82 |
+| `3` | `SOUTH_SOUTH` | 133 |
+| `4` | `WESTERN` | 439 |
+| `5` | `NORTH` | 463 |
+
+`BP_CLUSTER_CODE` is also the **tenant discriminator**. The same ERP instance
+serves other companies: `GZ020` alone accounts for 1,832 of the 3,747 customers
+in the feed, plus `GZ001` (6) and `9` (58). Those are not Viju distributors and
+are quarantined, never projected and never given a default region —
+`Customer.region` is `NOT NULL` and much of the portal filters on it, so a
+guessed region is a wrong answer that spreads. **1,851 of the 3,747 customers in
+the feed are Viju's.**
+
+⚠️ The `Region` enum in the live database is `LAGOS, EASTERN, SOUTH_SOUTH,
+WESTERN, NORTH`. `prisma/schema/region.prisma` in this repo is a **stale mirror**
+and still lists the retired `SOUTH_WEST` / `SOUTH_EAST`; its `OrderStatus` is
+missing `LOADED` / `DISPATCHED` / `CLOSED`, and `PurchaseItem.itemCode` is
+absent. Refresh it with `npm run schema:pull` from the main repo. The projection
+casts enum labels in SQL (`::"Region"`) precisely so the database, not a stale
+generated client, is the source of truth.
+
+**`outstandingBalance` is computed, and `CREDIT_PAY` alone had the sign
+backwards.**
+
+```
+Running Balance = CREDIT_AMT + CREDIT_AMT1 − CREDIT_PAY
+```
+
+taken from the newest credit record per customer (`ORDER BY EFFECTIVE_DATE DESC
+NULLS LAST, id DESC`), in `numeric` and unrounded — the ERP carries up to 4 dp
+and all of them must survive. `CREDIT_PAY` is credit *consumed*, so copying it
+straight across (which the old projector did) inverted the balance for every
+customer holding credit. Positive now means **funds available**, which is what
+the portal assumes. Confirmed against the four onboarded customers: e.g.
+`10110017` read `-33401031.14` and is now `33403031.4733`.
+
+In practice `CUSTOMER_CREDIT` returns exactly **one row per customer** (1,831
+rows, 1,831 distinct `CUSTOMER_CODE`), so the "which row wins" question is
+currently moot — but the `DISTINCT ON` ordering above settles it if that changes.
+A customer with no credit record is **left as-is, never zeroed**.
+
+**⛔ `phone` is the binding constraint on customer coverage, and it is a data
+problem.** `Customer.phone` is `UNIQUE` and is the login identifier. The feed
+carries only **8 distinct phone numbers for the 1,851 Viju distributors** —
+1,844 of them share the placeholder `0913580925`. Those are quarantined
+(`NO_USABLE_PHONE`) with the conflicting party recorded, and convert into real
+customers with no code change the moment the ERP supplies per-customer numbers.
+Two further hazards found in the same data:
+
+* ERP customer `10110001` (ABAYOMI) carries the number that `10110017` (ISEA
+  INTEGRATED) already logs in with — a cross-row unique violation that would
+  abort the whole batch on a different constraint than the one being
+  conflict-targeted.
+* `40510009` (LATLEK) carries `0707459177`, ten digits where a Nigerian mobile
+  has eleven. Overwriting a working login with an unreachable number is worse
+  than leaving it, so phones are normalised to `+234` E.164 and validated
+  against `ERP_PHONE_PATTERN` before being written.
+
+`ERP_CUSTOMER_SYNTHETIC_PHONE=true` trades this off: the quarantined customers
+are created with a non-dialable `erp:<CUSTOMER_CODE>` placeholder, so they appear
+in the portal's admin / regional-admin / officer views without a credential
+anyone can log in with. Off by default.
+
+---
+
+## 1b. PurchaseItem — measured against the live feed (2026-08-23)
+
+The remaining blocker is no longer only `ITEM_ID` → material-master resolution.
+**The feed carries no per-line money at all.** `AMT_UNINCLUDE_TAX_OC` and
+`TAX_OC` are *header* totals repeated verbatim on every line of an order: of
+5,000 sampled `DOC_NO`s, **zero** had more than one distinct value across their
+lines, and there is no unit-price field anywhere on the detail row.
+
+`PurchaseItem.unitPrice` and `PurchaseItem.lineTotal` are both `NOT NULL`, so
+projecting lines today would mean writing zeros or apportioning the header total
+by quantity — inventing prices — into a screen a distributor reads as an invoice.
+Quantity and description *are* available per line (`BUSINESS_QTY`,
+`ITEM_DESCRIPTION`), so this becomes a small job the moment a price arrives.
+
+**When it does, the write must be DELETE-then-INSERT of the purchase's items
+inside the parent `Purchase`'s transaction, not an upsert.** `PurchaseItem` has
+no natural key and no unique constraint, so there is nothing to conflict-target,
+and re-inserting without deleting duplicates every line on every sync. Deleting
+first is also what makes a line *removed* in the ERP disappear here.
+
+Until then nothing in this service writes `public."PurchaseItem"`.
+
+**Ask the ERP team for:** a per-line amount or unit price on
+`sales_order_doc.query` (an `AMT`/`PRICE` field on the detail row).
 
 ---
 

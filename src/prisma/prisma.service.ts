@@ -88,7 +88,7 @@ export class PrismaService
       }
     }
   }
-
+
   /**
    * Postgres SQLSTATEs that mean "this connection is gone / the server is busy
    * or restarting", not "your query is wrong". Prisma surfaces these inside a
@@ -99,9 +99,22 @@ export class PrismaService
    *   57P01 admin shutdown        — "terminating connection due to administrator command"
    *   57P02 crash shutdown        57P03 cannot connect now (server starting up)
    *   08xxx connection exceptions 53300 too many connections
+   *
+   * 40P01 / 40001 are not connection faults but they belong here for the same
+   * reason: they mean "your transaction lost a race, run it again", and
+   * Postgres has already rolled it back for us. The projector takes an advisory
+   * lock per job, but two DIFFERENT jobs can still contend — the customer pass
+   * writes public."Customer" while the purchase and payment passes hold FK
+   * references to it — and a deploy where one instance is still on the previous
+   * build has no shared lock at all. Every pass is an idempotent upsert inside
+   * one transaction, so replaying it is exactly the right response; without this
+   * a lost race failed the whole job and waited for the next tick.
+   *
+   *   40P01 deadlock_detected     40001 serialization_failure
    */
   private static readonly TRANSIENT_SQLSTATE = new Set([
     '57P01', '57P02', '57P03', '08000', '08003', '08006', '08001', '08004', '53300',
+    '40P01', '40001',
   ]);
 
   /** Prisma-level codes for an unreachable/closed connection or an exhausted pool. */
@@ -194,14 +207,36 @@ export class PrismaService
     throw new Error(`${label}: exhausted DB retries`);
   }
 
-  /** Drop the (possibly dead) pool and dial again. Throws if still unreachable. */
+  /**
+   * Re-establish the connection, at most once at a time.
+   *
+   * ⚠️ Two hard-won constraints here.
+   *
+   * 1. NO $disconnect(). The client is shared by every job, and up to 8 ingest
+   *    sweeps plus the projections run concurrently. Disconnecting on behalf of
+   *    ONE failed statement tears the pool out from under all the others, which
+   *    then fail, disconnect, and reconnect in turn — a storm that logs
+   *    "connection re-established" and "connection lost" alternately and never
+   *    settles. Prisma replaces dead pooled connections by itself; a plain
+   *    $connect() (a no-op when already connected) is all that is needed.
+   *
+   * 2. Single-flight. Without this, every concurrent failure starts its own
+   *    reconnect against a database that is already struggling.
+   */
+  private reconnecting: Promise<void> | null = null;
+
   private async reconnect(): Promise<void> {
-    try {
-      await this.$disconnect();
-    } catch {
-      // Already down — nothing to drop.
-    }
-    await this.$connect();
+    if (this.reconnecting) return this.reconnecting;
+
+    this.reconnecting = (async () => {
+      try {
+        await this.$connect();
+      } finally {
+        this.reconnecting = null;
+      }
+    })();
+
+    return this.reconnecting;
   }
 
   /**

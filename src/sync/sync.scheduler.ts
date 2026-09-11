@@ -20,7 +20,6 @@ export class SyncScheduler implements OnApplicationBootstrap {
   private readonly owner = `${hostname()}:${process.pid}`;
   private tickCount = 0;
   private readonly bootTime = Date.now();
-  private lastIngestStartedAt = 0;
 
   constructor(
     private readonly sync: SyncService,
@@ -68,50 +67,205 @@ export class SyncScheduler implements OnApplicationBootstrap {
   /**
    * Interval polling.
    *
-   * Default is every 15 minutes rather than every minute, because the ERP cannot
-   * do deltas — each tick re-reads EVERY order and customer. Content hashing
-   * keeps the downstream writes near zero, but the ERP still pays for the read,
-   * so the interval is a real cost. Override with ERP_SYNC_CRON.
+   * Ingest is now per-object and incremental (see ingestSchedule below); the ERP
+   * pays for one object's changed rows at a time rather than a full re-read of
+   * everything on one clock.
    *
    * Every stage below is logged and timed independently, and tagged with a tick
    * id (e.g. "tick #7"), so a failure tells you exactly WHICH stage broke —
    * acquiring the lock, running the cycle, or releasing — rather than surfacing a
    * bare Prisma error with no context.
    */
-  // INGEST: the heavy ERP → erp_raw sweep.
-  //
-  // The cron fires every 15 min (finest cadence), but an escalation gate decides
-  // whether to actually run: FAST for the first ERP_INGEST_FAST_MINUTES after boot
-  // (every 15 min — quick initial catch-up), then STEADY (at most once per
-  // ERP_INGEST_SLOW_MINUTES — hourly by default) to spare the flaky DB once caught
-  // up. A tick that's gated off just logs and stands down.
-  @Cron(process.env.ERP_SYNC_CRON || '0 0 */6 * * *', { name: 'erp-ingest' })
+  /**
+   * Per-object ingest schedule.
+   *
+   * Each ERP interface gets its OWN cadence and its own start minute. Two reasons:
+   *
+   *  1. The ERP asked us to. Their analysis of the 331 errors found requests
+   *     arriving ~every 2s against a ~60s response time, backlogging their server.
+   *     Eight sweeps that all began at :00 were the shape of that burst.
+   *  2. The objects are not equally busy. Customers change rarely; sales orders
+   *     and collections change constantly. Sweeping them on the same clock wastes
+   *     calls on the quiet ones.
+   *
+   * `offsetMinutes` staggers the start so two objects never begin together, and
+   * the dispatcher runs at most ONE sweep per tick, so only one is ever in flight.
+   */
+  private readonly ingestSchedule: {
+    job: string;
+    configKey: string;
+    offsetMinutes: number;
+  }[] = [
+    { job: 'ingest:customer', configKey: 'ERP_INTERVAL_CUSTOMER', offsetMinutes: 0 },
+    { job: 'ingest:sales_order', configKey: 'ERP_INTERVAL_SALES_ORDER', offsetMinutes: 7 },
+    { job: 'ingest:collection', configKey: 'ERP_INTERVAL_COLLECTION', offsetMinutes: 14 },
+    { job: 'ingest:sales_delivery', configKey: 'ERP_INTERVAL_SALES_DELIVERY', offsetMinutes: 21 },
+    { job: 'ingest:customer_credit', configKey: 'ERP_INTERVAL_CUSTOMER_CREDIT', offsetMinutes: 28 },
+    { job: 'ingest:sales_return', configKey: 'ERP_INTERVAL_SALES_RETURN', offsetMinutes: 35 },
+    { job: 'ingest:ar_refund', configKey: 'ERP_INTERVAL_AR_REFUND', offsetMinutes: 42 },
+    { job: 'ingest:other_receivable', configKey: 'ERP_INTERVAL_OTHER_RECEIVABLE', offsetMinutes: 49 },
+  ];
+
+  /** When each object last STARTED a sweep, so intervals are measured from a run
+   *  rather than from the clock. Empty after a restart — see dueJobs(). */
+  private readonly lastIngestAt = new Map<string, number>();
+
+  /** A sweep is running in THIS process. Sweeps can outlast their interval (the
+   *  customer sweep takes ~90s, collections far longer), and without this the
+   *  dispatcher re-picks the same job every minute just to lose the lock race and
+   *  log a stand-down. The DB lock still guards across processes. */
+  private ingestInFlight = false;
+
+  /**
+   * Fires every minute, but does almost nothing: it picks at most one object whose
+   * interval has elapsed and sweeps that one. A quiet minute costs a Map lookup.
+   */
+  @Cron('0 * * * * *', { name: 'erp-ingest' })
   async ingestTick(): Promise<void> {
-    const gate = this.ingestGate();
-    if (!gate.run) {
-      this.logger.log(`ingest tick skipped — ${gate.reason}`);
-      return;
+    if (!this.config.get<boolean>('SYNC_ENABLED')) return;
+
+    if (this.ingestInFlight) return;
+
+    const due = this.dueJobs();
+    if (due.length === 0) return;
+
+    // ONE per tick. Several may be due at once (notably right after a restart);
+    // running them a minute apart is exactly the spreading the ERP asked for.
+    const job = due[0];
+    this.logger.log(
+      `ingest tick — ${job}` +
+        (due.length > 1 ? ` (${due.length - 1} more due, one per minute)` : ''),
+    );
+
+    // Stamp only if the sweep really ran. A tick that stood down (a longer sweep
+    // still holds the lock) must stay due, or a busy object that keeps colliding
+    // with a slow one would silently wait a full interval each time it lost.
+    this.ingestInFlight = true;
+    try {
+      const ran = await this.runStage(INGEST_LOCK, () => this.sync.runIngestJob(job));
+      if (ran) this.lastIngestAt.set(job, Date.now());
+    } finally {
+      this.ingestInFlight = false;
     }
-    this.lastIngestStartedAt = Date.now();
-    this.logger.log(`ingest tick — ${gate.reason}`);
-    await this.runStage(INGEST_LOCK, () => this.sync.runIngest());
   }
 
-  /** 15-min cadence during the initial catch-up window, then back off to hourly. */
-  private ingestGate(): { run: boolean; reason: string } {
-    const fastMs = (this.config.get<number>('ERP_INGEST_FAST_MINUTES') ?? 60) * 60_000;
-    const slowMs = (this.config.get<number>('ERP_INGEST_SLOW_MINUTES') ?? 60) * 60_000;
-    const now = Date.now();
+  // ─── On-demand triggers ──────────────────────────────────────────────────
+  // Used by the /sync endpoints so a run can be forced without waiting for the
+  // schedule. They go through the SAME in-flight guard and DB lock as the cron,
+  // which is the point: a manual trigger must never put a second sweep on the
+  // ERP alongside a scheduled one. (An earlier attempt ran the sweep in its own
+  // process and did exactly that.)
 
-    if (now - this.bootTime < fastMs) {
-      return { run: true, reason: 'catch-up window (15m cadence)' };
+  /** Names of the objects that can be swept. */
+  ingestJobNames(): string[] {
+    return this.ingestSchedule.map((s) => s.job);
+  }
+
+  /** What the scheduler is doing right now, for the /sync/status endpoint. */
+  status(): Record<string, unknown> {
+    const defaultInterval =
+      this.config.get<number>('ERP_INGEST_INTERVAL_MINUTES') ?? 60;
+    return {
+      sweepInProgress: this.ingestInFlight,
+      due: this.dueJobs(),
+      objects: this.ingestSchedule.map(({ job, configKey, offsetMinutes }) => {
+        const last = this.lastIngestAt.get(job);
+        return {
+          job,
+          everyMinutes: this.config.get<number>(configKey) ?? defaultInterval,
+          startsAtMinute: offsetMinutes,
+          lastRun: last ? new Date(last).toISOString() : null,
+        };
+      }),
+    };
+  }
+
+  /**
+   * Sweep ONE object now, or make every object due immediately.
+   *
+   * Returns as soon as the work is launched — a sweep takes minutes to hours, far
+   * longer than an HTTP request should wait.
+   */
+  triggerIngest(job?: string): { started: boolean; message: string } {
+    if (this.ingestInFlight) {
+      return { started: false, message: 'a sweep is already running - try again when it finishes' };
     }
-    const since = now - this.lastIngestStartedAt;
-    if (since >= slowMs) {
-      return { run: true, reason: 'steady window (hourly cadence)' };
+
+    if (!job) {
+      // Forget every recorded run, so the next tick (within a minute) treats all
+      // eight as due and works through them one per minute.
+      this.lastIngestAt.clear();
+      return {
+        started: true,
+        message: 'all objects marked due - they will sweep one per minute, starting within 60s',
+      };
     }
-    const mins = Math.ceil((slowMs - since) / 60_000);
-    return { run: false, reason: `steady window — ~${mins}m until next run` };
+
+    if (!this.ingestJobNames().includes(job)) {
+      return {
+        started: false,
+        message: `unknown job "${job}" - one of: ${this.ingestJobNames().join(', ')}`,
+      };
+    }
+
+    this.ingestInFlight = true;
+    void (async () => {
+      try {
+        this.logger.log(`manual trigger - ${job}`);
+        const ran = await this.runStage(INGEST_LOCK, () => this.sync.runIngestJob(job));
+        if (ran) this.lastIngestAt.set(job, Date.now());
+      } finally {
+        this.ingestInFlight = false;
+      }
+    })();
+
+    return { started: true, message: `${job} started - watch: pm2 logs erp-sync` };
+  }
+
+  /** Run the projection stage now (erp_raw -> public). */
+  triggerProjection(): { started: boolean; message: string } {
+    void this.projectionTick();
+    return { started: true, message: 'projection started - watch: pm2 logs erp-sync' };
+  }
+
+  /**
+   * Objects whose interval has elapsed, in schedule order.
+   *
+   * After a restart nothing has a recorded run, so every object is due at once —
+   * deliberately: one goes per minute until all are caught up, then each settles
+   * onto its own interval.
+   */
+  private dueJobs(): string[] {
+    const defaultInterval =
+      this.config.get<number>('ERP_INGEST_INTERVAL_MINUTES') ?? 60;
+    const now = Date.now();
+    const minuteOfHour = new Date(now).getMinutes();
+
+    return this.ingestSchedule
+      .filter(({ job, configKey, offsetMinutes }) => {
+        const intervalMin = this.config.get<number>(configKey) ?? defaultInterval;
+        const last = this.lastIngestAt.get(job);
+
+        // Never run in this process: due now (restart catch-up).
+        if (last === undefined) return true;
+
+        // Grace of one tick. `last` records when the sweep STARTED, a second or
+        // two after the tick that launched it, so at the next matching minute the
+        // elapsed time is always a hair under the interval — 59.97 minutes for a
+        // 60-minute interval. Without this the job is judged "not due", waits for
+        // the following matching minute, and silently runs at HALF the configured
+        // frequency (customer_credit was running every 2 hours, not every 1).
+        const TICK_MS = 60_000;
+        if (now - last < intervalMin * 60_000 - TICK_MS) return false;
+
+        // Past due AND at its own start minute, so two objects with the same
+        // interval still do not fire together. If the offset minute is missed
+        // (a long sweep overran it), the next matching minute picks it up.
+        return intervalMin >= 60
+          ? minuteOfHour === offsetMinutes % 60
+          : minuteOfHour % intervalMin === offsetMinutes % intervalMin;
+      })
+      .map(({ job }) => job);
   }
 
   // PROJECT: erp_raw → public.*. Runs on its own, more frequent schedule (every
@@ -127,13 +281,14 @@ export class SyncScheduler implements OnApplicationBootstrap {
    * naming. Ingest and projection each get an independent lock, so one can run
    * while the other is mid-flight.
    */
-  private async runStage(lockName: string, work: () => Promise<void>): Promise<void> {
+  /** Returns false when the stage did NOT run (disabled, or the lock was held). */
+  private async runStage(lockName: string, work: () => Promise<void>): Promise<boolean> {
     const tag = `${lockName} #${++this.tickCount}`;
     const startedAt = Date.now();
 
     if (!this.config.get<boolean>('SYNC_ENABLED')) {
       this.logger.log(`${tag}: SYNC_ENABLED=false — not running`);
-      return;
+      return false;
     }
 
     const leaseMinutes = this.config.get<number>('SYNC_LOCK_MINUTES') ?? 30;
@@ -143,14 +298,14 @@ export class SyncScheduler implements OnApplicationBootstrap {
       acquired = await this.acquire(lockName, leaseMinutes);
     } catch (error) {
       this.logFailure(tag, 'ACQUIRE_LOCK', error, startedAt);
-      return;
+      return false;
     }
 
     if (!acquired) {
       this.logger.log(
         `${tag}: another worker holds the ${lockName} lock — standing down (${Date.now() - startedAt}ms)`,
       );
-      return;
+      return false;
     }
 
     let stageError: unknown;
@@ -178,6 +333,8 @@ export class SyncScheduler implements OnApplicationBootstrap {
       `${tag}: ${failed ? 'FAILED' : 'ok'}${releaseError ? ' (lock not released — it will expire)' : ''}` +
         ` — total ${Date.now() - startedAt}ms`,
     );
+
+    return true;
   }
 
   /**

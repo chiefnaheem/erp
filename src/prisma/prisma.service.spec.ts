@@ -46,6 +46,19 @@ describe('PrismaService.withRetry', () => {
     expect(prisma.isTransient(new Error('Server has closed the connection.'))).toBe(true);
   });
 
+  it('retries a deadlock — a lost race is replayable, not a bug in the query', () => {
+    // Two projection passes contending over public."Customer" (one writing it,
+    // one holding FK references to it) is a real, expected collision. Postgres
+    // has already rolled the loser back, and every projection pass is an
+    // idempotent upsert in one transaction, so replaying it is exactly right.
+    expect(
+      prisma.isTransient(rawQueryError('40P01', 'deadlock detected')),
+    ).toBe(true);
+    expect(
+      prisma.isTransient(rawQueryError('40001', 'could not serialize access')),
+    ).toBe(true);
+  });
+
   it('does NOT retry a genuine query error', async () => {
     const op = jest.fn().mockRejectedValue(
       Object.assign(new Error('column "nope" does not exist'), { code: 'P2010', meta: { code: '42703' } }),
@@ -67,10 +80,11 @@ describe('PrismaService.withRetry', () => {
 
     await expect(prisma.withRetry(op, 'upsert')).resolves.toBe('recovered');
     expect(op).toHaveBeenCalledTimes(3);
-    // The dead pool is dropped and re-dialled before each RETRY — otherwise the
-    // retry just draws another dead connection and fails identically.
-    expect(disconnect).toHaveBeenCalledTimes(2);
+    // Re-dialled before each RETRY. It must NOT disconnect: the client is shared
+    // by every concurrent job, so disconnecting for one failed statement kills
+    // the others' connections too and sets off a reconnect storm.
     expect(connect).toHaveBeenCalledTimes(2);
+    expect(disconnect).not.toHaveBeenCalled();
   });
 
   it('gives up after 6 attempts and rethrows the original error', async () => {
@@ -105,5 +119,24 @@ describe('PrismaService.withRetry', () => {
     expect(prisma.msSinceLastOk()).toBeNull();
     await prisma.withRetry(async () => 'ok', 'probe');
     expect(prisma.msSinceLastOk()).toBeGreaterThanOrEqual(0);
+  });
+
+  it('reconnects ONCE when many concurrent jobs fail together', async () => {
+    await prisma.onModuleInit();
+    connect.mockClear();
+
+    // 8 concurrent ops all hit the same dropped connection, as the ingest jobs do.
+    const ops = Array.from({ length: 8 }, () => {
+      const op = jest
+        .fn()
+        .mockRejectedValueOnce(new Error('Server has closed the connection.'))
+        .mockResolvedValue('ok');
+      return prisma.withRetry(op, 'concurrent');
+    });
+
+    await expect(Promise.all(ops)).resolves.toEqual(Array(8).fill('ok'));
+    // Single-flight: they share one reconnect instead of starting eight.
+    expect(connect.mock.calls.length).toBeLessThanOrEqual(2);
+    expect(disconnect).not.toHaveBeenCalled();
   });
 });
