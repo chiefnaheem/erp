@@ -251,3 +251,80 @@ function normalisePhone(value: unknown): string | null {
   const digits = String(value).replace(/[^\d+]/g, '');
   return digits.length >= 7 ? digits : null;
 }
+
+// ─── BP_CLUSTER_CODE → Region (the real, confirmed mapping) ──────────────────
+//
+// Everything above this line predates the ERP team confirming where a Viju
+// distributor's region actually lives. It is NOT the customer's `Region` field
+// (that column is blank on ~every row) — it is the numeric BP_CLUSTER_CODE:
+//
+//   1 → LAGOS   2 → EASTERN   3 → SOUTH_SOUTH   4 → WESTERN   5 → NORTH
+//
+// BP_CLUSTER_CODE doubles as the tenant discriminator. The same ERP instance
+// serves other companies, whose customers carry non-numeric codes (GZ020, GZ001)
+// or codes outside 1–5 (9). Those are NOT Viju distributors: 1,832 of the 3,747
+// customers in the feed belong to the GZ020 tenant alone. They are quarantined
+// rather than projected, and never defaulted to a region — `Customer.region` is
+// NOT NULL and half the portal's filters key off it, so a guessed region is a
+// wrong answer that spreads.
+//
+// The values below are the labels of the Postgres "Region" enum as it exists in
+// the live database. NOTE: they are deliberately NOT taken from the generated
+// Prisma client — prisma/schema/region.prisma in this repo is a stale copy of
+// the main API's schema and still lists the pre-migration labels (SOUTH_WEST,
+// SOUTH_EAST). Projection casts these strings with ::"Region" in SQL, so the
+// database is the single source of truth and a stale local schema cannot
+// silently write a label that no longer exists.
+export const VIJU_REGIONS = [
+  'LAGOS',
+  'EASTERN',
+  'SOUTH_SOUTH',
+  'WESTERN',
+  'NORTH',
+] as const;
+
+export type VijuRegion = (typeof VIJU_REGIONS)[number];
+
+const DEFAULT_CLUSTER_REGION_MAP: Record<string, VijuRegion> = {
+  '1': 'LAGOS',
+  '2': 'EASTERN',
+  '3': 'SOUTH_SOUTH',
+  '4': 'WESTERN',
+  '5': 'NORTH',
+};
+
+/**
+ * BP_CLUSTER_CODE → Region, overridable via ERP_CLUSTER_REGION_MAP, e.g.
+ *
+ *   ERP_CLUSTER_REGION_MAP={"1":"LAGOS","2":"EASTERN","6":"NORTH"}
+ *
+ * The override REPLACES the built-in map rather than merging into it, and it is
+ * ALL-OR-NOTHING: if any entry names something that is not a real Region label,
+ * the whole override is discarded and the built-ins stand.
+ *
+ * That combination is deliberate. Applying an override entry-by-entry would let
+ * a single typo — writing the retired label SOUTH_WEST for code 1, say — quietly
+ * delete a mapping, and every customer in that region would then be quarantined
+ * as "not a Viju distributor". A bad value would also reach the ::"Region" cast
+ * in SQL and abort the projection statement mid-run. Refusing the override
+ * outright keeps a typo from doing either, and the projector logs the map it
+ * ended up with so the mistake is visible.
+ */
+export function buildClusterRegionMap(raw?: string): Record<string, VijuRegion> {
+  if (!raw) return { ...DEFAULT_CLUSTER_REGION_MAP };
+  try {
+    const parsed = JSON.parse(raw) as Record<string, string>;
+    const map: Record<string, VijuRegion> = {};
+    for (const [code, region] of Object.entries(parsed)) {
+      const key = String(code).trim();
+      const value = String(region).trim().toUpperCase();
+      if (!key || !(VIJU_REGIONS as readonly string[]).includes(value)) {
+        return { ...DEFAULT_CLUSTER_REGION_MAP };
+      }
+      map[key] = value as VijuRegion;
+    }
+    return Object.keys(map).length ? map : { ...DEFAULT_CLUSTER_REGION_MAP };
+  } catch {
+    return { ...DEFAULT_CLUSTER_REGION_MAP };
+  }
+}

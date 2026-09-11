@@ -272,18 +272,99 @@ export interface ErpCollectionRow {
   [key: string]: unknown;
 }
 
+/**
+ * A sales-delivery row is HEADER + ONE DETAIL LINE, flattened — the 2026-09-07
+ * doc update added the subtable to this query. A delivery with N lines arrives as
+ * N rows repeating the header, which is why the raw store keys on
+ * SALES_DELIVERY_D_ID rather than DOC_NO.
+ */
 export interface ErpSalesDeliveryRow {
-  SALES_DELIVERY_ID: string;
-  DOC_NO: string; // the raw key for this object
+  SALES_DELIVERY_ID: string; // header key
+  /** Detail-line primary key — unique per row, unlike DOC_NO. */
+  SALES_DELIVERY_D_ID?: string;
+  DOC_NO: string;
+  DOC_ID?: string;
+  DOC_Sequence?: string | number;
   DOC_DATE?: string;
   TRANSACTION_DATE?: string;
-  CATEGORY?: string;
+  CreateDate?: string;
+  LastModifiedDate?: string; // drives the incremental filter
+  ApproveDate?: string;
+  ApproveStatus?: string;
   CUSTOMER_ID?: string; // Guid — resolve via customer_link
-  ISSUED_STATUS?: string;
-  DESTINATION?: string;
-  TELEPHONE?: string; // per-shipment contact number, NOT the customer master
+  CUSTOMER_CODE?: string; // joins straight onto Customer.erpId
+  CUSTOMER_NAME?: string;
+  CURRENCY_ID?: string;
+  EXCHANGE_RATE?: string | number;
   AMOUNT_UNINCLUDE_TAX_OC?: string | number;
-  PIECES?: number; // likely the true source of "loaded cartons"
+  AMOUNT_UNINCLUDE_TAX_BC?: string | number;
+  TAX_OC?: string | number;
+  TAX_BC?: string | number;
+  ISSUED_STATUS?: string;
+  WAREHOUSE_ID?: string;
+  TELEPHONE?: string; // per-shipment contact, NOT the customer master
+  // ── Detail-line fields (subtable) ─────────────────────────────────────────
+  ITEM_CODE?: string;
+  ITEM_NAME?: string;
+  ITEM_DESCRIPTION?: string;
+  ITEM_SPECIFICATION?: string;
+  ITEM_TYPE?: string;
+  LOT_CODE?: string;
+  BUSINESS_QTY?: string | number;
+  PIECES?: number; // cartons on this line
+  PRICE?: string | number; // per-line unit price
+  PRICE_QTY?: string | number;
+  AMOUNT?: string | number; // per-line amount
+  TAX_RATE?: string | number;
+  WAREHOUSE_CODE?: string;
+  WAREHOUSE_NAME?: string;
+  [key: string]: unknown;
+}
+
+/**
+ * A sales-return row is HEADER + ONE DETAIL LINE, flattened (same 2026-09-07
+ * update). ⚠️ Unlike deliveries, the ERP exposes NO subtable primary key here —
+ * only the header's SALES_RETURN_ID — so the raw store keys these rows on
+ * DOC_NO plus a hash of the line fields. See SalesReturnIngestJob.
+ */
+export interface ErpSalesReturnRow {
+  SALES_RETURN_ID: string; // header key
+  DOC_NO: string;
+  DOC_ID?: string;
+  DOC_Sequence?: string | number;
+  DOC_DATE?: string;
+  TRANSACTION_DATE?: string;
+  CreateDate?: string;
+  LastModifiedDate?: string;
+  ApproveDate?: string;
+  ApproveStatus?: string;
+  RECEIPTED_STATUS?: string;
+  CUSTOMER_ID?: string; // Guid
+  CUSTOMER_CODE?: string;
+  CUSTOMER_NAME?: string;
+  CURRENCY_ID?: string;
+  EXCHANGE_RATE?: string | number;
+  AMOUNT_UNINCLUDE_TAX_OC?: string | number;
+  AMOUNT_UNINCLUDE_TAX_BC?: string | number;
+  TAX_OC?: string | number;
+  TAX_BC?: string | number;
+  PIECES?: number; // header carton count
+  // ── Detail-line fields (subtable) ─────────────────────────────────────────
+  ITEM_CODE?: string;
+  ITEM_NAME?: string;
+  ITEM_DESCRIPTION?: string;
+  ITEM_SPECIFICATION?: string;
+  ITEM_TYPE?: string;
+  LOT_CODE?: string;
+  BUSINESS_QTY?: string | number;
+  PIECES1?: number; // cartons on this line
+  PRICE?: string | number;
+  PRICE_QTY?: string | number;
+  AMOUNT?: string | number;
+  SALES_RETURN_TYPE?: string;
+  TAX_RATE?: string | number;
+  WAREHOUSE_CODE?: string;
+  WAREHOUSE_NAME?: string;
   [key: string]: unknown;
 }
 

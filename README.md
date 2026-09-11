@@ -53,7 +53,7 @@ overwritten by a sync.
 
 | Entity | Fields | Keyed on | ERP source |
 |---|---|---|---|
-| **Customer** | `name`, `outstandingBalance` (⛔ not `phone`/`region` — see CONTRACT) | `erpId` | `customer.query` |
+| **Customer** | `name`, `phone`, `region`, `outstandingBalance` | `erpId` ← `CUSTOMER_CODE` | `customer.query` + `customer_credit.query` |
 | **Stock** | `productName`, `quantity` | `erpId` | ⛔ **no endpoint exists** |
 | **Purchase** | `orderDate`, `totalItems`, `totalValue`, `status` | `erpId` (`DOC_NO`) | `sales_order_doc.query` |
 | **PurchaseItem** | `productName`, `quantity`, `unitPrice`, `lineTotal` | parent | ⛔ **not exposed** |

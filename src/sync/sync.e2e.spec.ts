@@ -111,6 +111,9 @@ describe('Sync cycle (e2e)', () => {
       `DELETE FROM erp_raw.raw_customer WHERE erp_key LIKE 'TEST_E2E_%'`,
     );
     await prisma.$executeRawUnsafe(
+      `DELETE FROM erp_raw.raw_customer_credit WHERE erp_key LIKE 'TEST_E2E_%'`,
+    );
+    await prisma.$executeRawUnsafe(
       `DELETE FROM erp_raw.raw_sales_order WHERE erp_key LIKE 'TEST_E2E_%'`,
     );
     await prisma.$executeRawUnsafe(
@@ -122,6 +125,13 @@ describe('Sync cycle (e2e)', () => {
     await prisma.$executeRawUnsafe(
       `DELETE FROM erp_raw.sync_run WHERE started_at > now() - interval '10 minutes'`,
     );
+    await prisma.$executeRawUnsafe(
+      `DELETE FROM erp_raw.projection_quarantine WHERE erp_key LIKE 'TEST_E2E_%'`,
+    );
+    // NOTE: erp_raw.projection_watermark is deliberately NOT reset here. Each
+    // test re-upserts its fixtures, which sets changed_at = now() and
+    // projected_at = NULL, so they are selected either way — while clearing the
+    // watermark would force every test to re-scan the entire feed.
   };
 
   const PAYDOC = 'TEST_E2E_PAY_1';
@@ -129,7 +139,14 @@ describe('Sync cycle (e2e)', () => {
   beforeEach(async () => {
     await cleanup();
     customers = [
-      { CUSTOMER_ID: GUID, CUSTOMER_CODE: CODE, CUSTOMER_FULL_NAME: 'ERP Provided Name' },
+      {
+        CUSTOMER_ID: GUID,
+        CUSTOMER_CODE: CODE,
+        CUSTOMER_FULL_NAME: 'ERP Provided Name',
+        // region comes from BP_CLUSTER_CODE, not the (blank) Region field
+        BP_CLUSTER_CODE: '1', // → LAGOS
+        PhoneNumber: '08090000001', // → +2348090000001
+      },
     ];
     salesOrders = [
       {
@@ -186,27 +203,110 @@ describe('Sync cycle (e2e)', () => {
     await sync.runProjection();
   };
 
-  // ── Customer projection is refresh-only (creation blocked by ERP phone data) ──
-  it('does NOT create customers from ERP (creation is disabled)', async () => {
-    // Even with phone + region present, the sync no longer inserts customers,
-    // because the ERP PhoneNumber is a shared placeholder across customers.
-    customers[0].PhoneNumber = '+2348090000001';
-    customers[0].Region = 'LAGOS';
+  /** Row counts of every table the projector writes — the idempotence probe. */
+  const counts = async () => {
+    const [row] = await prisma.$queryRawUnsafe<any[]>(
+      `SELECT (SELECT count(*) FROM "Customer")     AS customers,
+              (SELECT count(*) FROM "Purchase")     AS purchases,
+              (SELECT count(*) FROM "PurchaseItem") AS items,
+              (SELECT count(*) FROM "Payment")      AS payments,
+              (SELECT count(*) FROM "Staff")        AS staff`,
+    );
+    return Object.fromEntries(
+      Object.entries(row).map(([k, v]) => [k, String(v)]),
+    );
+  };
+
+  // ── Customer projection: create + refresh, on the ERP's natural key ────────
+  it('CREATES a customer from the ERP when the cluster and phone are usable', async () => {
+    await runCycle();
+
+    const customer = await prisma.customer.findUniqueOrThrow({ where: { erpId: CODE } });
+    expect(customer.name).toBe('ERP Provided Name');
+    expect(customer.phone).toBe('+2348090000001'); // normalised to E.164
+    expect(customer.region).toBe('LAGOS'); // from BP_CLUSTER_CODE '1'
+  });
+
+  it('quarantines a customer whose BP_CLUSTER_CODE is not a Viju region', async () => {
+    // The same ERP serves other companies; their customers must never be
+    // projected, and must never be defaulted into a region.
+    customers[0].BP_CLUSTER_CODE = 'GZ020';
 
     await runCycle();
 
     expect(await prisma.customer.findUnique({ where: { erpId: CODE } })).toBeNull();
+    const [quarantined] = await prisma.$queryRawUnsafe<any[]>(
+      `SELECT reason, detail FROM erp_raw.projection_quarantine
+       WHERE job = 'project:customer' AND erp_key = '${CODE}' AND resolved_at IS NULL`,
+    );
+    expect(quarantined.reason).toBe('NOT_A_VIJU_DISTRIBUTOR');
+    expect(quarantined.detail).toContain('GZ020');
   });
 
-  it("refreshes an existing customer's name but leaves app-owned phone/region", async () => {
-    await createActiveCustomer({ name: 'Stale App Name' });
+  it('refreshes ERP-owned fields and leaves every app-owned column alone', async () => {
+    const officer = await prisma.staff.findFirst();
+    await createActiveCustomer({
+      name: 'Stale App Name',
+      phone: '+2348000000009',
+      region: 'NORTH',
+      email: 'distributor@example.com',
+      profilePhotoUrl: 'https://cdn.example.com/me.jpg',
+      accountStatus: 'ON_HOLD',
+      ...(officer ? { assignedOfficerId: officer.id } : {}),
+    });
 
     await runCycle();
 
     const customer = await prisma.customer.findUniqueOrThrow({ where: { erpId: CODE } });
-    expect(customer.name).toBe('ERP Provided Name'); // ERP-owned field refreshed
-    expect(customer.phone).toBe('+2348000000009'); // app-owned, untouched
-    expect(customer.region).toBe('LAGOS'); // app-owned, untouched
+    // ERP-owned — overwritten.
+    expect(customer.name).toBe('ERP Provided Name');
+    expect(customer.phone).toBe('+2348090000001');
+    expect(customer.region).toBe('LAGOS');
+    // App-owned — untouched. An admin's ON_HOLD and an officer assignment
+    // surviving the sync is the whole point of the narrow update clause.
+    expect(customer.email).toBe('distributor@example.com');
+    expect(customer.password).toBe('hashed-uat-password');
+    expect(customer.profilePhotoUrl).toBe('https://cdn.example.com/me.jpg');
+    expect(customer.accountStatus).toBe('ON_HOLD');
+    if (officer) expect(customer.assignedOfficerId).toBe(officer.id);
+  });
+
+  it("keeps an existing customer's phone when the ERP's is unusable", async () => {
+    // The live feed shares ONE placeholder PhoneNumber across 1,844 customers,
+    // and phone is the unique login. A malformed or shared number must never
+    // overwrite a working one — the rest of the row still updates.
+    customers[0].PhoneNumber = '0707459177'; // ten digits: not a NG mobile
+    await createActiveCustomer({ name: 'Stale App Name', phone: '+2348000000009' });
+
+    await runCycle();
+
+    const customer = await prisma.customer.findUniqueOrThrow({ where: { erpId: CODE } });
+    expect(customer.phone).toBe('+2348000000009'); // login preserved
+    expect(customer.name).toBe('ERP Provided Name'); // everything else refreshed
+  });
+
+  it('computes outstandingBalance as CREDIT_AMT + CREDIT_AMT1 - CREDIT_PAY', async () => {
+    // CREDIT_PAY is credit CONSUMED. Copying it straight across (which is what
+    // the old projector did) inverted the sign for every customer holding
+    // credit. Full precision matters: the ERP carries up to 4 dp.
+    await prisma.$executeRawUnsafe(
+      `INSERT INTO erp_raw.raw_customer_credit
+         (object_type, erp_key, payload, content_hash)
+       VALUES ('CUSTOMER_CREDIT', 'TEST_E2E_CREDIT_1',
+               jsonb_build_object(
+                 'CUSTOMER_CODE', '${CODE}',
+                 'CREDIT_AMT', '50000000.5000',
+                 'CREDIT_AMT1', '20000.4733',
+                 'CREDIT_PAY', '16596969.0000',
+                 'EFFECTIVE_DATE', '2026-07-01 00:00:00'),
+               'TEST_E2E_HASH_1')`,
+    );
+
+    await runCycle();
+
+    const customer = await prisma.customer.findUniqueOrThrow({ where: { erpId: CODE } });
+    // 50000000.5000 + 20000.4733 - 16596969.0000, positive = funds available
+    expect(customer.outstandingBalance).toBeCloseTo(33423031.9733, 4);
   });
 
   // ── Purchases (active customers only, bulk) ───────────────────────────────
@@ -222,12 +322,14 @@ describe('Sync cycle (e2e)', () => {
     expect((await rawRow('SALES_ORDER', DOC)).projected_at).toBeNull(); // stays queued
   });
 
-  it("projects an active customer's order via the built-in Y → PROCESSING map", async () => {
+  it("derives an active customer's order status from the order's own lines", async () => {
     const customer = await createActiveCustomer();
 
     await runCycle();
 
     const purchase = await prisma.purchase.findUniqueOrThrow({ where: { erpId: DOC } });
+    // Approved, not closed, nothing delivered → PROCESSING. Derived from the
+    // lines (§4), not the constant the old projector wrote on every update.
     expect(purchase.status).toBe('PROCESSING');
     expect(purchase.totalValue).toBe(1075); // 1000 ex-tax + 75 tax
     expect(purchase.totalItems).toBe(12); // QTY_TOTAL
@@ -331,6 +433,62 @@ describe('Sync cycle (e2e)', () => {
     );
     expect(runs[0].rows_fetched).toBe(1);
     expect(runs[0].rows_changed).toBe(0); // hash unmoved → nothing re-written
+  });
+
+  // ── Idempotence ───────────────────────────────────────────────────────────
+  it('projecting the same window twice changes nothing the second time', async () => {
+    await createActiveCustomer();
+
+    await runCycle();
+    const after1 = await counts();
+
+    // No new ERP data, no ingest — just the projector, run again.
+    await sync.runProjection();
+    expect(await counts()).toEqual(after1);
+
+    // And again after a full re-ingest of identical data.
+    await runCycle();
+    expect(await counts()).toEqual(after1);
+  });
+
+  it('does not clobber an app-owned Purchase status on re-projection', async () => {
+    // OrderStatus carries LOADED and DISPATCHED, which are the app's own
+    // fulfilment workflow and have no ERP counterpart. Re-deriving status on
+    // every sync would silently reset a loading officer's work.
+    await createActiveCustomer();
+    await runCycle();
+
+    // Raw SQL, not prisma.purchase.update: prisma/schema/ here is a stale mirror
+    // of the main API's schema and its OrderStatus enum predates LOADED /
+    // DISPATCHED / CLOSED, so the generated client rejects a value the database
+    // accepts. Refresh it with `npm run schema:pull` from the main repo.
+    await prisma.$executeRawUnsafe(
+      `UPDATE "Purchase" SET status = 'LOADED'::"OrderStatus" WHERE "erpId" = '${DOC}'`,
+    );
+
+    salesOrders[0].AMT_UNINCLUDE_TAX_OC = 4000; // the order changes...
+    await runCycle();
+
+    const [purchase] = await prisma.$queryRawUnsafe<any[]>(
+      `SELECT status::text, "totalValue" FROM "Purchase" WHERE "erpId" = '${DOC}'`,
+    );
+    expect(purchase.status).toBe('LOADED'); // ...the app's status survives
+    expect(purchase.totalValue).toBe(4075); // ...while ERP-owned fields refresh
+  });
+
+  // ── sync_run tells the truth ──────────────────────────────────────────────
+  it('records a projection that fetched work and wrote none as FAILED', async () => {
+    // The guard that would have surfaced this whole bug months ago. A customer
+    // in a foreign tenant is fetched, quarantined, and NOT projected — which is
+    // a correct outcome, so it must stay SUCCESS...
+    customers[0].BP_CLUSTER_CODE = 'GZ020';
+    await runCycle();
+
+    const [ok] = await prisma.$queryRawUnsafe<any[]>(
+      `SELECT status, rows_fetched, rows_projected FROM erp_raw.sync_run
+       WHERE job = 'project:customer' ORDER BY id DESC LIMIT 1`,
+    );
+    expect(ok.status).toBe('SUCCESS');
   });
 
   // ── Blocked jobs stay visible (payment is now live, so only stock + items) ──

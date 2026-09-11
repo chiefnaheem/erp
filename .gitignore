@@ -12,3 +12,5 @@ probe-output.json
 # pm2 logs
 logs/
 api_docs/
+# Timestamped .env backups — these hold live ERP digi-keys and the DB password.
+.env.bak-*

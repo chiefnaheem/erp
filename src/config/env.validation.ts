@@ -194,11 +194,15 @@ export class EnvVars {
   @IsOptional()
   ERP_HOST_HEADER?: string;
 
+  // The ERP team measured a single E10 query at ~60s. A 30s timeout meant we
+  // ABANDONED requests that were still executing on their side and immediately
+  // sent another — multiplying the load we were complaining about. Must stay
+  // comfortably above their real response time.
   @IsInt()
   @Min(1000)
   @IsOptional()
   @Transform(toInt)
-  ERP_TIMEOUT_MS: number = 30_000;
+  ERP_TIMEOUT_MS: number = 120_000;
 
   @IsInt()
   @Min(0)
@@ -212,7 +216,7 @@ export class EnvVars {
   @Max(1000)
   @IsOptional()
   @Transform(toInt)
-  ERP_PAGE_SIZE: number = 100;
+  ERP_PAGE_SIZE: number = 100; 
 
   // How many times to retry a single page (transient ERP/transport error) before
   // skipping it and continuing the sweep. Keeps one bad page from failing the
@@ -227,12 +231,15 @@ export class EnvVars {
   // How many ingest sweeps run at once. All 8 at once overloaded the flaky DB
   // into half-open hangs; 3 keeps each sweep likelier to complete. Set to 1 for
   // fully sequential (gentlest on the DB, slowest wall-clock).
+  // ONE object at a time. The ERP reported requests arriving every ~2s against a
+  // ~60s response time, backlogging their server. Parallel sweeps are the last
+  // thing that endpoint needs.
   @IsInt()
   @Min(1)
   @Max(8)
   @IsOptional()
   @Transform(toInt)
-  ERP_INGEST_CONCURRENCY: number = 3;
+  ERP_INGEST_CONCURRENCY: number = 1;
 
   // Ingest escalation: run every 15 min for the first ERP_INGEST_FAST_MINUTES
   // after boot (quick catch-up), then at most once per ERP_INGEST_SLOW_MINUTES
@@ -290,6 +297,97 @@ export class EnvVars {
   @IsOptional()
   @Transform(toBool)
   ERP_DEBUG_STARTUP: boolean = false;
+
+  // ── ERP politeness / incremental sync ───────────────────────────────────
+  // Pause between PAGES of a sweep. The ERP measured our requests arriving every
+  // ~2s while each of their responses takes ~60s, so pages piled up faster than
+  // they could be served. This is the single most direct control on that.
+  @IsInt()
+  @Min(0)
+  @IsOptional()
+  @Transform(toInt)
+  ERP_PAGE_DELAY_MS: number = 1500;
+
+  // Pull only rows changed since the last successful sweep, instead of every row
+  // every time. Safe to leave on before the ERP exposes the field: a sweep that
+  // is rejected for an unknown column falls back to a full sweep automatically
+  // (see IngestJob) and starts filtering by itself once the ERP deploys it.
+  @IsBoolean()
+  @IsOptional()
+  @Transform(toBool)
+  ERP_INCREMENTAL: boolean = true;
+
+  // The column the incremental filter compares against.
+  @IsString()
+  @IsOptional()
+  ERP_INCREMENTAL_FIELD: string = 'LastModifiedDate';
+
+  // Re-fetch this much overlap either side of the watermark. Covers clock skew
+  // between us (+1) and the ERP (+8 in its own headers), and rows written while
+  // a sweep was mid-flight. Cheap: overlapping rows hash-match and are skipped.
+  @IsInt()
+  @Min(0)
+  @IsOptional()
+  @Transform(toInt)
+  ERP_INCREMENTAL_OVERLAP_MINUTES: number = 30;
+
+  // How long ONE object may sweep before it pauses and lets the others run.
+  // A full sales-order sweep is 8-14 hours; without this it holds the ingest lock
+  // for that whole time and every other object is starved (customer_credit went
+  // four days without a refresh). The page cursor makes pausing free: the sweep
+  // resumes exactly where it stopped. 0 disables the limit.
+  @IsInt()
+  @Min(0)
+  @IsOptional()
+  @Transform(toInt)
+  ERP_SWEEP_MAX_MINUTES: number = 10;
+
+  // Force a full, unfiltered sweep this often regardless of the watermark.
+  // The backstop for two things an incremental filter cannot see: rows the ERP
+  // changes WITHOUT moving LastModifiedDate, and back-dated edits. 0 disables it.
+  @IsInt()
+  @Min(0)
+  @IsOptional()
+  @Transform(toInt)
+  ERP_FULL_SWEEP_DAYS: number = 7;
+
+  // After a FULL sweep, delete rows the ERP no longer returns. This is what
+  // removes records deleted in the ERP, and the ghosts left behind when the ERP
+  // edits a field that forms part of our key (customer_credit moved five
+  // customers from EFFECTIVE_DATE 0001-01-01 to 2026-09-02, and the old rows
+  // stayed behind). Never applied to incremental sweeps.
+  @IsBoolean()
+  @IsOptional()
+  @Transform(toBool)
+  ERP_RECONCILE_DELETES: boolean = true;
+
+  // Jobs that ALWAYS sweep in full instead of incrementally. Only a full sweep
+  // reconciles, so these objects can never accumulate ghost rows — which is what
+  // lets customer_credit key on CREDIT_AMT1, sometimes the only thing telling two
+  // real records apart. Keep the million-row objects OUT of this list.
+  @IsString()
+  @IsOptional()
+  ERP_FULL_SWEEP_JOBS: string =
+    'ingest:customer_credit,ingest:sales_return,ingest:ar_refund,ingest:other_receivable,ingest:customer';
+
+  // Default gap between sweeps of ONE object. Each object also gets its own
+  // schedule (ERP_INTERVAL_<OBJECT>) and a staggered start minute, so the eight
+  // never run together.
+  @IsInt()
+  @Min(1)
+  @IsOptional()
+  @Transform(toInt)
+  ERP_INGEST_INTERVAL_MINUTES: number = 60;
+
+  // Per-object overrides, in minutes. Unset = ERP_INGEST_INTERVAL_MINUTES.
+  @IsInt() @Min(1) @IsOptional() @Transform(toInt) ERP_INTERVAL_CUSTOMER?: number;
+  @IsInt() @Min(1) @IsOptional() @Transform(toInt) ERP_INTERVAL_CUSTOMER_CREDIT?: number;
+  @IsInt() @Min(1) @IsOptional() @Transform(toInt) ERP_INTERVAL_SALES_ORDER?: number;
+  @IsInt() @Min(1) @IsOptional() @Transform(toInt) ERP_INTERVAL_SALES_DELIVERY?: number;
+  @IsInt() @Min(1) @IsOptional() @Transform(toInt) ERP_INTERVAL_SALES_RETURN?: number;
+  @IsInt() @Min(1) @IsOptional() @Transform(toInt) ERP_INTERVAL_COLLECTION?: number;
+  @IsInt() @Min(1) @IsOptional() @Transform(toInt) ERP_INTERVAL_AR_REFUND?: number;
+  @IsInt() @Min(1) @IsOptional() @Transform(toInt) ERP_INTERVAL_OTHER_RECEIVABLE?: number;
 
   // Watchdog: if the database stays unreachable this many minutes, exit so the
   // process manager (pm2 / Windows service) restarts the worker with a fresh
@@ -372,9 +470,122 @@ export class EnvVars {
   // so without a fallback nearly all customers are un-creatable. Setting this
   // unblocks customer creation; accuracy can be refined via ERP_REGION_MAP later.
   //   ERP_REGION_DEFAULT=LAGOS
+  //
+  // ⚠️ SUPERSEDED. A distributor's region comes from the numeric BP_CLUSTER_CODE
+  // (see ERP_CLUSTER_REGION_MAP), not from the customer's `Region` field, which
+  // is blank on essentially every row. The projector never defaults a region:
+  // region is NOT NULL and half the portal filters on it, so a guess is a wrong
+  // answer that spreads. Kept only so an existing .env does not fail validation.
   @IsString()
   @IsOptional()
   ERP_REGION_DEFAULT?: string;
+
+  // ── Projection ───────────────────────────────────────────────────────────
+
+  // BP_CLUSTER_CODE → Region. The ERP's cluster code is both the region key AND
+  // the tenant discriminator: the same ERP serves other companies, whose
+  // customers carry codes outside this map and are quarantined rather than
+  // projected. Built-in: {"1":"LAGOS","2":"EASTERN","3":"SOUTH_SOUTH",
+  //                       "4":"WESTERN","5":"NORTH"}
+  @IsString()
+  @IsOptional()
+  ERP_CLUSTER_REGION_MAP?: string;
+
+  // Ignore the changed_at watermark and re-project the whole feed on every run.
+  //
+  // Normally unnecessary — a job with no row in erp_raw.projection_watermark
+  // full-scans by itself, so the first run after a deploy backfills without
+  // anyone asking. To force one later, prefer deleting that job's row:
+  //   DELETE FROM erp_raw.projection_watermark WHERE job = 'project:customer';
+  @IsBoolean()
+  @IsOptional()
+  @Transform(toBool)
+  ERP_PROJECT_FULL: boolean = false;
+
+  // Whether the ERP owns Customer.phone on rows that ALREADY exist. Per the
+  // field-ownership table it does, so this defaults to true. Turn it off if the
+  // ERP's phone data is worse than the app's: customers being created still get
+  // their phone from the ERP (it is NOT NULL and it is the login), but existing
+  // customers keep the number they have.
+  @IsBoolean()
+  @IsOptional()
+  @Transform(toBool)
+  ERP_CUSTOMER_PHONE_UPDATE: boolean = true;
+
+  // Create customers whose ERP PhoneNumber is unusable (blank, or — for 1,844 of
+  // the 1,851 Viju distributors — shared with everyone else) using a
+  // non-dialable 'erp:<CUSTOMER_CODE>' placeholder instead of quarantining them.
+  //
+  // The placeholder cannot collide with a real number and cannot receive an OTP,
+  // so the distributor becomes visible to admins, regional admins and account
+  // officers WITHOUT a credential anyone could log in with. A later run replaces
+  // it the moment the ERP sends a real number.
+  //
+  // OFF by default: phone is the customer login, and inventing one is a product
+  // decision, not a sync default. Turn it on to reach parity with the feed
+  // before the ERP's phone data is fixed.
+  @IsBoolean()
+  @IsOptional()
+  @Transform(toBool)
+  ERP_CUSTOMER_SYNTHETIC_PHONE: boolean = false;
+
+  // A normalised phone must match this POSIX regex to be written to
+  // Customer.phone. Default is a Nigerian mobile in E.164:
+  //   ^[+]234[789][01][0-9]{8}$
+  // phone is the login AND the OTP target, so a malformed number is worse than
+  // the one already on the record. Override only if the ERP starts carrying
+  // numbers from another country.
+  @IsString()
+  @IsOptional()
+  ERP_PHONE_PATTERN?: string;
+
+  // Statement timeout for a projection pass. Generous, because the first
+  // backfill run touches the whole customer set.
+  //
+  // ⚠️ PrismaService pins socket_timeout=120 on the connection string, so the
+  // CLIENT gives up on a single statement at ~120s regardless. Raising this
+  // past that only helps if socket_timeout is raised with it.
+  @IsInt()
+  @Min(1000)
+  @IsOptional()
+  @Transform(toInt)
+  ERP_PROJECT_STATEMENT_TIMEOUT_MS: number = 300_000;
+
+  // How long a projection transaction may stay open before Prisma aborts it.
+  @IsInt()
+  @Min(1000)
+  @IsOptional()
+  @Transform(toInt)
+  ERP_PROJECT_TX_TIMEOUT_MS: number = 600_000;
+
+  // ── Viju backend API (post-run reconcile calls) ──────────────────────────
+  //
+  // After a clean projection the worker POSTs to two endpoints that re-derive
+  // what the backend owns. Both take no body and are safe to call repeatedly:
+  //
+  //   POST /api/v1/erp/sync/account-balance
+  //   POST /api/v1/erp/sync/order-status
+  //
+  // The second one is load-bearing: this service does not write Purchase.status
+  // on update (the app's LOADED / DISPATCHED states have no ERP counterpart and
+  // would be clobbered), so the backend's reconciler is what carries an ERP
+  // status change through. Leave both unset to skip the calls entirely.
+  @IsUrl({ require_tld: false })
+  @IsOptional()
+  VIJU_API_BASE_URL?: string;
+
+  // The BACKEND's own ERP_API_KEY — the shared secret it expects in x-api-key.
+  // Deliberately NOT this app's ERP_API_KEY, which is the ERP's digi-key: two
+  // different secrets that happen to share a name across the two repos.
+  @IsString()
+  @IsOptional()
+  VIJU_API_KEY?: string;
+
+  @IsInt()
+  @Min(1000)
+  @IsOptional()
+  @Transform(toInt)
+  VIJU_API_TIMEOUT_MS: number = 30_000;
 }
 
 export function validateEnv(raw: Record<string, unknown>): EnvVars {

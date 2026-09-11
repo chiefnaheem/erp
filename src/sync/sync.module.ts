@@ -1,3 +1,4 @@
+import { HttpModule } from '@nestjs/axios';
 import { Module } from '@nestjs/common';
 import { ErpModule } from '../erp/erp.module';
 import { RawModule } from '../raw/raw.module';
@@ -20,11 +21,15 @@ import {
   PaymentProjectionJob,
   PurchaseProjectionJob,
 } from './jobs/projection.jobs';
+import { SyncController } from './sync.controller';
 import { SyncScheduler } from './sync.scheduler';
 import { SyncService } from './sync.service';
+import { VijuNotifier } from './viju.notifier';
 
 @Module({
-  imports: [ErpModule, RawModule],
+  // HttpModule backs VijuNotifier's post-run calls to the Viju backend API.
+  imports: [HttpModule, ErpModule, RawModule],
+  controllers: [SyncController],
   providers: [
     CustomerIngestJob,
     SalesOrderIngestJob,
@@ -39,6 +44,7 @@ import { SyncService } from './sync.service';
     StockProjectionJob,
     PurchaseItemProjectionJob,
     PaymentProjectionJob,
+    VijuNotifier,
     SyncService,
     SyncScheduler,
   ],

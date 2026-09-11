@@ -20,6 +20,7 @@ import {
   PurchaseProjectionJob,
 } from './jobs/projection.jobs';
 import { SyncJob } from './sync.job';
+import { VijuNotifier } from './viju.notifier';
 
 @Injectable()
 export class SyncService {
@@ -40,6 +41,7 @@ export class SyncService {
     private readonly stockProjection: StockProjectionJob,
     private readonly purchaseItemProjection: PurchaseItemProjectionJob,
     private readonly paymentProjection: PaymentProjectionJob,
+    private readonly notifier: VijuNotifier,
   ) {}
 
   /**
@@ -62,10 +64,10 @@ export class SyncService {
     label: string,
     jobs: SyncJob[],
     concurrency: number,
-  ): Promise<void> {
+  ): Promise<string[]> {
     if (!this.config.get<boolean>('SYNC_ENABLED')) {
       this.logger.warn(`SYNC_ENABLED=false — skipping ${label}`);
-      return;
+      return ['SYNC_ENABLED=false'];
     }
 
     const startedAt = Date.now();
@@ -101,6 +103,8 @@ export class SyncService {
     }/${jobs.length} ok`;
     if (failures.length) this.logger.error(`${summary}; FAILED: ${failures.join(', ')}`);
     else this.logger.log(summary);
+
+    return failures;
   }
 
   /**
@@ -110,19 +114,41 @@ export class SyncService {
   async runIngest(): Promise<void> {
     await this.runJobs(
       'ingest',
-      [
-        this.customerIngest, // builds customer_link, needed by projection
-        this.salesOrderIngest,
-        this.collectionIngest,
-        this.salesDeliveryIngest,
-        this.customerCreditIngest,
-        this.salesReturnIngest,
-        this.arRefundIngest,
-        this.otherReceivableIngest,
-      ],
-      // Bounded concurrency (default 3) so the big sweeps don't overload the DB.
-      this.config.get<number>('ERP_INGEST_CONCURRENCY') ?? 3,
+      this.ingestJobs(),
+      // Default 1: the ERP reported our requests backlogging their server, and
+      // parallel sweeps are the last thing that endpoint needs.
+      this.config.get<number>('ERP_INGEST_CONCURRENCY') ?? 1,
     );
+  }
+
+  /** Every ingest job, in dependency order (customer first — it builds the
+   *  Guid→code bridge the purchase projection needs). */
+  ingestJobs(): SyncJob[] {
+    return [
+      this.customerIngest,
+      this.salesOrderIngest,
+      this.collectionIngest,
+      this.salesDeliveryIngest,
+      this.customerCreditIngest,
+      this.salesReturnIngest,
+      this.arRefundIngest,
+      this.otherReceivableIngest,
+    ];
+  }
+
+  /**
+   * Run ONE object's sweep. This is what the per-object scheduler calls: each ERP
+   * interface now has its own cadence, and only one sweep is ever in flight, so
+   * we never present the ERP with the burst of concurrent queries it complained
+   * about.
+   */
+  async runIngestJob(name: string): Promise<void> {
+    const job = this.ingestJobs().find((j) => j.name === name);
+    if (!job) {
+      this.logger.error(`no ingest job named ${name}`);
+      return;
+    }
+    await this.runJobs(name, [job], 1);
   }
 
   /**
@@ -132,7 +158,7 @@ export class SyncService {
    * customers must exist before their orders/payments (FK).
    */
   async runProjection(): Promise<void> {
-    await this.runJobs(
+    const failures = await this.runJobs(
       'projection',
       [
         this.customerProjection, // all customers
@@ -144,5 +170,17 @@ export class SyncService {
       ],
       1, // sequential — customers must exist before their orders/payments (FK)
     );
+
+    // Tell the backend to re-derive what it owns. Deliberately AFTER the whole
+    // projection stage and only when it went clean: re-running the balance and
+    // order-status reconcilers over a half-projected feed would have them draw
+    // conclusions from data that is still mid-flight.
+    if (failures.length === 0) {
+      await this.notifier.notifySyncComplete();
+    } else {
+      this.logger.warn(
+        `skipping the backend reconcile calls — ${failures.join(', ')} failed this cycle`,
+      );
+    }
   }
 }

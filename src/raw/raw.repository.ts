@@ -92,6 +92,33 @@ export class RawRepository {
   }
 
   /**
+   * Fields the ERP adds that describe the RESPONSE, not the record.
+   *
+   * `DCMS_ROWNUM` is the row's position in the result set. It appears only when
+   * the query is ordered, and it shifts whenever anything is inserted or removed
+   * ahead of a row — so storing it makes every row look "changed" on the next
+   * sweep even when nothing about the record moved. That defeats the content-hash
+   * check this whole design rests on: a steady-state sweep rewrote all ~1M
+   * sales-order rows instead of writing nothing, which is a large part of what
+   * filled the database disk.
+   *
+   * Stripped before both hashing and storage, so the payload holds the record and
+   * nothing about how it happened to be paged.
+   */
+  private static readonly RESPONSE_ARTIFACTS = ['DCMS_ROWNUM'] as const;
+
+  static stripArtifacts(row: Record<string, unknown>): Record<string, unknown> {
+    let copy: Record<string, unknown> | null = null;
+    for (const field of RawRepository.RESPONSE_ARTIFACTS) {
+      if (field in row) {
+        copy ??= { ...row };
+        delete copy[field];
+      }
+    }
+    return copy ?? row;
+  }
+
+  /**
    * Store a sweep's worth of ERP rows into the object's own table.
    *
    * Unchanged rows have their last_seen_at bumped but are NOT marked for
@@ -108,7 +135,9 @@ export class RawRepository {
     // Keep only rows with a key, deduped by key (a multi-row ON CONFLICT cannot
     // touch the same target row twice in one statement). Last write wins.
     const keyed = new Map<string, Record<string, unknown>>();
-    for (const row of rows) {
+    for (const incoming of rows) {
+      // Drop response-only fields BEFORE keying/hashing (see stripArtifacts).
+      const row = RawRepository.stripArtifacts(incoming);
       const key = keyOf(row);
       if (!key) {
         this.logger.warn(
@@ -212,6 +241,178 @@ export class RawRepository {
         ON CONFLICT (job) DO UPDATE SET cursor_value = ${String(page)}, updated_at = now()
       `,
       `setIngestPage(${job})`,
+    );
+  }
+
+  /**
+   * Incremental watermark — stored as the ERP's OWN timestamp text, verbatim.
+   *
+   * ⚠️ Deliberately a string, not a Date. An earlier version stamped our own
+   * clock (UTC) and compared it against the ERP's LastModifiedDate, which is in
+   * the ERP's local time. Whenever our clock ran ahead of theirs, the filter
+   * asked for "changes since a moment that has not happened yet on their side"
+   * and quietly returned nothing — updates would be missed permanently, with no
+   * error anywhere. Keeping the ERP's own value means the comparison happens
+   * entirely in the ERP's clock space and no conversion can go wrong.
+   *
+   * Returns null when the job has never completed a sweep, which forces a full
+   * one — exactly what we want on a first run.
+   */
+  async getWatermark(job: string): Promise<string | null> {
+    const rows = await this.withRetry(
+      () => this.prisma.$queryRaw<{ cursor_value: string | null }[]>`
+        SELECT cursor_value FROM erp_raw.sync_cursor WHERE job = ${'watermark:' + job}
+      `,
+      `getWatermark(${job})`,
+    );
+    return rows[0]?.cursor_value ?? null;
+  }
+
+  /**
+   * Record the watermark. Call ONLY after a sweep finished without gaps, and pass
+   * the HIGHEST LastModifiedDate actually seen in the data — not the clock time.
+   */
+  async setWatermark(job: string, erpTimestamp: string): Promise<void> {
+    await this.withRetry(
+      () => this.prisma.$executeRaw`
+        INSERT INTO erp_raw.sync_cursor (job, cursor_value, updated_at)
+        VALUES (${'watermark:' + job}, ${erpTimestamp}, now())
+        ON CONFLICT (job) DO UPDATE SET cursor_value = ${erpTimestamp}, updated_at = now()
+      `,
+      `setWatermark(${job})`,
+    );
+  }
+
+  /** When the watermark was last moved — used to force a periodic full re-sweep. */
+  async watermarkUpdatedAt(job: string): Promise<Date | null> {
+    const rows = await this.withRetry(
+      () => this.prisma.$queryRaw<{ updated_at: Date }[]>`
+        SELECT updated_at FROM erp_raw.sync_cursor WHERE job = ${'watermark:full:' + job}
+      `,
+      `watermarkUpdatedAt(${job})`,
+    );
+    return rows[0]?.updated_at ?? null;
+  }
+
+  /** Stamp when this job last completed a FULL (unfiltered) sweep. */
+  async markFullSweep(job: string): Promise<void> {
+    await this.withRetry(
+      () => this.prisma.$executeRaw`
+        INSERT INTO erp_raw.sync_cursor (job, cursor_value, updated_at)
+        VALUES (${'watermark:full:' + job}, ${new Date().toISOString()}, now())
+        ON CONFLICT (job) DO UPDATE SET cursor_value = ${new Date().toISOString()}, updated_at = now()
+      `,
+      `markFullSweep(${job})`,
+    );
+  }
+
+  // ─── Full-sweep reconciliation ───────────────────────────────────────────
+  // A raw row is keyed on the ERP's identifier, but for some objects that
+  // identifier is not stable: customer_credit's key includes EFFECTIVE_DATE, and
+  // when the ERP edits that field in place the record arrives as a NEW row while
+  // the old one stays behind forever. No stable key exists for that view, so a
+  // full sweep instead records what it saw and deletes what it did not.
+
+  /**
+   * Drop key sets abandoned by earlier sweeps of this object.
+   *
+   * A sweep that is killed mid-flight (pm2 restart, watchdog exit, crash) never
+   * reaches its cleanup, and its keys would sit here forever — growing without
+   * bound and, worse, mixing into nothing useful. Clearing at the START of a
+   * sweep is the reliable moment: it needs no shutdown hook to fire.
+   */
+  async clearStaleSeen(objectType: ErpObjectType, keepSweepId: string): Promise<void> {
+    await this.withRetry(
+      () => this.prisma.$executeRaw`
+        DELETE FROM erp_raw.sweep_seen
+        WHERE object_type = ${objectType} AND sweep_id <> ${keepSweepId}
+      `,
+      `clearStaleSeen(${objectType})`,
+    );
+  }
+
+  /** Remember the keys returned by one page of a full sweep. */
+  async recordSeen(objectType: ErpObjectType, sweepId: string, keys: string[]): Promise<void> {
+    if (keys.length === 0) return;
+    const t = this.table(objectType); // validates the object type
+    void t;
+    for (let i = 0; i < keys.length; i += CHUNK) {
+      const chunk = keys.slice(i, i + CHUNK);
+      const params: unknown[] = [sweepId, objectType];
+      const values = chunk.map((_, n) => `($1, $2, $${n + 3})`).join(', ');
+      params.push(...chunk);
+      await this.withRetry(
+        () =>
+          this.prisma.$executeRawUnsafe(
+            `INSERT INTO erp_raw.sweep_seen (sweep_id, object_type, erp_key)
+             VALUES ${values} ON CONFLICT DO NOTHING`,
+            ...params,
+          ),
+        `recordSeen(${objectType})`,
+      );
+    }
+  }
+
+  /** How many keys a sweep has recorded so far — the safety check before deleting. */
+  async seenCount(sweepId: string): Promise<number> {
+    const rows = await this.withRetry(
+      () => this.prisma.$queryRaw<{ n: bigint }[]>`
+        SELECT count(*) AS n FROM erp_raw.sweep_seen WHERE sweep_id = ${sweepId}
+      `,
+      'seenCount',
+    );
+    return Number(rows[0]?.n ?? 0);
+  }
+
+  /**
+   * Delete rows the completed full sweep never returned — ERP deletions, and the
+   * ghosts left behind when a record's key fields were edited.
+   *
+   * ⚠️ Only ever call this after a sweep that ran to the END. A paused or failed
+   * sweep has an incomplete key set, and deleting against it would wipe the
+   * object. The caller enforces that; the count check here is the second line of
+   * defence.
+   */
+  async deleteUnseen(objectType: ErpObjectType, sweepId: string): Promise<number> {
+    const t = this.table(objectType);
+    const deleted = await this.withRetry(
+      () =>
+        this.prisma.$executeRawUnsafe(
+          `DELETE FROM erp_raw.${t} r
+           WHERE NOT EXISTS (
+             SELECT 1 FROM erp_raw.sweep_seen s
+             WHERE s.sweep_id = $1 AND s.erp_key = r.erp_key
+           )`,
+          sweepId,
+        ),
+      `deleteUnseen(${objectType})`,
+    );
+    return deleted;
+  }
+
+  /** Drop a sweep's recorded keys — always, whether it completed or not. */
+  async clearSeen(sweepId: string): Promise<void> {
+    await this.withRetry(
+      () => this.prisma.$executeRaw`DELETE FROM erp_raw.sweep_seen WHERE sweep_id = ${sweepId}`,
+      'clearSeen',
+    );
+  }
+
+  /** Rows currently held for an object — used to sanity-check a reconciliation. */
+  async rowCount(objectType: ErpObjectType): Promise<number> {
+    const t = this.table(objectType);
+    const rows = await this.withRetry(
+      () => this.prisma.$queryRawUnsafe<{ n: bigint }[]>(`SELECT count(*) AS n FROM erp_raw.${t}`),
+      `rowCount(${objectType})`,
+    );
+    return Number(rows[0]?.n ?? 0);
+  }
+
+  /** Forget the watermark, forcing the next sweep to be a full one. */
+  async clearWatermark(job: string): Promise<void> {
+    await this.withRetry(
+      () => this.prisma.$executeRaw`DELETE FROM erp_raw.sync_cursor WHERE job = ${'watermark:' + job}`,
+      `clearWatermark(${job})`,
     );
   }
 
