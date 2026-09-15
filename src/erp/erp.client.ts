@@ -52,6 +52,7 @@ const OBJECT_KEY_ALIAS: Record<string, string> = {
   collection_doc: 'COLLECTION',
   ar_refund_doc: 'AR_REFUND',
   other_receivable_doc: 'OTHER_RECEIVABLE',
+  ar_transfer_doc: 'AR_TRANSFER',
 };
 
 @Injectable()

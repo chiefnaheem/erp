@@ -55,7 +55,7 @@ export class EnvVars {
   // .query (which is all the sync does); add the _QUERY / _READ variants only
   // where the ERP actually issued separate keys. Objects: CUSTOMER,
   // CUSTOMER_CREDIT, SALES_ORDER, SALES_DELIVERY,
-  // SALES_RETURN, COLLECTION, AR_REFUND, OTHER_RECEIVABLE.
+  // SALES_RETURN, COLLECTION, AR_REFUND, AR_TRANSFER, OTHER_RECEIVABLE.
   @IsString()
   @IsOptional()
   ERP_API_KEY_CUSTOMER?: string;
@@ -139,6 +139,18 @@ export class EnvVars {
   @IsString()
   @IsOptional()
   ERP_API_KEY_AR_REFUND_READ?: string;
+
+  @IsString()
+  @IsOptional()
+  ERP_API_KEY_AR_TRANSFER?: string;
+
+  @IsString()
+  @IsOptional()
+  ERP_API_KEY_AR_TRANSFER_QUERY?: string;
+
+  @IsString()
+  @IsOptional()
+  ERP_API_KEY_AR_TRANSFER_READ?: string;
 
   @IsString()
   @IsOptional()
@@ -368,7 +380,7 @@ export class EnvVars {
   @IsString()
   @IsOptional()
   ERP_FULL_SWEEP_JOBS: string =
-    'ingest:customer_credit,ingest:sales_return,ingest:ar_refund,ingest:other_receivable,ingest:customer';
+    'ingest:customer_credit,ingest:sales_return,ingest:ar_refund,ingest:other_receivable,ingest:ar_transfer,ingest:customer';
 
   // Default gap between sweeps of ONE object. Each object also gets its own
   // schedule (ERP_INTERVAL_<OBJECT>) and a staggered start minute, so the eight
@@ -388,6 +400,7 @@ export class EnvVars {
   @IsInt() @Min(1) @IsOptional() @Transform(toInt) ERP_INTERVAL_COLLECTION?: number;
   @IsInt() @Min(1) @IsOptional() @Transform(toInt) ERP_INTERVAL_AR_REFUND?: number;
   @IsInt() @Min(1) @IsOptional() @Transform(toInt) ERP_INTERVAL_OTHER_RECEIVABLE?: number;
+  @IsInt() @Min(1) @IsOptional() @Transform(toInt) ERP_INTERVAL_AR_TRANSFER?: number;
 
   // Watchdog: if the database stays unreachable this many minutes, exit so the
   // process manager (pm2 / Windows service) restarts the worker with a fresh

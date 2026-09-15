@@ -612,6 +612,18 @@ export class ArRefundIngestJob extends IngestJob {
 }
 
 @Injectable()
+export class ArTransferIngestJob extends IngestJob {
+  readonly name = 'ingest:ar_transfer';
+  protected readonly method = ERP_METHOD.AR_TRANSFER_QUERY;
+  protected readonly objectType: ErpObjectType = 'AR_TRANSFER';
+
+  /** Header-only object: DOC_NO is unique across the feed (4,440 of 4,440). */
+  protected keyOf(row: Record<string, unknown>) {
+    return row.DOC_NO as string | undefined;
+  }
+}
+
+@Injectable()
 export class OtherReceivableIngestJob extends IngestJob {
   readonly name = 'ingest:other_receivable';
   protected readonly method = ERP_METHOD.OTHER_RECEIVABLE_QUERY;

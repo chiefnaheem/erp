@@ -8,6 +8,7 @@ import {
 } from './jobs/blocked.jobs';
 import {
   ArRefundIngestJob,
+  ArTransferIngestJob,
   CollectionIngestJob,
   CustomerCreditIngestJob,
   CustomerIngestJob,
@@ -38,6 +39,7 @@ import { VijuNotifier } from './viju.notifier';
     CustomerCreditIngestJob,
     SalesReturnIngestJob,
     ArRefundIngestJob,
+    ArTransferIngestJob,
     OtherReceivableIngestJob,
     CustomerProjectionJob,
     PurchaseProjectionJob,

@@ -151,3 +151,38 @@ describe('line-level keys after the 2026-09-07 subtable update', () => {
     });
   });
 });
+
+/**
+ * AR_TRANSFER_DOC (应收转销单), added 2026-09-15. Header-only object — the ERP
+ * returns no subtable, so DOC_NO is unique across the whole feed (verified live:
+ * 4,440 rows, 4,440 distinct DOC_NO).
+ */
+describe('ar_transfer keys', () => {
+  const { ArTransferIngestJob } = require('./jobs/ingest.jobs');
+  const job = new ArTransferIngestJob({} as never, {} as never, {} as never);
+  const keyOf = (row: Record<string, unknown>) => (job as any).keyOf(row);
+
+  it('keys on the document number', () => {
+    expect(keyOf({ DOC_NO: '6701-202608050002', CUSTOMER_CODE: '10110015' })).toBe(
+      '6701-202608050002',
+    );
+  });
+
+  it('keeps the same key when the document is edited, so it updates', () => {
+    const before = { DOC_NO: '6701-202608050002', TRANSFER_AMT_TC: 504000 };
+    const after = { ...before, TRANSFER_AMT_TC: 999 };
+    expect(keyOf(before)).toBe(keyOf(after));
+  });
+
+  it('is not confused by the two customers the document carries', () => {
+    // CUSTOMER_CODE is the IN side, CUSTOMER_CODE1 the OUT side; neither is part
+    // of the identity.
+    const a = { DOC_NO: 'X', CUSTOMER_CODE: '111', CUSTOMER_CODE1: '222' };
+    const b = { DOC_NO: 'X', CUSTOMER_CODE: '999', CUSTOMER_CODE1: '888' };
+    expect(keyOf(a)).toBe(keyOf(b));
+  });
+
+  it('returns undefined without a document number', () => {
+    expect(keyOf({ CUSTOMER_CODE: '111' })).toBeUndefined();
+  });
+});

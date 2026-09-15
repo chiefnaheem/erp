@@ -11,7 +11,8 @@ export type ErpObjectType =
   | 'SALES_RETURN'
   | 'COLLECTION'
   | 'AR_REFUND'
-  | 'OTHER_RECEIVABLE';
+  | 'OTHER_RECEIVABLE'
+  | 'AR_TRANSFER';
 
 /**
  * Each ERP object is dumped into its OWN table under erp_raw, so every
@@ -30,6 +31,7 @@ const RAW_TABLE: Record<ErpObjectType, string> = {
   COLLECTION: 'raw_collection',
   AR_REFUND: 'raw_ar_refund',
   OTHER_RECEIVABLE: 'raw_other_receivable',
+  AR_TRANSFER: 'raw_ar_transfer',
 };
 
 export interface RawUpsertResult {

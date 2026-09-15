@@ -37,9 +37,9 @@ describe('ErpDebugProbe', () => {
     expect(query).not.toHaveBeenCalled();
   });
 
-  // All EIGHT ingested query endpoints are probed, so one restart shows a sample
+  // All NINE ingested query endpoints are probed, so one restart shows a sample
   // row for every erp_raw table the sync writes.
-  it('calls all 8 query endpoints and logs a per-endpoint result', async () => {
+  it('calls all 9 query endpoints and logs a per-endpoint result', async () => {
     const probe = await build({ ERP_DEBUG_STARTUP: true, ERP_BASE_URL: 'http://erp/api' });
     query.mockResolvedValue({
       execution: { code: '0' },
@@ -49,13 +49,13 @@ describe('ErpDebugProbe', () => {
 
     await probe.onApplicationBootstrap();
 
-    expect(query).toHaveBeenCalledTimes(8);
+    expect(query).toHaveBeenCalledTimes(9);
     const out = logged(logSpy);
     expect(out).toMatch(/yvijucrm\.customer\.query/);
     expect(out).toMatch(/customer_credit/);
     expect(out).toMatch(/sales_return/);
     expect(out).toMatch(/ar_refund/);
-    expect(out).toMatch(/8\/8 endpoints OK/);
+    expect(out).toMatch(/9\/9 endpoints OK/);
   });
 
   it('requests exactly one row per endpoint, and asks for the total', async () => {
@@ -108,7 +108,7 @@ describe('ErpDebugProbe', () => {
   it('keeps going when one endpoint fails, and logs the failure detail', async () => {
     const probe = await build({ ERP_DEBUG_STARTUP: true, ERP_BASE_URL: 'http://erp/api' });
     query.mockImplementation((method: string) => {
-      // Matches customer_credit — one of the eight.
+      // Matches customer_credit — one of the nine.
       if (method.includes('customer_credit')) {
         return Promise.reject(
           new ErpProtocolError(method, '<html>Unauthorized</html>', 200),
@@ -119,9 +119,9 @@ describe('ErpDebugProbe', () => {
 
     await probe.onApplicationBootstrap();
 
-    expect(query).toHaveBeenCalledTimes(8); // did not stop at the failure
+    expect(query).toHaveBeenCalledTimes(9); // did not stop at the failure
     expect(logged(errorSpy)).toMatch(/customer_credit: FAILED/);
     expect(logged(errorSpy)).toMatch(/Unauthorized/);
-    expect(logged(logSpy)).toMatch(/7\/8 endpoints OK/);
+    expect(logged(logSpy)).toMatch(/8\/9 endpoints OK/);
   });
 });

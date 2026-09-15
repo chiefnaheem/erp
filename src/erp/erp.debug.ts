@@ -22,6 +22,7 @@ const ENDPOINTS: {
   { label: 'collection', method: ERP_METHOD.COLLECTION_QUERY, table: 'raw_collection', keyField: 'DOC_NO' },
   { label: 'ar_refund', method: ERP_METHOD.AR_REFUND_QUERY, table: 'raw_ar_refund', keyField: 'DOC_NO' },
   { label: 'other_receivable', method: ERP_METHOD.OTHER_RECEIVABLE_QUERY, table: 'raw_other_receivable', keyField: 'DOC_NO' },
+  { label: 'ar_transfer', method: ERP_METHOD.AR_TRANSFER_QUERY, table: 'raw_ar_transfer', keyField: 'DOC_NO' },
 ];
 
 /**

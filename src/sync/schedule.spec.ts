@@ -23,7 +23,7 @@ describe('SyncScheduler per-object schedule', () => {
   afterEach(() => jest.restoreAllMocks());
 
   it('treats every object as due on a fresh process, so nothing is missed', () => {
-    expect(scheduler.dueJobs()).toHaveLength(8);
+    expect(scheduler.dueJobs()).toHaveLength(9);
   });
 
   it('gives each object its own start minute, so two never begin together', () => {

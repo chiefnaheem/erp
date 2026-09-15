@@ -6,6 +6,7 @@ import {
 } from './jobs/blocked.jobs';
 import {
   ArRefundIngestJob,
+  ArTransferIngestJob,
   CollectionIngestJob,
   CustomerCreditIngestJob,
   CustomerIngestJob,
@@ -35,6 +36,7 @@ export class SyncService {
     private readonly customerCreditIngest: CustomerCreditIngestJob,
     private readonly salesReturnIngest: SalesReturnIngestJob,
     private readonly arRefundIngest: ArRefundIngestJob,
+    private readonly arTransferIngest: ArTransferIngestJob,
     private readonly otherReceivableIngest: OtherReceivableIngestJob,
     private readonly customerProjection: CustomerProjectionJob,
     private readonly purchaseProjection: PurchaseProjectionJob,
@@ -133,6 +135,7 @@ export class SyncService {
       this.salesReturnIngest,
       this.arRefundIngest,
       this.otherReceivableIngest,
+      this.arTransferIngest,
     ];
   }
 

@@ -104,6 +104,7 @@ export class SyncScheduler implements OnApplicationBootstrap {
     { job: 'ingest:sales_return', configKey: 'ERP_INTERVAL_SALES_RETURN', offsetMinutes: 35 },
     { job: 'ingest:ar_refund', configKey: 'ERP_INTERVAL_AR_REFUND', offsetMinutes: 42 },
     { job: 'ingest:other_receivable', configKey: 'ERP_INTERVAL_OTHER_RECEIVABLE', offsetMinutes: 49 },
+    { job: 'ingest:ar_transfer', configKey: 'ERP_INTERVAL_AR_TRANSFER', offsetMinutes: 56 },
   ];
 
   /** When each object last STARTED a sweep, so intervals are measured from a run

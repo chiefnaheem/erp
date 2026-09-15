@@ -21,6 +21,8 @@ export const ERP_METHOD = {
   COLLECTION_READ: 'yvijucrm.collection_doc.read',
   AR_REFUND_QUERY: 'yvijucrm.ar_refund_doc.query',
   AR_REFUND_READ: 'yvijucrm.ar_refund_doc.read',
+  AR_TRANSFER_QUERY: 'yvijucrm.ar_transfer_doc.query',
+  AR_TRANSFER_READ: 'yvijucrm.ar_transfer_doc.read',
   OTHER_RECEIVABLE_QUERY: 'yvijucrm.other_receivable_doc.query',
   OTHER_RECEIVABLE_READ: 'yvijucrm.other_receivable_doc.read',
 } as const;
@@ -36,6 +38,7 @@ export const ERP_QUERY_METHODS: ErpMethod[] = [
   ERP_METHOD.COLLECTION_QUERY,
   ERP_METHOD.AR_REFUND_QUERY,
   ERP_METHOD.OTHER_RECEIVABLE_QUERY,
+  ERP_METHOD.AR_TRANSFER_QUERY,
   ERP_METHOD.CUSTOMER_QUERY,
 ];
 
@@ -65,6 +68,7 @@ export const READ_KEY_FIELDS: Record<string, readonly string[]> = {
   [ERP_METHOD.COLLECTION_READ]: [...ORG_KEY_FIELDS, 'DOC_NO'],
   [ERP_METHOD.AR_REFUND_READ]: [...ORG_KEY_FIELDS, 'DOC_NO'],
   [ERP_METHOD.OTHER_RECEIVABLE_READ]: [...ORG_KEY_FIELDS, 'DOC_NO'],
+  [ERP_METHOD.AR_TRANSFER_READ]: [...ORG_KEY_FIELDS, 'DOC_NO'],
   [ERP_METHOD.CUSTOMER_CREDIT_READ]: [
     ...ORG_KEY_FIELDS,
     'CREDIT_AREA_ID_CREDIT_AREA_CODE',
@@ -253,6 +257,39 @@ export interface ErpCustomerCreditLineRow {
  * documented field list — DOC_ID is the document TYPE, not the row's identity —
  * which is why the raw store keys these rows on DOC_NO.
  */
+/**
+ * AR_TRANSFER_DOC (应收转销单) — a receivable written off against another party.
+ *
+ * Header-only: the ERP returns no subtable, and DOC_NO is unique across the feed
+ * (4,440 rows, 4,440 distinct DOC_NO), so that is the raw key.
+ *
+ * ⚠️ It carries TWO customers. CUSTOMER_CODE/_NAME are the IN side (documented
+ * "IN") and CUSTOMER_CODE1/_NAME1 the OUT side — the receivable moves from one to
+ * the other. Anything that attributes these documents to a customer has to say
+ * which side it means.
+ */
+export interface ErpArTransferRow {
+  DOC_NO: string; // the raw key
+  DOC_ID?: string; // document type
+  DOC_DATE?: string;
+  BOOKKEEPING_DATE?: string;
+  CreateDate?: string;
+  LastModifiedDate?: string; // drives the incremental filter
+  ApproveDate?: string;
+  ApproveStatus?: string;
+  CUSTOMER_CODE?: string; // IN side
+  CUSTOMER_NAME?: string;
+  CUSTOMER_CODE1?: string; // OUT side
+  CUSTOMER_NAME1?: string;
+  CURRENCY_ID?: string;
+  EXCHANGE_RATE?: string | number;
+  TRANSFER_AMT_TC?: string | number; // original currency
+  TRANSFER_AMT_FC?: string | number; // base currency
+  RECEIVABLES_TYPE?: number;
+  REMARK?: string;
+  [key: string]: unknown;
+}
+
 export interface ErpCollectionRow {
   DOC_NO: string; // → our Payment.erpId, and the raw key
   DOC_ID?: string; // document type (Guid), not a row identifier
