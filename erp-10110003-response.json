@@ -1,0 +1,61 @@
+{
+  "fetched_at_utc": "2026-09-11 09:41:38",
+  "customer_code": "10110003",
+  "endpoint_base": "http://192.168.25.241:9990/CROSS/RESTful",
+  "account": "CRM",
+  "yvijucrm.customer.query": [
+    {
+      "CreateDate": "2016-02-27 04:15:12",
+      "LastModifiedDate": "2026-08-28 16:35:03",
+      "ApproveDate": "2026-08-28 16:35:03",
+      "ApproveStatus": "Y",
+      "CUSTOMER_CODE": "10110003",
+      "CUSTOMER_FULL_NAME": "ADLAK",
+      "CUSTOMER_ID": "70c2cc8c-58fb-4ce3-ed73-121d2a4b0333",
+      "CUSTOMER_NAME": "ADLAK",
+      "GENERAL_CURRENCY_ID": "80a26f72-4823-42e4-1bad-121354ea66b3",
+      "Owner_Dept": "00000000-0000-0000-0000-000000000000",
+      "Owner_Emp": "00000000-0000-0000-0000-000000000000",
+      "PhoneNumber": "08168584112",
+      "Region": "南部",
+      "BP_CLUSTER_CODE": "1",
+      "BP_CLUSTER_NAME": "LAGOS区",
+      "sys_MainId": "70c2cc8c-58fb-4ce3-ed73-121d2a4b0333"
+    }
+  ],
+  "yvijucrm.customer_credit.query": [
+    {
+      "CreateDate": "2016-03-29 16:29:42",
+      "LastModifiedDate": "2026-09-06 00:07:31",
+      "ApproveStatus": "Y",
+      "ApproveDate": "2016-03-29 17:08:23",
+      "CUSTOMER_CREDIT_ID": "bbb3cf9a-7dab-44e7-c23f-1235ed0005aa",
+      "COMPANY_CODE": "V01",
+      "COMPANY_NAME": "唯久工业（尼日利亚）有限公司",
+      "CUSTOMER_CODE": "10110003",
+      "CUSTOMER_NAME": "ADLAK",
+      "CURRENCY_ID": "80a26f72-4823-42e4-1bad-121354ea66b3",
+      "CREDIT_AMT": 0,
+      "CREDIT_PAY": -10115600.1232,
+      "OVERFLOW_AMT": 0,
+      "OVERFLOW_RATE": 0,
+      "ALARM_LINE": 0,
+      "REMARK": "1",
+      "CREDIT_AMT1": 10000.2345,
+      "EFFECTIVE_DATE": "2026-08-31 00:00:00",
+      "INEFFECTIVE_DATE": "2026-09-05 00:00:00",
+      "FUND_DESC": "ces",
+      "REMARK1": "",
+      "CREDIT_RULE_CODE": "01",
+      "CREDIT_RULE_NAME": "唯久信用管控",
+      "ADV_RATE": 1,
+      "AR_RATE": 1,
+      "BR_RATE": 0,
+      "CO_RATE": 0,
+      "SD_RATE": 1,
+      "SO_RATE": 1,
+      "sys_MainId": "bbb3cf9a-7dab-44e7-c23f-1235ed0005aa"
+    }
+  ],
+  "note": "Returned verbatim by the ERP. DCMS_ROWNUM (a result-set position, not data) removed."
+}
