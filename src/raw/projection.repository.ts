@@ -187,6 +187,7 @@ export class ProjectionRepository {
     statementTimeoutMs: number,
     txTimeoutMs: number,
     work: (tx: TxClient, wm: Date | null) => Promise<ProjectionResult>,
+    workMemMb = 64,
   ): Promise<ProjectionResult> {
     const watermark = await this.getWatermark(job);
     const lockKey = LOCK_KEY[job];
@@ -211,6 +212,28 @@ export class ProjectionRepository {
             await tx.$executeRawUnsafe(
               `SET LOCAL statement_timeout = ${Math.floor(statementTimeoutMs)}`,
             );
+
+            // Do the sorting and hashing in MEMORY, not in temp files.
+            //
+            // The server's work_mem is 4MB, so every aggregate of any size spills
+            // to disk — and on 2026-09-16 the disk was full, which is a hard
+            // failure (53100) rather than a slow one. Each run's working set is
+            // capped (ERP_PROJECT_MAX_ROWS_PER_RUN), so a session-local work_mem
+            // holds it comfortably and the projection stops depending on free
+            // disk at all. SET LOCAL, so it dies with the transaction and does
+            // not change the setting for anything else on the server.
+            await tx.$executeRawUnsafe(
+              `SET LOCAL work_mem = '${Math.floor(workMemMb)}MB'`,
+            );
+
+            // Tell the planner the storage is an SSD.
+            //
+            // The default random_page_cost of 4 describes a spinning disk, and on
+            // this data it is the difference between an index scan and a full
+            // read of a 3GB table. Measured on the purchase job's line pass:
+            // 48.6s with the default, 2.0s with this — same rows, same result.
+            // SET LOCAL, so it applies to this transaction only.
+            await tx.$executeRawUnsafe(`SET LOCAL random_page_cost = 1.1`);
 
             return work(tx as unknown as TxClient, watermark);
           },
@@ -711,6 +734,8 @@ export class ProjectionRepository {
     eligibleApproveStatuses: string[];
     statementTimeoutMs: number;
     txTimeoutMs: number;
+    /** Raw rows one run may scan. See the cap note inside. */
+    maxRowsPerRun: number;
   }): Promise<ProjectionResult> {
     const JOB = 'project:purchase';
     const eligible = opts.eligibleApproveStatuses.map(lit).join(', ');
@@ -724,47 +749,139 @@ export class ProjectionRepository {
         const notes: string[] = [];
         const sel = this.selector('r', wm, opts.full);
 
-        // Every DOC_NO with at least one moved line.
+        // ── The slice this run takes ────────────────────────────────────
+        //
+        // A run reads the NEXT SLICE of the feed by id, not the whole selector.
+        //
+        // Why a slice at all: the selector re-reads every row with projected_at
+        // IS NULL, and 1.94M of the 1.99M sales-order rows are permanently in
+        // that state — their distributor has not onboarded, so they are left
+        // queued on purpose. Unbounded, one run therefore hashed and sorted the
+        // entire table every three minutes. Measured on 2026-09-16: 890 GB of
+        // temp files in twenty hours, the server's disk full, and this job
+        // failing with 53100 for nine days straight.
+        //
+        // Why by id and not by a "retry later" stamp on the row: a raw row is a
+        // ~1.5KB JSONB payload and Postgres rewrites the whole row to change one
+        // field, so stamping the backlog would have written ~3GB — on the disk
+        // that had just run out. The cursor writes ONE row per run and gives the
+        // same guarantee: the next run starts where this one stopped.
+        //
+        // Reaching the end wraps the cursor back to 0, and only THAT run may
+        // advance the watermark — it is the one that has seen the whole feed.
+        const maxRows = Math.max(1_000, opts.maxRowsPerRun);
+        const cursor = await this.scanCursor(tx, JOB);
+
+        await tx.$executeRawUnsafe(`
+          CREATE TEMP TABLE erp_proj_slice ON COMMIT DROP AS
+          SELECT r.id, r.payload->>'DOC_NO' AS doc_no_raw
+          FROM erp_raw.raw_sales_order r
+          WHERE ${sel}
+            AND r.id > ${cursor}
+            AND NULLIF(btrim(coalesce(r.payload->>'DOC_NO', '')), '') IS NOT NULL
+          ORDER BY r.id
+          LIMIT ${maxRows}
+        `);
+
+        const edge = await tx.$queryRawUnsafe<{ n: bigint; max_id: bigint | null }[]>(
+          `SELECT count(*)::bigint AS n, max(id)::bigint AS max_id FROM erp_proj_slice`,
+        );
+        const sliceRows = Number(edge[0]?.n ?? 0);
+        const truncated = sliceRows >= maxRows;
+        await this.setScanCursor(
+          tx,
+          JOB,
+          truncated ? Number(edge[0]?.max_id ?? 0) : 0,
+        );
+
+        // Distinct documents in the slice. A document whose lines straddle the
+        // slice boundary is still aggregated in FULL, because the line pass below
+        // re-reads every line of each document named here.
         await tx.$executeRawUnsafe(`
           CREATE TEMP TABLE erp_proj_doc ON COMMIT DROP AS
-          SELECT DISTINCT NULLIF(btrim(r.payload->>'DOC_NO'), '') AS doc_no
-          FROM erp_raw.raw_sales_order r
-          WHERE ${sel} AND NULLIF(btrim(coalesce(r.payload->>'DOC_NO', '')), '') IS NOT NULL
+          SELECT DISTINCT doc_no_raw FROM erp_proj_slice
         `);
         await tx.$executeRawUnsafe(
-          `CREATE INDEX ON erp_proj_doc (doc_no)`,
+          `CREATE INDEX ON erp_proj_doc (doc_no_raw)`,
         );
+        // A temp table carries no statistics of its own, and every join below
+        // drives off this one. Without this the planner sizes it by a hardcoded
+        // guess and picks the wrong join shape for it.
+        await tx.$executeRawUnsafe(`ANALYZE erp_proj_doc`);
+
+        // Every LINE of those orders, flattened to SCALARS — never the payload.
+        //
+        // ⚠️ This table must not carry `payload`. It used to: `lines` was a CTE
+        // selecting r.payload, read twice (by `agg` and by `hdr`). Postgres 10
+        // ALWAYS materialises a CTE, so each run wrote every selected row's full
+        // JSONB to a temp file and then sorted it again for the DISTINCT ON.
+        //
+        // That is fine while the selected set is small. It is not fine here,
+        // because `sel` re-selects every row with projected_at IS NULL — and
+        // 1.94M of the 1.99M sales-order rows are permanently in that state
+        // (their customer has not onboarded, so they are deliberately left
+        // queued). So a 3 GB table was materialised and re-sorted every three
+        // minutes: 890 GB of temp files in twenty hours, which filled the
+        // server's disk and made the job fail with 53100 for nine days straight.
+        //
+        // Extracting the eleven scalars we actually use drops the same row set
+        // from ~3 GB to ~200 MB. This is exactly the shape projectPayments has
+        // always used, which is why that job never hit the wall.
+        await tx.$executeRawUnsafe(`
+          CREATE TEMP TABLE erp_proj_line ON COMMIT DROP AS
+          SELECT
+            btrim(d.doc_no_raw) AS doc_no,
+            r.id,
+            r.changed_at,
+            btrim(coalesce(r.payload->>'ApproveStatus', '')) AS approve_status,
+            btrim(coalesce(r.payload->>'CLOSE', ''))         AS close_status,
+            ${num("r.payload->>'BUSINESS_QTY'")}             AS qty_ordered,
+            ${num("r.payload->>'DELIVERED_BUSINESS_QTY'")}   AS qty_delivered,
+            r.payload->>'CUSTOMER_ID'                        AS customer_guid,
+            ${ts("r.payload->>'ORDER_DATE'")}                AS order_date,
+            (${num("r.payload->>'QTY_TOTAL'")})::int         AS total_items,
+            (${num("r.payload->>'AMT_UNINCLUDE_TAX_OC'")}
+           + ${num("r.payload->>'TAX_OC'")})::double precision AS total_value
+          FROM erp_raw.raw_sales_order r
+          -- ⚠️ JOIN ON THE UNTRIMMED VALUE. raw_sales_order_doc_no_idx is on
+          -- (payload->>'DOC_NO') with no btrim around it, so joining on
+          -- btrim(...) cannot use it — and the planner's answer to that was a
+          -- MERGE JOIN, which sorts all 1.99M rows at full width, payload and
+          -- all: a ~2.5GB spill every run. That is where the 890 GB of temp
+          -- files came from, and with it the server's disk. Matching the index's
+          -- exact expression makes this an index lookup per document instead.
+          -- Both sides read the same column, so the raw values compare exactly;
+          -- the trim belongs on the OUTPUT, and that is where it now is.
+          JOIN erp_proj_doc d ON d.doc_no_raw = r.payload->>'DOC_NO'
+        `);
 
         // Aggregate ALL lines of those orders, plus a representative header row.
         await tx.$executeRawUnsafe(`
           CREATE TEMP TABLE erp_proj_purchase ON COMMIT DROP AS
-          WITH lines AS (
-            SELECT r.id, r.payload, r.changed_at, d.doc_no
-            FROM erp_raw.raw_sales_order r
-            JOIN erp_proj_doc d ON d.doc_no = btrim(r.payload->>'DOC_NO')
-          ), agg AS (
+          WITH agg AS (
             SELECT
               doc_no,
               max(changed_at) AS changed_at,
-              bool_and(btrim(coalesce(payload->>'ApproveStatus', '')) IN (${eligible})) AS eligible,
-              bool_and(btrim(coalesce(payload->>'ApproveStatus', '')) = 'Y')            AS all_approved,
-              bool_and(btrim(coalesce(payload->>'CLOSE', '')) = '2')                    AS all_closed,
-              sum(${num("payload->>'BUSINESS_QTY'")})                                   AS qty_ordered,
-              sum(${num("payload->>'DELIVERED_BUSINESS_QTY'")})                         AS qty_delivered
-            FROM lines GROUP BY doc_no
+              bool_and(approve_status IN (${eligible})) AS eligible,
+              bool_and(approve_status = 'Y')            AS all_approved,
+              bool_and(close_status = '2')              AS all_closed,
+              sum(qty_ordered)                          AS qty_ordered,
+              sum(qty_delivered)                        AS qty_delivered
+            FROM erp_proj_line GROUP BY doc_no
           ), hdr AS (
-            SELECT DISTINCT ON (doc_no) doc_no, id, payload FROM lines ORDER BY doc_no, id
+            SELECT DISTINCT ON (doc_no)
+              doc_no, customer_guid, order_date, total_items, total_value
+            FROM erp_proj_line ORDER BY doc_no, id
           )
           SELECT
             a.doc_no,
             a.changed_at,
             a.eligible,
             cust.id AS customer_id,
-            ${ts("h.payload->>'ORDER_DATE'")} AS order_date,
+            h.order_date,
             -- header totals: taken ONCE, never summed across the lines
-            (${num("h.payload->>'QTY_TOTAL'")})::int AS total_items,
-            (${num("h.payload->>'AMT_UNINCLUDE_TAX_OC'")}
-           + ${num("h.payload->>'TAX_OC'")})::double precision AS total_value,
+            h.total_items,
+            h.total_value,
             -- §4's derivation, in its stated order of precedence. Used on INSERT
             -- only; see the note above the method.
             (CASE
@@ -777,7 +894,7 @@ export class ProjectionRepository {
           FROM agg a
           JOIN hdr h ON h.doc_no = a.doc_no
           LEFT JOIN erp_raw.customer_link cl
-            ON cl.erp_customer_guid = h.payload->>'CUSTOMER_ID'
+            ON cl.erp_customer_guid = h.customer_guid
           LEFT JOIN public."Customer" cust
             ON cust."erpId" = cl.erp_customer_code AND cust.password IS NOT NULL
         `);
@@ -836,9 +953,21 @@ export class ProjectionRepository {
           UPDATE erp_raw.raw_sales_order r
           SET projected_at = now(), project_error = NULL
           FROM erp_proj_purchase p
-          WHERE btrim(r.payload->>'DOC_NO') = p.doc_no
+          JOIN erp_proj_doc d ON btrim(d.doc_no_raw) = p.doc_no
+          WHERE r.payload->>'DOC_NO' = d.doc_no_raw
             AND p.eligible AND p.customer_id IS NOT NULL AND p.order_date IS NOT NULL
         `);
+
+        // A capped run has not seen the whole feed. Advancing the watermark here
+        // would declare rows it never looked at as seen, and they would only ever
+        // come back through the projected_at half of the selector.
+        if (truncated) {
+          notes.push(
+            `scan capped at ${maxRows} row(s) — watermark held; the next run picks up ` +
+              `where this one stopped`,
+          );
+          return { fetched, projected, skipped: deferred, notes };
+        }
 
         await this.advanceWatermark(tx, JOB, projected, [
           {
@@ -959,6 +1088,33 @@ export class ProjectionRepository {
   }
 
   // ─── Shared bits ──────────────────────────────────────────────────────────
+
+  /**
+   * Where the last run of this job stopped reading, as a raw-table id.
+   *
+   * Kept in erp_raw.sync_cursor beside the ingest's own page cursors, and read
+   * and written INSIDE the projection's transaction — so a run that rolls back
+   * leaves the cursor where it was and re-reads the same slice, rather than
+   * skipping it.
+   */
+  private async scanCursor(tx: TxClient, job: string): Promise<number> {
+    const rows = await tx.$queryRawUnsafe<{ cursor_value: string | null }[]>(
+      `SELECT cursor_value FROM erp_raw.sync_cursor WHERE job = ${lit('scan:' + job)}`,
+    );
+    const value = Number(rows[0]?.cursor_value ?? 0);
+    return Number.isFinite(value) && value > 0 ? Math.floor(value) : 0;
+  }
+
+  /** Record where this run stopped. 0 means "start again from the beginning". */
+  private async setScanCursor(tx: TxClient, job: string, id: number): Promise<void> {
+    await tx.$executeRawUnsafe(
+      `INSERT INTO erp_raw.sync_cursor (job, cursor_value, updated_at)
+       VALUES (${lit('scan:' + job)}, ${lit(String(Math.max(0, Math.floor(id))))}, now())
+       ON CONFLICT (job) DO UPDATE
+         SET cursor_value = EXCLUDED.cursor_value, updated_at = now()`,
+    );
+  }
+
 
   private async count(tx: TxClient, from: string, where = 'TRUE'): Promise<number> {
     const rows = await tx.$queryRawUnsafe<{ n: bigint }[]>(

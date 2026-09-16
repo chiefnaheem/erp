@@ -223,6 +223,49 @@ export class SyncScheduler implements OnApplicationBootstrap {
     return { started: true, message: `${job} started - watch: pm2 logs erp-sync` };
   }
 
+  /**
+   * Re-read a stated window of one object, now.
+   *
+   * Goes through the same in-flight guard and the same database lock as the
+   * cron, because the ERP asked us not to present them with concurrent queries —
+   * a backfill is still a few hundred pages against the endpoint they complained
+   * about.
+   */
+  triggerBackfill(
+    job: string,
+    window: { field: string; from: string; to: string },
+  ): { started: boolean; message: string } {
+    if (this.ingestInFlight) {
+      return { started: false, message: 'a sweep is already running - try again when it finishes' };
+    }
+    if (!this.ingestJobNames().includes(job)) {
+      return {
+        started: false,
+        message: `unknown job "${job}" - one of: ${this.ingestJobNames().join(', ')}`,
+      };
+    }
+    if (!window.from || !window.to) {
+      return { started: false, message: 'from and to are required, e.g. {"from":"2026-04-28","to":"2026-08-04"}' };
+    }
+
+    this.ingestInFlight = true;
+    void (async () => {
+      try {
+        this.logger.log(
+          `manual backfill - ${job} (${window.field} ${window.from} .. ${window.to})`,
+        );
+        // Deliberately does NOT touch lastIngestAt: a backfill is not a sweep, so
+        // it must not push the object's next scheduled sweep back.
+        await this.runStage(INGEST_LOCK, () => this.sync.runBackfillJob(job, window));
+      } finally {
+        this.ingestInFlight = false;
+      }
+    })();
+
+    return { started: true, message: `${job} backfill started - watch: pm2 logs erp-sync` };
+  }
+
+
   /** Run the projection stage now (erp_raw -> public). */
   triggerProjection(): { started: boolean; message: string } {
     void this.projectionTick();

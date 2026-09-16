@@ -8,6 +8,19 @@ import { ErpObjectType, RawRepository } from '../../raw/raw.repository';
 import { JobStats, SyncJob } from '../sync.job';
 
 /**
+ * A job that can re-read a stated window on demand. Every ingest job can; the
+ * projections cannot, and the scheduler is handed SyncJob[] — so this is the
+ * narrow surface it tests for rather than exporting the whole base class.
+ */
+export interface Backfillable {
+  backfill(window: { field: string; from: string; to: string }): Promise<JobStats>;
+}
+
+export const isBackfillable = (job: unknown): job is Backfillable =>
+  typeof (job as Backfillable | undefined)?.backfill === 'function';
+
+
+/**
  * Ingest = ERP → erp_raw. Verbatim, no interpretation.
  *
  * These jobs are unaffected by the mapping gaps in CONTRACT.md: capturing what
@@ -379,6 +392,86 @@ abstract class IngestJob extends SyncJob {
 
   /** Hook for per-page side effects (e.g. maintaining the customer Guid bridge). */
   protected async afterPage(_page: Record<string, unknown>[]): Promise<void> {}
+
+  /**
+   * Re-read ONE WINDOW of this object, outside the normal sweep.
+   *
+   * Why this exists. The sweep walks the whole feed in LastModifiedDate order,
+   * oldest first, ten minutes at a time, resuming from a page cursor — so when
+   * the ERP adds FIELDS to an object (sales_delivery gained its subtable: AMOUNT,
+   * PRICE, ITEM_CODE, ITEM_DESCRIPTION, ITEM_SPECIFICATION, BUSINESS_QTY), the
+   * rows already stored keep their old, narrower shape until the sweep reaches
+   * them again. On sales_delivery that is roughly a fortnight, and it arrives in
+   * the worst possible order: 2016 first, this year last. The rows anyone
+   * actually needs are the ones that stay wrong longest.
+   *
+   * A backfill re-reads a stated window NOW and upserts it through the ordinary
+   * key, so those rows take their current shape immediately. It deliberately
+   * touches NOTHING else:
+   *
+   *   • no page cursor    — the running sweep resumes exactly where it paused
+   *   • no watermark      — this is not a sweep and must not stand in for one
+   *   • no reconciliation — a window's key set says nothing about the rest of
+   *                         the feed, and deleting against it would be a wipe
+   *   • no unknown-column fallback — sweep() answers a rejected filter by
+   *                         re-reading EVERYTHING unfiltered, which for a
+   *                         backfill would be ten thousand pages by mistake. A
+   *                         window the ERP will not filter on is an error here.
+   */
+  async backfill(window: {
+    field: string;
+    from: string;
+    to: string;
+  }): Promise<JobStats> {
+    const table = this.raw.tableFor(this.objectType);
+    const conditions: ErpCondition[] = [
+      { field_name: window.field, operator: '>=', value: window.from },
+      { field_name: window.field, operator: '<=', value: window.to },
+    ];
+
+    const runId = await this.raw.startRun(`${this.name}:backfill`);
+    const startedAt = Date.now();
+    let fetched = 0;
+    let changed = 0;
+    let pages = 0;
+
+    this.logger.log(
+      `${this.name}: BACKFILL ${this.method} → erp_raw.${table} ` +
+        `(${window.field} ${window.from} .. ${window.to}) — ` +
+        `re-reading a window; cursor, watermark and reconciliation untouched`,
+    );
+
+    try {
+      for await (const { pageNo, rows } of this.erp.queryAll<Record<string, unknown>>(
+        this.method,
+        { conditions, orders: this.sweepOrder() },
+      )) {
+        pages++;
+        const result = await this.raw.upsertMany(this.objectType, rows, (row) =>
+          this.keyOf(row),
+        );
+        fetched += result.fetched;
+        changed += result.changed;
+        this.logger.log(
+          `${this.name}: backfill page ${pageNo} — stored ${result.fetched} row(s) ` +
+            `(${result.changed} new/changed) into erp_raw.${table}`,
+        );
+        await this.afterPage(rows);
+      }
+
+      await this.raw.finishRun(runId, { status: 'SUCCESS', fetched, changed });
+      this.logger.log(
+        `${this.name}: backfill done in ${Date.now() - startedAt}ms — ` +
+          `${fetched} row(s) over ${pages} page(s), ${changed} new/changed`,
+      );
+      return { fetched, changed };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      await this.raw.finishRun(runId, { status: 'FAILED', fetched, changed, error: message });
+      this.logger.error(`${this.name}: backfill FAILED — ${message}`);
+      throw error;
+    }
+  }
 }
 
 /**

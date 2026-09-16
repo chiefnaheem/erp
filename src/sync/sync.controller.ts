@@ -32,6 +32,28 @@ export class SyncController {
     return this.scheduler.triggerIngest(body?.job);
   }
 
+  /**
+   * POST /sync/backfill {"job":"ingest:sales_delivery","from":"2026-04-28","to":"2026-08-04"}
+   *
+   * Re-reads that window of that object NOW and upserts it through the ordinary
+   * key. Use it when the ERP has WIDENED an object and the rows already stored
+   * still carry the old, narrower shape — the scheduled sweep fixes those too,
+   * but it walks the feed oldest-first over days and reaches this year last.
+   *
+   * `field` defaults to DOC_DATE, which is what "records between these dates"
+   * means to anyone reading the ERP. Pass LastModifiedDate instead to re-read by
+   * when a record was last touched.
+   */
+  @Post('backfill')
+  backfill(@Body() body: { job?: string; from?: string; to?: string; field?: string }) {
+    return this.scheduler.triggerBackfill(body?.job ?? '', {
+      field: body?.field ?? 'DOC_DATE',
+      from: body?.from ?? '',
+      to: body?.to ?? '',
+    });
+  }
+
+
   /** POST /sync/projection → push erp_raw into the app tables now. */
   @Post('projection')
   projection() {

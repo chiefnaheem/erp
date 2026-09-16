@@ -14,6 +14,7 @@ import {
   SalesDeliveryIngestJob,
   SalesOrderIngestJob,
   SalesReturnIngestJob,
+  isBackfillable,
 } from './jobs/ingest.jobs';
 import {
   CustomerProjectionJob,
@@ -152,6 +153,33 @@ export class SyncService {
       return;
     }
     await this.runJobs(name, [job], 1);
+  }
+
+  /**
+   * Re-read ONE WINDOW of one object, now.
+   *
+   * Separate from runIngestJob because it is not a sweep and must not be taken
+   * for one: it moves no page cursor and no watermark, so the scheduled sweep
+   * carries on from exactly where it paused. It exists because a sweep walks the
+   * feed oldest-first over days, so rows the ERP has since WIDENED (sales_delivery
+   * gained a subtable: ITEM_CODE, ITEM_DESCRIPTION, ITEM_SPECIFICATION, PRICE,
+   * AMOUNT) keep their old narrow shape until their turn comes round — and this
+   * year's documents are last in that queue.
+   */
+  async runBackfillJob(
+    name: string,
+    window: { field: string; from: string; to: string },
+  ): Promise<void> {
+    const job = this.ingestJobs().find((j) => j.name === name);
+    if (!job) {
+      this.logger.error(`no ingest job named ${name}`);
+      return;
+    }
+    if (!isBackfillable(job)) {
+      this.logger.error(`${name} cannot be backfilled`);
+      return;
+    }
+    await job.backfill(window);
   }
 
   /**

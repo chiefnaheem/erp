@@ -571,6 +571,25 @@ export class EnvVars {
   @Transform(toInt)
   ERP_PROJECT_TX_TIMEOUT_MS: number = 600_000;
 
+  // Raw rows one purchase projection may read.
+  //
+  // The selector re-reads every row with projected_at IS NULL, and 1.94M of the
+  // 1.99M sales-order rows are permanently in that state (their distributor has
+  // not onboarded). Unbounded, that re-read spilled 890 GB of temp files in
+  // twenty hours on 2026-09-16 and filled the database server's disk.
+  //
+  // A run now takes the next slice of this many rows by id and records where it
+  // stopped (erp_raw.sync_cursor, key "scan:project:purchase"), wrapping to the
+  // start when it reaches the end — and only the wrapping run advances the
+  // watermark. Whole documents are still aggregated even when their lines
+  // straddle a slice boundary: the line pass re-reads every line of each
+  // document the slice names.
+  @IsInt()
+  @Min(1000)
+  @IsOptional()
+  @Transform(toInt)
+  ERP_PROJECT_MAX_ROWS_PER_RUN: number = 100_000;
+
   // ── Viju backend API (post-run reconcile calls) ──────────────────────────
   //
   // After a clean projection the worker POSTs to two endpoints that re-derive
