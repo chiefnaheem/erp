@@ -256,7 +256,9 @@ export class SyncScheduler implements OnApplicationBootstrap {
         );
         // Deliberately does NOT touch lastIngestAt: a backfill is not a sweep, so
         // it must not push the object's next scheduled sweep back.
-        await this.runStage(INGEST_LOCK, () => this.sync.runBackfillJob(job, window));
+        await this.runStage(INGEST_LOCK, () => this.sync.runBackfillJob(job, window), {
+          ignorePause: true,
+        });
       } finally {
         this.ingestInFlight = false;
       }
@@ -326,13 +328,25 @@ export class SyncScheduler implements OnApplicationBootstrap {
    * while the other is mid-flight.
    */
   /** Returns false when the stage did NOT run (disabled, or the lock was held). */
-  private async runStage(lockName: string, work: () => Promise<void>): Promise<boolean> {
+  private async runStage(
+    lockName: string,
+    work: () => Promise<void>,
+    opts: { ignorePause?: boolean } = {},
+  ): Promise<boolean> {
     const tag = `${lockName} #${++this.tickCount}`;
     const startedAt = Date.now();
 
-    if (!this.config.get<boolean>('SYNC_ENABLED')) {
+    // SYNC_ENABLED stops SCHEDULED work. A backfill is an operator typing an
+    // explicit, bounded window into an endpoint — a decision the pause switch is
+    // not there to override — so it runs, and says plainly that it did.
+    if (!this.config.get<boolean>('SYNC_ENABLED') && !opts.ignorePause) {
       this.logger.log(`${tag}: SYNC_ENABLED=false — not running`);
       return false;
+    }
+    if (!this.config.get<boolean>('SYNC_ENABLED')) {
+      this.logger.warn(
+        `${tag}: SYNC_ENABLED=false, but this is a manual backfill — running it anyway`,
+      );
     }
 
     const leaseMinutes = this.config.get<number>('SYNC_LOCK_MINUTES') ?? 30;
