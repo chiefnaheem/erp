@@ -50,6 +50,6 @@ import { VijuNotifier } from './viju.notifier';
     SyncService,
     SyncScheduler,
   ],
-  exports: [SyncService],
+  exports: [SyncService, SyncScheduler],
 })
 export class SyncModule {}

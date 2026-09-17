@@ -24,6 +24,20 @@ export class SyncController {
   }
 
   /**
+   * GET /sync/freshness → when each feed last completed, and which have stopped.
+   *
+   * This is the one to check when a number on a screen looks wrong. `status`
+   * answers "what is scheduled"; this answers "what has actually happened",
+   * from erp_raw.sync_run rather than from memory — so it stays true across a
+   * restart, and a paused or failing feed shows up as `stale` instead of as a
+   * blank that reads like a fresh start.
+   */
+  @Get('freshness')
+  freshness() {
+    return this.scheduler.freshness();
+  }
+
+  /**
    * POST /sync/ingest              → mark all objects due (one sweeps per minute)
    * POST /sync/ingest {"job":"…"}  → sweep that one object now
    */

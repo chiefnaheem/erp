@@ -729,6 +729,29 @@ export class RawRepository {
 
   // ─── Sync run bookkeeping ────────────────────────────────────────────────
 
+  /**
+   * When each job last finished SUCCESSFULLY, from erp_raw.sync_run.
+   *
+   * The freshness check is built on this rather than on the raw tables'
+   * last_seen_at, and the difference matters: change detection makes an
+   * unchanged upsert a no-op, so last_seen_at does NOT move on a sweep that
+   * found nothing new. A feed that is healthy and quiet would look abandoned.
+   * A completed run is the honest signal — it says we asked the ERP and it
+   * answered, whether or not anything had changed.
+   */
+  async lastSuccessByJob(): Promise<Map<string, Date>> {
+    const rows = await this.withRetry(
+      () => this.prisma.$queryRaw<{ job: string; finished_at: Date }[]>`
+        SELECT job, max(finished_at) AS finished_at
+        FROM erp_raw.sync_run
+        WHERE status = 'SUCCESS' AND finished_at IS NOT NULL
+        GROUP BY job
+      `,
+      'lastSuccessByJob',
+    );
+    return new Map(rows.map((r) => [r.job, r.finished_at]));
+  }
+
   async startRun(job: string): Promise<bigint> {
     const rows = await this.withRetry(
       () => this.prisma.$queryRaw<{ id: bigint }[]>`

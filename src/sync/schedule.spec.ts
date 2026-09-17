@@ -11,13 +11,18 @@ import { SyncScheduler } from './sync.scheduler';
 describe('SyncScheduler per-object schedule', () => {
   let settings: Record<string, unknown>;
   let scheduler: any;
+  /** Whatever the freshness check reads: job → when it last finished cleanly. */
+  let lastSuccess: Map<string, Date>;
+  let raw: { lastSuccessByJob: () => Promise<Map<string, Date>> };
 
   const at = (hh: number, mm: number) => new Date(2026, 7, 28, hh, mm, 0).getTime();
 
   beforeEach(() => {
     settings = { ERP_INGEST_INTERVAL_MINUTES: 60, SYNC_ENABLED: true };
+    lastSuccess = new Map();
+    raw = { lastSuccessByJob: () => Promise.resolve(lastSuccess) };
     const config = { get: (k: string) => settings[k] } as never;
-    scheduler = new SyncScheduler({} as never, {} as never, config);
+    scheduler = new SyncScheduler({} as never, {} as never, raw as never, config);
   });
 
   afterEach(() => jest.restoreAllMocks());
@@ -115,5 +120,91 @@ describe('SyncScheduler per-object schedule', () => {
     scheduler.lastIngestAt.set('ingest:customer_credit', at(10, 28));
     jest.spyOn(Date, 'now').mockReturnValue(at(10, 50)); // only 22 minutes later
     expect(scheduler.dueJobs()).not.toContain('ingest:customer_credit');
+  });
+});
+
+/**
+ * Freshness.
+ *
+ * A distributor's credit sat two days out of date and nothing reported it: the
+ * sweep was not running, and the only "last run" we published lived in memory
+ * and reset on restart. These pin the properties that make a stalled feed
+ * visible.
+ */
+describe('SyncScheduler freshness', () => {
+  let settings: Record<string, unknown>;
+  let lastSuccess: Map<string, Date>;
+  let scheduler: any;
+
+  const minutesAgo = (n: number) => new Date(Date.now() - n * 60_000);
+  const feed = (report: any, job: string) =>
+    report.feeds.find((f: any) => f.job === job);
+
+  beforeEach(() => {
+    settings = {
+      ERP_INGEST_INTERVAL_MINUTES: 60,
+      ERP_INTERVAL_CUSTOMER_CREDIT: 30,
+      ERP_STALE_AFTER_MULTIPLE: 3,
+      SYNC_ENABLED: true,
+    };
+    lastSuccess = new Map();
+    const raw = { lastSuccessByJob: () => Promise.resolve(lastSuccess) };
+    const config = { get: (k: string) => settings[k] } as never;
+    scheduler = new SyncScheduler({} as never, {} as never, raw as never, config);
+  });
+
+  it('reads the recorded run history, not the in-memory map — so a restart does not erase it', async () => {
+    lastSuccess.set('ingest:customer_credit', minutesAgo(10));
+    // lastIngestAt is what a fresh process has: empty.
+    expect(scheduler.lastIngestAt.size).toBe(0);
+
+    const report = await scheduler.freshness();
+    expect(feed(report, 'ingest:customer_credit').stale).toBe(false);
+    expect(feed(report, 'ingest:customer_credit').minutesSince).toBe(10);
+  });
+
+  it('flags the feed that actually went stale, and leaves the healthy ones alone', async () => {
+    // The real case: credit last swept two days before it was noticed.
+    lastSuccess.set('ingest:customer_credit', minutesAgo(60 * 48));
+    lastSuccess.set('ingest:customer', minutesAgo(20));
+
+    const report = await scheduler.freshness();
+    expect(feed(report, 'ingest:customer_credit').stale).toBe(true);
+    expect(feed(report, 'ingest:customer').stale).toBe(false);
+  });
+
+  it('judges lateness against each feed\'s own interval, not one fixed age', async () => {
+    // 100 minutes: late for a 30-minute feed (threshold 90), fine for a
+    // 60-minute one (threshold 180).
+    lastSuccess.set('ingest:customer_credit', minutesAgo(100)); // every 30m
+    lastSuccess.set('ingest:customer', minutesAgo(100)); // every 60m
+
+    const report = await scheduler.freshness();
+    expect(feed(report, 'ingest:customer_credit').stale).toBe(true);
+    expect(feed(report, 'ingest:customer').stale).toBe(false);
+  });
+
+  it('does not cry wolf over a single skipped cycle', async () => {
+    lastSuccess.set('ingest:customer_credit', minutesAgo(45)); // every 30m, one missed
+    const report = await scheduler.freshness();
+    expect(feed(report, 'ingest:customer_credit').stale).toBe(false);
+  });
+
+  it('treats a feed that has never completed a run as stale, not as blank', async () => {
+    const report = await scheduler.freshness();
+    expect(feed(report, 'ingest:customer_credit').lastSuccessAt).toBeNull();
+    expect(feed(report, 'ingest:customer_credit').stale).toBe(true);
+  });
+
+  it('watches the projection too — fresh raw data that never lands is just as wrong', async () => {
+    const report = await scheduler.freshness();
+    expect(feed(report, 'project:customer')).toBeDefined();
+  });
+
+  it('reports whether the sync is paused, so a stale feed can be explained', async () => {
+    settings.SYNC_ENABLED = false;
+    const report = await scheduler.freshness();
+    expect(report.syncEnabled).toBe(false);
+    expect(report.staleCount).toBeGreaterThan(0);
   });
 });

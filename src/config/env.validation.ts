@@ -431,6 +431,30 @@ export class EnvVars {
   @IsOptional()
   ERP_PROJECT_CRON: string = '0 */3 * * * *';
 
+  // How the freshness check reads ERP_PROJECT_CRON. Kept as a plain number
+  // because a cron expression cannot be compared to an elapsed time; keep the
+  // two in step if you change the cadence.
+  @IsInt()
+  @Min(1)
+  @IsOptional()
+  @Transform(toInt)
+  ERP_PROJECTION_INTERVAL_MINUTES: number = 3;
+
+  // A feed is STALE when it has not completed a run in this many times its own
+  // interval. GET /sync/freshness reports it, /health degrades on it, and the
+  // hourly check logs it.
+  //
+  // A multiple rather than a fixed age, because a 30-minute feed and a daily one
+  // are not late at the same point. Three of them, so one skipped cycle — a lock
+  // held, a single ERP timeout — is not an alarm. This exists because a
+  // distributor's credit went two days stale in September 2026 and the only
+  // thing that noticed was a person reading the number.
+  @IsInt()
+  @Min(2)
+  @IsOptional()
+  @Transform(toInt)
+  ERP_STALE_AFTER_MULTIPLE: number = 3;
+
   // Rows projected per batch while draining the backlog.
   @IsInt()
   @Min(1)

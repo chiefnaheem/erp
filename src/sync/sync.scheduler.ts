@@ -8,6 +8,7 @@ import { ConfigService } from '@nestjs/config';
 import { Cron } from '@nestjs/schedule';
 import { Prisma } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
+import { RawRepository } from '../raw/raw.repository';
 import { SyncService } from './sync.service';
 
 const INGEST_LOCK = 'ingest';
@@ -20,10 +21,16 @@ export class SyncScheduler implements OnApplicationBootstrap {
   private readonly owner = `${hostname()}:${process.pid}`;
   private tickCount = 0;
   private readonly bootTime = Date.now();
+  /**
+   * The last freshness report, so /health can report a stalled feed without
+   * running a query on every probe. Null until the first check has run.
+   */
+  private lastFreshness: { checkedAt: string; stale: string[] } | null = null;
 
   constructor(
     private readonly sync: SyncService,
     private readonly prisma: PrismaService,
+    private readonly raw: RawRepository,
     private readonly config: ConfigService,
   ) {}
 
@@ -179,6 +186,142 @@ export class SyncScheduler implements OnApplicationBootstrap {
         };
       }),
     };
+  }
+
+  /**
+   * How long since each feed last completed a run, and whether that is too long.
+   *
+   * ─── Why this exists ───────────────────────────────────────────────────────
+   *
+   * On 2026-09-17 a distributor's credit was two days out of date — the ERP had
+   * moved their Used Credit Limit by 145,000 and we were still publishing the
+   * old figure. The sweep that keeps it current runs every thirty minutes and
+   * had not run since the 15th, because the service was paused. Nothing said so.
+   * Someone noticed by reading a number on a screen and not believing it.
+   *
+   * status() could not have told them: its `lastRun` is an in-memory Map that
+   * empties on every restart, so a freshly restarted worker reports "never run"
+   * for a feed that is perfectly healthy, and a paused one reports the same
+   * thing for a feed that has genuinely stopped. This reads erp_raw.sync_run
+   * instead, which survives restarts and records what actually happened.
+   *
+   * `stale` is the alarm: no successful run in ERP_STALE_AFTER_MULTIPLE times
+   * the object's own interval. A multiple, not a fixed age, because a 30-minute
+   * feed and a daily one are not late at the same point — and three of them,
+   * so a single skipped cycle (a lock held, one ERP timeout) is not an alarm.
+   */
+  async freshness(): Promise<{
+    checkedAt: string;
+    staleCount: number;
+    syncEnabled: boolean;
+    feeds: {
+      job: string;
+      everyMinutes: number;
+      lastSuccessAt: string | null;
+      minutesSince: number | null;
+      staleAfterMinutes: number;
+      stale: boolean;
+    }[];
+  }> {
+    const defaultInterval =
+      this.config.get<number>('ERP_INGEST_INTERVAL_MINUTES') ?? 60;
+    const multiple = Math.max(2, this.config.get<number>('ERP_STALE_AFTER_MULTIPLE') ?? 3);
+    const projectionMinutes =
+      this.config.get<number>('ERP_PROJECTION_INTERVAL_MINUTES') ?? 3;
+    const now = Date.now();
+
+    const lastSuccess = await this.raw.lastSuccessByJob();
+
+    // The projection is checked too: a fresh raw table that never reaches
+    // public.* leaves the app just as wrong as a stale sweep would.
+    const feeds = [
+      ...this.ingestSchedule.map(({ job, configKey }) => ({
+        job,
+        everyMinutes: this.config.get<number>(configKey) ?? defaultInterval,
+      })),
+      { job: 'project:customer', everyMinutes: projectionMinutes },
+      { job: 'project:purchase', everyMinutes: projectionMinutes },
+      { job: 'project:payment', everyMinutes: projectionMinutes },
+    ];
+
+    const rows = feeds.map(({ job, everyMinutes }) => {
+      const at = lastSuccess.get(job) ?? null;
+      const minutesSince = at ? Math.round((now - at.getTime()) / 60_000) : null;
+      const staleAfterMinutes = everyMinutes * multiple;
+      return {
+        job,
+        everyMinutes,
+        lastSuccessAt: at ? at.toISOString() : null,
+        minutesSince,
+        staleAfterMinutes,
+        // Never having run at all counts as stale — that is the state a feed is
+        // in when it was wired up but never scheduled, which is worth shouting
+        // about rather than rendering as a blank.
+        stale: minutesSince === null || minutesSince > staleAfterMinutes,
+      };
+    });
+
+    const stale = rows.filter((r) => r.stale);
+    this.lastFreshness = {
+      checkedAt: new Date(now).toISOString(),
+      stale: stale.map((r) => r.job),
+    };
+
+    return {
+      checkedAt: new Date(now).toISOString(),
+      staleCount: stale.length,
+      syncEnabled: this.config.get<boolean>('SYNC_ENABLED') ?? false,
+      feeds: rows,
+    };
+  }
+
+  /**
+   * The last freshness verdict, for /health. Deliberately a cached value and not
+   * a fresh check: a health endpoint gets polled, and this one would otherwise
+   * put an aggregate over erp_raw.sync_run behind every probe.
+   */
+  staleFeeds(): { checkedAt: string; stale: string[] } | null {
+    return this.lastFreshness;
+  }
+
+  /**
+   * Say so, loudly, when a feed has stopped.
+   *
+   * Hourly and on its own cron, so it keeps reporting while the problem lasts
+   * instead of once at the moment it started. It only reads and logs — the cure
+   * for a stalled feed is never "quietly sweep it", because the reason is
+   * usually something a person needs to see (the service paused, the ERP
+   * refusing a key, the database out of disk).
+   */
+  @Cron('0 5 * * * *', { name: 'erp-freshness' })
+  async freshnessTick(): Promise<void> {
+    let report: Awaited<ReturnType<SyncScheduler['freshness']>>;
+    try {
+      report = await this.freshness();
+    } catch (error) {
+      this.logger.warn(
+        `freshness check could not run: ${error instanceof Error ? error.message : String(error)}`,
+      );
+      return;
+    }
+
+    if (report.staleCount === 0) {
+      this.logger.log(`freshness: all ${report.feeds.length} feed(s) current`);
+      return;
+    }
+
+    const paused = report.syncEnabled ? '' : ' (SYNC_ENABLED=false — the sync is paused)';
+    this.logger.error(`freshness: ${report.staleCount} feed(s) STALE${paused}`);
+    for (const feed of report.feeds.filter((f) => f.stale)) {
+      this.logger.error(
+        `  ${feed.job}: ` +
+          (feed.minutesSince === null
+            ? 'has never completed a run'
+            : `last completed ${feed.minutesSince} minute(s) ago`) +
+          ` — it runs every ${feed.everyMinutes}m, so anything past ` +
+          `${feed.staleAfterMinutes}m means it is not running`,
+      );
+    }
   }
 
   /**

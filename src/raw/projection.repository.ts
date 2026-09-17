@@ -309,8 +309,11 @@ export class ProjectionRepository {
    *     Anything outside 1–5 belongs to another tenant on the same ERP and is
    *     quarantined — never defaulted to a region.
    *
-   *  3. outstandingBalance = CREDIT_AMT + CREDIT_AMT1 − CREDIT_PAY, computed in
-   *     `numeric` and unrounded, from the NEWEST credit record per customer. The
+   *  3. outstandingBalance = CREDIT_AMT + Σ(CREDIT_AMT1 in force) − CREDIT_PAY,
+   *     computed in `numeric` and unrounded. This is the ERP's own "Credit
+   *     Balance": standing limit, plus every temporary grant whose date window
+   *     covers today, less the credit consumed. Verified field by field against
+   *     the ERP screen for 10110017 on 2026-09-17. The
    *     old projector copied CREDIT_PAY straight across, which is credit
    *     *consumed* and therefore inverted the sign for every customer holding
    *     credit. Positive now means funds available, which is what the portal
@@ -385,33 +388,65 @@ export class ProjectionRepository {
                   WHERE c.payload->>'CUSTOMER_CODE' = r.erp_key AND ${creditSel}
                 )
               )
-          ), credit AS (
-            SELECT DISTINCT ON (c.payload->>'CUSTOMER_CODE')
-                   c.payload->>'CUSTOMER_CODE' AS code,
-                   (${num("c.payload->>'CREDIT_AMT'")}
-                  + ${num("c.payload->>'CREDIT_AMT1'")}
-                  - ${num("c.payload->>'CREDIT_PAY'")}) AS balance
+          ), credit_doc AS (
+            -- ── One row per CREDIT DOCUMENT, which is how the ERP stores it ──
+            --
+            -- yvijucrm.customer_credit.query returns a HEADER repeated on every
+            -- SUBTABLE line, exactly like the sales documents:
+            --
+            --   header   CREDIT_AMT      the standing credit limit
+            --            CREDIT_PAY      credit consumed  ("Used Credit Limit")
+            --   subtable CREDIT_AMT1     ONE temporary grant, with its own
+            --                            EFFECTIVE_DATE..INEFFECTIVE_DATE window
+            --
+            -- So the header figures are taken ONCE per document (max() over
+            -- identical values), and the temporary grants are SUMMED — a customer
+            -- may hold several at the same time and the ERP adds them all up.
+            --
+            -- ⚠️ This used to be DISTINCT ON (CUSTOMER_CODE) ... ORDER BY
+            -- EFFECTIVE_DATE DESC, i.e. the single NEWEST line, which silently
+            -- dropped every other grant in force. Checked against the ERP screen
+            -- for 10110017 on 2026-09-17: it holds two live grants, 200 (from
+            -- 09-02) and 5,000 (from 09-09), and the ERP shows Temporary Credit
+            -- 5,200 and Total Credit Limit 6,200.8888. We were publishing 5,000.
+            --
+            -- The date window gates the GRANT, not the document: an expired
+            -- temporary grant contributes 0, but the standing CREDIT_AMT and the
+            -- CREDIT_PAY beside it still count. Dropping the whole document
+            -- (which the row-level filter used to do) left customers whose grants
+            -- had all lapsed with no balance to publish at all.
+            SELECT
+              c.payload->>'CUSTOMER_CODE' AS code,
+              COALESCE(NULLIF(btrim(coalesce(c.payload->>'CUSTOMER_CREDIT_ID', '')), ''),
+                       c.payload->>'CUSTOMER_CODE') AS doc_id,
+              max(${num("c.payload->>'CREDIT_AMT'")}) AS credit_amt,
+              max(${num("c.payload->>'CREDIT_PAY'")}) AS credit_pay,
+              sum(
+                CASE
+                  WHEN (
+                    NULLIF(btrim(coalesce(c.payload->>'INEFFECTIVE_DATE', '')), '') IS NULL
+                    OR c.payload->>'INEFFECTIVE_DATE' = '0001-01-01 00:00:00'
+                    OR ${ts("c.payload->>'INEFFECTIVE_DATE'")} >= now()
+                  ) AND (
+                    NULLIF(btrim(coalesce(c.payload->>'EFFECTIVE_DATE', '')), '') IS NULL
+                    OR c.payload->>'EFFECTIVE_DATE' = '0001-01-01 00:00:00'
+                    OR ${ts("c.payload->>'EFFECTIVE_DATE'")} <= now()
+                  )
+                  THEN ${num("c.payload->>'CREDIT_AMT1'")}
+                  ELSE 0
+                END
+              ) AS temporary_credit
             FROM erp_raw.raw_customer_credit c
             WHERE NULLIF(btrim(coalesce(c.payload->>'CUSTOMER_CODE', '')), '') IS NOT NULL
               AND c.payload->>'CUSTOMER_CODE' IN (SELECT erp_id FROM src)
-              -- Ignore credit records no longer in force. The ERP gives each record a
-              -- validity window, and an expired one says nothing about what the customer
-              -- owes today. Without this we published balances from credit lines that
-              -- ended long ago: customer 10110003 showed 10,125,600 from a record that
-              -- expired 2026-09-05, and 10110270 from one that expired in 2023.
-              AND (
-                NULLIF(btrim(coalesce(c.payload->>'INEFFECTIVE_DATE', '')), '') IS NULL
-                OR c.payload->>'INEFFECTIVE_DATE' = '0001-01-01 00:00:00'
-                OR ${ts("c.payload->>'INEFFECTIVE_DATE'")} >= now()
-              )
-              AND (
-                NULLIF(btrim(coalesce(c.payload->>'EFFECTIVE_DATE', '')), '') IS NULL
-                OR c.payload->>'EFFECTIVE_DATE' = '0001-01-01 00:00:00'
-                OR ${ts("c.payload->>'EFFECTIVE_DATE'")} <= now()
-              )
-            ORDER BY c.payload->>'CUSTOMER_CODE',
-                     ${ts("c.payload->>'EFFECTIVE_DATE'")} DESC NULLS LAST,
-                     c.id DESC
+            GROUP BY 1, 2
+          ), credit AS (
+            -- A customer may hold credit under more than one company or currency,
+            -- i.e. more than one document; those add up.
+            SELECT code,
+                   sum(credit_amt + temporary_credit - credit_pay) AS balance
+            FROM credit_doc
+            GROUP BY code
           )
           SELECT
             s.raw_id,
