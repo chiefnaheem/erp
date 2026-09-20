@@ -425,7 +425,7 @@ export class ErpClient {
       prod: 'E10',
       ip,
       name: method,
-      id: '03_External',
+      id: '01_External',
     };
 
     const headers: Record<string, string> = {

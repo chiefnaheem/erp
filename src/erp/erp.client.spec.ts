@@ -88,7 +88,7 @@ describe('ErpClient', () => {
     const service = JSON.parse(headers['digi-service'] as string);
     expect(service.name).toBe(ERP_METHOD.CUSTOMER_QUERY);
     expect(service.prod).toBe('E10');
-    expect(service.id).toBe('03_External');
+    expect(service.id).toBe('01_External');
 
     const host = JSON.parse(headers['digi-host'] as string);
     expect(host.prod).toBe('YVIJUCRM');
