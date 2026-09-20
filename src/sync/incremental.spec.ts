@@ -305,3 +305,168 @@ describe('incremental ingest', () => {
     expect(raw.clearStaleSeen).toHaveBeenCalled();
   });
 });
+
+/**
+ * Recent-change catch-up during a backfill.
+ *
+ * The gap this closes, asked as a question: "if the ERP is updated, does the
+ * data sync on time?" During a multi-day backfill it did not. A full sweep reads
+ * oldest-first and earns no watermark until it finishes, so on 2026-09-20 —
+ * sales_order 3,875 pages in, no watermark — a document edited that morning
+ * would have waited days for the sweep to crawl up to it.
+ */
+describe('recent-change catch-up', () => {
+  let raw: any;
+  let erp: any;
+  let config: any;
+  let settings: Record<string, unknown>;
+
+  const build = () => new CustomerIngestJob(raw, erp, config);
+
+  /** A generator yielding one page of rows carrying the given timestamps. */
+  const pageOf = (stamps: string[]) =>
+    async function* () {
+      yield {
+        pageNo: 1,
+        rows: stamps.map((s, i) => ({
+          CUSTOMER_CODE: `C${i}`,
+          LastModifiedDate: s,
+        })),
+      };
+    };
+
+  beforeEach(() => {
+    settings = {
+      ERP_INCREMENTAL: true,
+      ERP_INCREMENTAL_FIELD: 'LastModifiedDate',
+      ERP_INCREMENTAL_OVERLAP_MINUTES: 30,
+      ERP_CATCHUP: true,
+      ERP_CATCHUP_MAX_MINUTES: 2,
+      ERP_CATCHUP_LOOKBACK_HOURS: 48,
+    };
+    config = { get: (k: string) => settings[k] };
+    raw = {
+      tableFor: () => 'raw_customer',
+      // startPage > 1 == a backfill is mid-flight, which is when catch-up runs.
+      getIngestPage: jest.fn().mockResolvedValue(3875),
+      setIngestPage: jest.fn(),
+      clearIngestPage: jest.fn(),
+      getWatermark: jest.fn().mockResolvedValue(null), // no watermark: still backfilling
+      getCatchupWatermark: jest.fn().mockResolvedValue(null),
+      setCatchupWatermark: jest.fn(),
+      watermarkUpdatedAt: jest.fn().mockResolvedValue(new Date()),
+      markFullSweep: jest.fn(),
+      recordSeen: jest.fn(),
+      seenCount: jest.fn().mockResolvedValue(10),
+      rowCount: jest.fn().mockResolvedValue(10),
+      deleteUnseen: jest.fn().mockResolvedValue(0),
+      clearSeen: jest.fn(),
+      clearStaleSeen: jest.fn(),
+      setWatermark: jest.fn(),
+      upsertMany: jest.fn().mockResolvedValue({ fetched: 2, changed: 2 }),
+      linkCustomers: jest.fn(),
+    };
+    erp = {
+      queryAll: jest.fn().mockImplementation(async function* () {}),
+      // The ERP's own newest change, used to seed the first catch-up window.
+      query: jest.fn().mockResolvedValue({
+        rows: [{ LastModifiedDate: '2026-09-20 12:00:00' }],
+      }),
+    };
+    jest.spyOn(Logger.prototype, 'log').mockImplementation(() => undefined);
+    jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
+    Object.getPrototypeOf(CustomerIngestJob).incrementalUnavailable = false;
+  });
+
+  afterEach(() => jest.restoreAllMocks());
+
+  it('pulls recent changes BEFORE continuing the backfill', async () => {
+    await (build() as any).execute();
+
+    // Two calls: the catch-up, then the backfill resuming at its page.
+    expect(erp.queryAll).toHaveBeenCalledTimes(2);
+    const [, catchupOpts] = erp.queryAll.mock.calls[0];
+    expect(catchupOpts.conditions).toEqual([
+      // 48 hours back from the ERP's own newest change, in the ERP's format.
+      { field_name: 'LastModifiedDate', operator: '>=', value: '2026-09-18 12:00:00' },
+    ]);
+    // The backfill still resumes exactly where it paused.
+    expect(erp.queryAll.mock.calls[1][2]).toBe(3875);
+  });
+
+  it("seeds the first window from the ERP's clock, never from ours", async () => {
+    await (build() as any).execute();
+    expect(erp.query).toHaveBeenCalledWith(
+      ERP_METHOD.CUSTOMER_QUERY,
+      expect.objectContaining({
+        pageSize: 1,
+        orders: [{ field_name: 'LastModifiedDate', order_type: 'desc' }],
+      }),
+    );
+  });
+
+  it('advances its own watermark from the newest row it actually saw', async () => {
+    erp.queryAll.mockImplementationOnce(
+      pageOf(['2026-09-20 09:00:00', '2026-09-20 11:30:00']),
+    );
+    await (build() as any).execute();
+    expect(raw.setCatchupWatermark).toHaveBeenCalledWith(
+      'ingest:customer',
+      '2026-09-20 11:30:00',
+    );
+  });
+
+  it('re-reads from the stored watermark, minus the overlap, on later turns', async () => {
+    raw.getCatchupWatermark.mockResolvedValue('2026-09-20 11:30:00');
+    await (build() as any).execute();
+    const [, opts] = erp.queryAll.mock.calls[0];
+    expect(opts.conditions).toEqual([
+      { field_name: 'LastModifiedDate', operator: '>=', value: '2026-09-20 11:00:00' },
+    ]);
+    // No need to ask the ERP for its newest stamp once we have a position.
+    expect(erp.query).not.toHaveBeenCalled();
+  });
+
+  it('keeps its own position, so it cannot move the sweep watermark', async () => {
+    erp.queryAll.mockImplementationOnce(pageOf(['2026-09-20 11:30:00']));
+    await (build() as any).execute();
+    // The catch-up records where IT has read...
+    expect(raw.setCatchupWatermark).toHaveBeenCalledWith(
+      'ingest:customer',
+      '2026-09-20 11:30:00',
+    );
+    // ...and never writes the sweep's watermark, which only a completed full
+    // sweep may earn. Were it to, the backfill's remaining history would be
+    // declared already seen.
+    expect(raw.setWatermark).not.toHaveBeenCalledWith(
+      'ingest:customer',
+      '2026-09-20 11:30:00',
+    );
+  });
+
+  it('does NOT run once the backfill is finished — the normal filter covers it', async () => {
+    raw.getIngestPage.mockResolvedValue(1); // nothing mid-flight
+    raw.getWatermark.mockResolvedValue('2026-09-20 10:00:00');
+    await (build() as any).execute();
+    expect(erp.queryAll).toHaveBeenCalledTimes(1); // the incremental sweep only
+    expect(raw.getCatchupWatermark).not.toHaveBeenCalled();
+  });
+
+  it('can be switched off without touching the backfill', async () => {
+    settings.ERP_CATCHUP = false;
+    await (build() as any).execute();
+    expect(erp.queryAll).toHaveBeenCalledTimes(1);
+  });
+
+  it('never falls back to an unfiltered re-read when the ERP rejects the filter', async () => {
+    erp.queryAll.mockImplementationOnce(async function* () {
+      throw new ErpApiError('CE66014:找不到别名为 LastModifiedDate 的查询列', {} as never);
+    });
+    await (build() as any).execute();
+    // One extra full sweep would be a second multi-day read competing with the
+    // first. The catch-up stands down instead.
+    expect(erp.queryAll).toHaveBeenCalledTimes(2);
+    expect(erp.queryAll.mock.calls[1][1].conditions).toBeUndefined();
+    expect(raw.setCatchupWatermark).not.toHaveBeenCalled();
+  });
+});

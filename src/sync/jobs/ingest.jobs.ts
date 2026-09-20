@@ -172,6 +172,25 @@ abstract class IngestJob extends SyncJob {
     const { conditions, since } = await this.incrementalConditions();
     const isFullSweep = conditions.length === 0;
 
+    // ── Recent changes first, before the backfill continues ──────────────────
+    //
+    // A full sweep reads the feed OLDEST-FIRST and only earns a watermark when it
+    // finishes. On sales_order that is days — 3,875 pages in and not yet half way
+    // — so until it completes there is no incremental filter at all, and a
+    // document edited in the ERP today sits at the very END of the queue. Asked
+    // plainly: "if the ERP is updated, does the data sync on time?" During a
+    // backfill, it did not.
+    //
+    // So each turn now starts with a SHORT pass for whatever changed recently,
+    // and only then continues the backfill with the rest of its budget. The two
+    // keep separate positions (catchup: vs the page cursor), so neither disturbs
+    // the other, and change latency becomes one interval — 30 minutes — no matter
+    // how many days of history are still to load.
+    let caught = { fetched: 0, changed: 0 };
+    if (startPage > 1 && isFullSweep) {
+      caught = await this.catchUpOnRecentChanges();
+    }
+
     // The highest LastModifiedDate actually returned. This — not our clock —
     // becomes the next watermark, so the comparison always happens in the ERP's
     // own time. Stays null if the ERP sends no such field.
@@ -259,7 +278,7 @@ abstract class IngestJob extends SyncJob {
     if (outOfTime) {
       // Incomplete key set — deleting against it would wipe the object.
       if (reconcile) await this.raw.clearSeen(sweepId);
-      return { fetched, changed };
+    return { fetched: fetched + caught.fetched, changed: changed + caught.changed };
     }
 
     await this.raw.clearIngestPage(this.name);
@@ -320,7 +339,7 @@ abstract class IngestJob extends SyncJob {
       );
     }
 
-    return { fetched, changed };
+    return { fetched: fetched + caught.fetched, changed: changed + caught.changed };
   }
 
   /**
@@ -346,6 +365,128 @@ abstract class IngestJob extends SyncJob {
   private sweepOrder(): ErpOrder[] {
     const field = this.config.get<string>('ERP_INCREMENTAL_FIELD') ?? 'LastModifiedDate';
     return [{ field_name: field, order_type: 'asc' }];
+  }
+
+  /**
+   * Pull what the ERP changed RECENTLY, without waiting for the backfill.
+   *
+   * Runs at the top of a turn while a full sweep is still mid-flight, on its own
+   * small budget (ERP_CATCHUP_MAX_MINUTES, default 2) and its own watermark. It
+   * writes through the ordinary key, so a row it fetches now is simply a no-op
+   * when the backfill reaches the same row later — the content hash has not
+   * moved.
+   *
+   * ⚠️ It must never fall back to an unfiltered sweep. sweep() answers a rejected
+   * filter by re-reading EVERYTHING, which here would mean a second full sweep
+   * competing with the first. If the ERP will not filter, catch-up switches
+   * itself off for the process and the backfill carries on alone.
+   */
+  private async catchUpOnRecentChanges(): Promise<{ fetched: number; changed: number }> {
+    const empty = { fetched: 0, changed: 0 };
+    if (IngestJob.incrementalUnavailable) return empty;
+    if ((this.config.get<boolean>('ERP_CATCHUP') ?? true) === false) return empty;
+
+    const field = this.config.get<string>('ERP_INCREMENTAL_FIELD') ?? 'LastModifiedDate';
+    const budgetMs =
+      (this.config.get<number>('ERP_CATCHUP_MAX_MINUTES') ?? 2) * 60_000;
+    if (budgetMs <= 0) return empty;
+
+    let since: string;
+    const stored = await this.raw.getCatchupWatermark(this.name);
+    if (stored) {
+      const overlapMin = this.config.get<number>('ERP_INCREMENTAL_OVERLAP_MINUTES') ?? 30;
+      since = this.shiftErpTimestamp(stored, overlapMin);
+    } else {
+      // First run. Seeding from OUR clock would be wrong by hours — the ERP
+      // declares +8 and this host runs at +1 — and seeding from the newest row we
+      // hold would be worse still: mid-backfill that is 2022 data, so the
+      // "recent" window would span three years. Ask the ERP what its own newest
+      // change is, and look back a bounded window from there.
+      const newest = await this.newestErpTimestamp(field);
+      if (!newest) return empty;
+      const hours = this.config.get<number>('ERP_CATCHUP_LOOKBACK_HOURS') ?? 48;
+      since = this.shiftErpTimestamp(newest, hours * 60);
+    }
+
+    const conditions: ErpCondition[] = [
+      { field_name: field, operator: '>=', value: since },
+    ];
+
+    let fetched = 0;
+    let changed = 0;
+    let pages = 0;
+    let maxSeen: string | null = null;
+    let complete = true;
+    const startedAt = Date.now();
+
+    try {
+      for await (const { rows } of this.erp.queryAll<Record<string, unknown>>(
+        this.method,
+        { conditions, orders: this.sweepOrder() },
+      )) {
+        pages++;
+        const result = await this.raw.upsertMany(this.objectType, rows, (row) =>
+          this.keyOf(row),
+        );
+        fetched += result.fetched;
+        changed += result.changed;
+
+        for (const row of rows) {
+          const value = row[field];
+          if (typeof value === 'string' && (maxSeen === null || value > maxSeen)) {
+            maxSeen = value;
+          }
+        }
+
+        await this.afterPage(rows);
+
+        if (Date.now() - startedAt >= budgetMs) {
+          // Out of time with pages still to come. Do NOT advance the watermark:
+          // the unread remainder must be offered again next turn.
+          complete = false;
+          break;
+        }
+      }
+    } catch (error) {
+      if (!this.isUnknownColumn(error)) throw error;
+      IngestJob.incrementalUnavailable = true;
+      this.logger.warn(
+        `${this.name}: ${field} is not filterable on this ERP build — recent-change ` +
+          `catch-up disabled for this process; the backfill continues alone.`,
+      );
+      return empty;
+    }
+
+    // Only a pass that reached the end of the window can say "everything up to
+    // here is in". A truncated one leaves the watermark where it was.
+    if (complete && maxSeen) await this.raw.setCatchupWatermark(this.name, maxSeen);
+
+    if (fetched > 0 || !complete) {
+      this.logger.log(
+        `${this.name}: catch-up — ${fetched} recent row(s) over ${pages} page(s), ` +
+          `${changed} new/changed, changed since ${since}` +
+          (complete ? '' : ` (budget reached; the rest comes next turn)`),
+      );
+    }
+
+    return { fetched, changed };
+  }
+
+  /**
+   * The newest value of the incremental field anywhere in this ERP feed.
+   *
+   * One request, one row, ordered newest-first. Used only to seed the catch-up
+   * window, and only once per object — it is the ERP's own clock, which is the
+   * only clock that may be compared against the ERP's own timestamps.
+   */
+  private async newestErpTimestamp(field: string): Promise<string | null> {
+    const page = await this.erp.query<Record<string, unknown>>(this.method, {
+      pageSize: 1,
+      pageNo: 1,
+      orders: [{ field_name: field, order_type: 'desc' }],
+    });
+    const value = page.rows[0]?.[field];
+    return typeof value === 'string' && value ? value : null;
   }
 
   private async *sweep(

@@ -285,6 +285,38 @@ export class RawRepository {
     );
   }
 
+  /**
+   * The CATCH-UP watermark: how far the recent-changes stream has been read.
+   *
+   * Deliberately separate from the sweep watermark above. A full sweep reads the
+   * feed oldest-first and only earns a watermark when it finishes, which on
+   * sales_order takes days — so during a backfill there is no incremental filter
+   * at all and a document edited today waits for the sweep to crawl up to it.
+   * This second watermark lets a short recent-changes pass run on every cycle
+   * ALONGSIDE the backfill, without either one disturbing the other's position.
+   */
+  async getCatchupWatermark(job: string): Promise<string | null> {
+    const rows = await this.withRetry(
+      () => this.prisma.$queryRaw<{ cursor_value: string | null }[]>`
+        SELECT cursor_value FROM erp_raw.sync_cursor WHERE job = ${'catchup:' + job}
+      `,
+      `getCatchupWatermark(${job})`,
+    );
+    return rows[0]?.cursor_value ?? null;
+  }
+
+  /** Record how far the catch-up stream has read, in the ERP's own clock. */
+  async setCatchupWatermark(job: string, erpTimestamp: string): Promise<void> {
+    await this.withRetry(
+      () => this.prisma.$executeRaw`
+        INSERT INTO erp_raw.sync_cursor (job, cursor_value, updated_at)
+        VALUES (${'catchup:' + job}, ${erpTimestamp}, now())
+        ON CONFLICT (job) DO UPDATE SET cursor_value = ${erpTimestamp}, updated_at = now()
+      `,
+      `setCatchupWatermark(${job})`,
+    );
+  }
+
   /** When the watermark was last moved — used to force a periodic full re-sweep. */
   async watermarkUpdatedAt(job: string): Promise<Date | null> {
     const rows = await this.withRetry(

@@ -440,6 +440,37 @@ export class EnvVars {
   @Transform(toInt)
   ERP_PROJECTION_INTERVAL_MINUTES: number = 3;
 
+  // ── Recent-change catch-up ──────────────────────────────────────────────
+  //
+  // While an object is still backfilling, each turn first pulls whatever the ERP
+  // changed recently, then continues the backfill with the rest of its budget.
+  //
+  // Without this, a full sweep reads oldest-first and earns no watermark until it
+  // finishes — days, on sales_order — so a document edited today waits for the
+  // sweep to crawl up to it. With it, change latency is one interval regardless
+  // of how much history is left to load.
+  @IsBoolean()
+  @IsOptional()
+  @Transform(toBool)
+  ERP_CATCHUP: boolean = true;
+
+  // The catch-up's slice of a turn. Small on purpose: it only has to carry the
+  // last few minutes of ERP activity, and every minute it takes is a minute the
+  // backfill does not get.
+  @IsInt()
+  @Min(1)
+  @IsOptional()
+  @Transform(toInt)
+  ERP_CATCHUP_MAX_MINUTES: number = 2;
+
+  // How far back the FIRST catch-up looks, measured from the ERP's own newest
+  // change — not from our clock, which is seven hours off the ERP's (+1 vs +8).
+  @IsInt()
+  @Min(1)
+  @IsOptional()
+  @Transform(toInt)
+  ERP_CATCHUP_LOOKBACK_HOURS: number = 48;
+
   // A feed is STALE when it has not completed a run in this many times its own
   // interval. GET /sync/freshness reports it, /health degrades on it, and the
   // hourly check logs it.
