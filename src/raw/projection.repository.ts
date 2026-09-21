@@ -378,8 +378,21 @@ export class ProjectionRepository {
           CREATE TEMP TABLE erp_proj_customer ON COMMIT DROP AS
           WITH src AS (
             SELECT r.id AS raw_id, r.erp_key AS erp_id, r.changed_at, r.payload,
-                   regexp_replace(coalesce(r.payload->>'PhoneNumber', ''), '[^0-9]', '', 'g') AS digits
+                   -- The customer master's own field FIRST, and a contact number
+                   -- harvested off this customer's documents only when it is
+                   -- blank — which on 2026-09-21 was 3,825 of 3,827 customers,
+                   -- confirmed against the live ERP rather than against our copy.
+                   -- See migrations/010_customer_phone.sql. The master always
+                   -- wins the moment the ERP team fills it in; nothing here
+                   -- overwrites a number the ERP actually states.
+                   regexp_replace(
+                     coalesce(
+                       NULLIF(btrim(coalesce(r.payload->>'PhoneNumber', '')), ''),
+                       cp.phone,
+                       ''
+                     ), '[^0-9]', '', 'g') AS digits
             FROM erp_raw.raw_customer r
+            LEFT JOIN erp_raw.customer_phone cp ON cp.erp_customer_code = r.erp_key
             WHERE NULLIF(btrim(coalesce(r.erp_key, '')), '') IS NOT NULL
               AND (
                 ${custSel}

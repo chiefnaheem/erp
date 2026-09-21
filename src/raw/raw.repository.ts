@@ -747,6 +747,65 @@ export class RawRepository {
     }
   }
 
+  /**
+   * Record contact numbers seen on documents, for customers whose ERP master has
+   * none. See migrations/010_customer_phone.sql for why that is the situation.
+   *
+   * Newest document wins: a customer's contact number changes over the years, so
+   * a 2016 delivery must not overwrite what a 2026 one says. Rows without a
+   * usable code or number are dropped here rather than at the call site.
+   */
+  async recordCustomerPhones(
+    entries: { code: string; phone: string; source: string; docDate?: string }[],
+  ): Promise<void> {
+    // Dedupe within the batch, newest first, so one multi-row ON CONFLICT cannot
+    // touch the same row twice (Postgres rejects that outright).
+    const byCode = new Map<string, { phone: string; source: string; docDate: string }>();
+    for (const e of entries) {
+      const code = e.code?.trim();
+      const phone = e.phone?.trim();
+      if (!code || !phone) continue;
+      const docDate = e.docDate?.trim() ?? '';
+      const held = byCode.get(code);
+      if (!held || docDate >= held.docDate) {
+        byCode.set(code, { phone, source: e.source, docDate });
+      }
+    }
+    const rows = [...byCode.entries()];
+    if (rows.length === 0) return;
+
+    for (let i = 0; i < rows.length; i += CHUNK) {
+      const chunk = rows.slice(i, i + CHUNK);
+      const params: unknown[] = [];
+      const values: string[] = [];
+      let p = 1;
+      for (const [code, v] of chunk) {
+        values.push(`($${p}, $${p + 1}, $${p + 2}, $${p + 3}, now())`);
+        params.push(code, v.phone, v.source, v.docDate);
+        p += 4;
+      }
+      await this.withRetry(
+        () =>
+          this.prisma.$executeRawUnsafe(
+            `INSERT INTO erp_raw.customer_phone
+               (erp_customer_code, phone, source, doc_date, updated_at)
+             VALUES ${values.join(', ')}
+             ON CONFLICT (erp_customer_code) DO UPDATE
+               SET phone      = EXCLUDED.phone,
+                   source     = EXCLUDED.source,
+                   doc_date   = EXCLUDED.doc_date,
+                   updated_at = now()
+               -- Only when the incoming document is at least as recent. Without
+               -- this the backfill, which reads oldest-first, would walk a
+               -- current number backwards through ten years of history.
+               WHERE EXCLUDED.doc_date >= erp_raw.customer_phone.doc_date`,
+            ...params,
+          ),
+        'record customer phones',
+      );
+    }
+  }
+
   /** CUSTOMER_ID (Guid) → CUSTOMER_CODE, or null if we've never seen the Guid. */
   async resolveCustomerCode(guid: string): Promise<string | null> {
     const rows = await this.withRetry(
