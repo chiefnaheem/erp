@@ -1,0 +1,25 @@
+-- Remove erp_raw.customer_phone.
+--
+-- A build earlier on 2026-09-21 harvested TELEPHONE (收货电话) off sales_delivery
+-- and sales_return and let the customer projection fall back to it when the
+-- customer master's PhoneNumber was blank — which it is for 3,825 of the 3,827
+-- customers, confirmed against the live ERP.
+--
+-- That was the wrong call, and the instruction that reversed it is the right
+-- one: a customer's phone number comes from the customer record or it does not
+-- come at all.
+--
+-- The reason is data integrity, not tidiness. TELEPHONE on a delivery is the
+-- contact the goods went out against — a driver, a storekeeper, a neighbour, a
+-- one-off number for one shipment. Publishing that as the CUSTOMER's phone
+-- states something the ERP never said, in the column the app uses as a login
+-- identity and an OTP target. A blank that is honestly blank can be fixed by
+-- the ERP team in an afternoon; a plausible-looking wrong number is believed,
+-- acted on, and very hard to find again.
+--
+-- api_docs/customer.query.md lists PhoneNumber as the object's only phone field.
+-- That field, and nothing else, is the source.
+--
+-- IF EXISTS, so this is a no-op where the table was never created.
+
+DROP TABLE IF EXISTS erp_raw.customer_phone;

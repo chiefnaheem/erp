@@ -378,21 +378,19 @@ export class ProjectionRepository {
           CREATE TEMP TABLE erp_proj_customer ON COMMIT DROP AS
           WITH src AS (
             SELECT r.id AS raw_id, r.erp_key AS erp_id, r.changed_at, r.payload,
-                   -- The customer master's own field FIRST, and a contact number
-                   -- harvested off this customer's documents only when it is
-                   -- blank — which on 2026-09-21 was 3,825 of 3,827 customers,
-                   -- confirmed against the live ERP rather than against our copy.
-                   -- See migrations/010_customer_phone.sql. The master always
-                   -- wins the moment the ERP team fills it in; nothing here
-                   -- overwrites a number the ERP actually states.
-                   regexp_replace(
-                     coalesce(
-                       NULLIF(btrim(coalesce(r.payload->>'PhoneNumber', '')), ''),
-                       cp.phone,
-                       ''
-                     ), '[^0-9]', '', 'g') AS digits
+                   -- PhoneNumber from the customer master, and NOTHING else.
+                   --
+                   -- ⚠️ Do not widen this. A customer's phone comes from the
+                   -- customer record or it does not come at all: it is that
+                   -- record's own field, and the ERP is the system of record for
+                   -- it. A number lifted from a sales document is the contact the
+                   -- goods were delivered against — a driver, a storekeeper, a
+                   -- one-off — and writing it here would state, as the customer's
+                   -- own number, something the ERP never says. A blank stays
+                   -- blank; see api_docs/customer.query.md, where PhoneNumber is
+                   -- the only phone field the object has.
+                   regexp_replace(coalesce(r.payload->>'PhoneNumber', ''), '[^0-9]', '', 'g') AS digits
             FROM erp_raw.raw_customer r
-            LEFT JOIN erp_raw.customer_phone cp ON cp.erp_customer_code = r.erp_key
             WHERE NULLIF(btrim(coalesce(r.erp_key, '')), '') IS NOT NULL
               AND (
                 ${custSel}

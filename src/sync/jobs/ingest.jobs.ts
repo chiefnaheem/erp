@@ -749,40 +749,7 @@ export class SalesDeliveryIngestJob extends IngestJob {
   protected keyOf(row: Record<string, unknown>) {
     return usableId(row.SALES_DELIVERY_D_ID) ?? (row.DOC_NO as string | undefined);
   }
-
-  /** Harvest delivery contact numbers — see harvestPhones(). */
-  protected async afterPage(page: Record<string, unknown>[]): Promise<void> {
-    await harvestPhones(this.raw, page, 'sales_delivery');
-  }
 }
-
-/**
- * Record the TELEPHONE (收货电话) on a document against its customer.
- *
- * The ERP's customer master carries a PhoneNumber field and it is blank for
- * 3,825 of 3,827 customers — verified against the live ERP on 2026-09-21, not
- * inferred from our copy. The numbers that exist are on the documents instead,
- * and for the app a customer's phone is the login identifier and the OTP target:
- * without one, that distributor cannot sign in at all.
- *
- * Done here, per page, so the projection can join a table of a few hundred rows
- * instead of scanning 1.24 million delivery rows every three minutes.
- */
-const harvestPhones = async (
-  raw: RawRepository,
-  page: Record<string, unknown>[],
-  source: string,
-): Promise<void> => {
-  const entries = page
-    .map((row) => ({
-      code: String(row.CUSTOMER_CODE ?? '').trim(),
-      phone: String(row.TELEPHONE ?? '').trim(),
-      source,
-      docDate: String(row.DOC_DATE ?? '').trim(),
-    }))
-    .filter((e) => e.code && e.phone);
-  if (entries.length) await raw.recordCustomerPhones(entries);
-};
 
 @Injectable()
 export class CustomerCreditIngestJob extends IngestJob {
@@ -864,11 +831,6 @@ export class SalesReturnIngestJob extends IngestJob {
     const docNo = row.DOC_NO as string | undefined;
     if (!docNo) return undefined;
     return `${docNo}|${lineHash(row, SalesReturnIngestJob.LINE_FIELDS)}`;
-  }
-
-  /** Returns carry the same TELEPHONE field as deliveries. */
-  protected async afterPage(page: Record<string, unknown>[]): Promise<void> {
-    await harvestPhones(this.raw, page, 'sales_return');
   }
 }
 
