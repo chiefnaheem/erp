@@ -208,3 +208,45 @@ describe('SyncScheduler freshness', () => {
     expect(report.staleCount).toBeGreaterThan(0);
   });
 });
+
+/**
+ * Lease recovery on startup.
+ *
+ * A fresh worker must clear the lease a DEAD predecessor left behind, and must
+ * not touch one a LIVE process is holding. Releasing a live holder's lease is
+ * what let two sweeps of the same object run together on 2026-09-22 — and
+ * because each sweep clears the other's reconciliation tags, the one that
+ * finished second deleted 400 customers that were present in the ERP the whole
+ * time.
+ */
+describe('SyncScheduler lease recovery', () => {
+  const build = () => {
+    const config = { get: () => undefined } as never;
+    return new SyncScheduler({} as never, {} as never, {} as never, config) as any;
+  };
+
+  it('treats a lease held by a process that is still running as LIVE', () => {
+    // Our own pid is certainly alive; borrow it as a stand-in for the worker.
+    const alive = `host:${process.pid + 0}`;
+    const s = build();
+    // Same-pid is special-cased as "our own previous incarnation", so use a
+    // different live pid: the parent process, which started us.
+    const parent = process.ppid;
+    expect(s.ownerStillRunning(`host:${parent}`)).toBe(true);
+    expect(alive).toContain('host:');
+  });
+
+  it('treats a lease held by a vanished process as releasable', () => {
+    // A pid that cannot exist.
+    expect(build().ownerStillRunning('host:2147483647')).toBe(false);
+  });
+
+  it('releases its own previous incarnation, which by definition is gone', () => {
+    expect(build().ownerStillRunning(`host:${process.pid}`)).toBe(false);
+  });
+
+  it('treats an unreadable owner as gone rather than blocking forever', () => {
+    expect(build().ownerStillRunning(null)).toBe(false);
+    expect(build().ownerStillRunning('host:not-a-pid')).toBe(false);
+  });
+});

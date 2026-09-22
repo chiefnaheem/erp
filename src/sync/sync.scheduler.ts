@@ -38,20 +38,77 @@ export class SyncScheduler implements OnApplicationBootstrap {
    * On startup, recover from a previous run of THIS worker that died mid-cycle.
    *
    * A hard kill (Ctrl-C, redeploy, crash) leaves the lease held until it expires
-   * — up to SYNC_LOCK_MINUTES — during which every tick stands down. Since a
-   * fresh process on this host means the previous process on this host is gone,
-   * we release any lock this host holds and close out its dangling RUNNING runs.
+   * — up to SYNC_LOCK_MINUTES — during which every tick stands down. So a fresh
+   * process releases the leases whose owner is GONE, and closes out that owner's
+   * dangling RUNNING runs.
    *
-   * This is safe for the normal one-worker-per-host deployment. If you ever run
-   * multiple replicas on a SINGLE host, drop this (the lease alone is enough).
+   * "Whose owner is gone" is doing real work in that sentence: see the note in
+   * onApplicationBootstrap for what releasing a LIVE process's lease cost.
    */
+
+  /**
+   * Is the process that took this lease still alive?
+   *
+   * signal 0 does no work — it only asks the OS whether the pid exists and is
+   * signalable. A pid we cannot see (EPERM: another user) counts as ALIVE, which
+   * is the safe direction: wrongly leaving a lease costs one cycle of waiting,
+   * wrongly releasing one costs deleted rows.
+   */
+  private ownerStillRunning(lockedBy: string | null): boolean {
+    const pid = Number(lockedBy?.split(':').pop());
+    if (!Number.isInteger(pid) || pid <= 0) return false; // unparsable: treat as gone
+    if (pid === process.pid) return false; // our own previous incarnation
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch (error) {
+      return (error as NodeJS.ErrnoException).code === 'EPERM';
+    }
+  }
+
   async onApplicationBootstrap(): Promise<void> {
-    const released = await this.prisma.$executeRaw`
-      UPDATE erp_raw.sync_lock SET locked_until = now()
+    // ⚠️ Only leases whose owning PROCESS IS GONE. This used to release every
+    // lease bearing this hostname, on the reasoning that a fresh process here
+    // means the previous one is dead. That is false the moment a SECOND process
+    // starts beside a live worker — which ops/run-job.js does every time it
+    // boots the application context. The running sweep then lost its lease, a
+    // second sweep of the same object started alongside it, and because each
+    // sweep clears the other's reconciliation tags, whichever finished second
+    // deleted rows that were perfectly present in the ERP. That took
+    // raw_customer from 3,827 rows to 3,427 on 2026-09-22.
+    //
+    // locked_by is `${hostname}:${pid}`, so the owner can simply be asked
+    // whether it is still running.
+    const candidates = await this.prisma.$queryRaw<
+      { name: string; locked_by: string | null }[]
+    >`
+      SELECT name, locked_by FROM erp_raw.sync_lock
       WHERE name IN (${INGEST_LOCK}, ${PROJECT_LOCK})
         AND locked_by LIKE ${this.host + ':%'}
         AND locked_until > now()
     `;
+
+    const dead = candidates
+      .filter(({ locked_by }) => !this.ownerStillRunning(locked_by))
+      .map(({ name }) => name);
+
+    let released = 0;
+    for (const name of dead) {
+      released += await this.prisma.$executeRaw`
+        UPDATE erp_raw.sync_lock SET locked_until = now()
+        WHERE name = ${name} AND locked_until > now()
+      `;
+    }
+
+    for (const { name, locked_by } of candidates) {
+      if (!dead.includes(name)) {
+        this.logger.warn(
+          `leaving the ${name} lease alone — ${locked_by} is still running. ` +
+            `Another process on this host is mid-sweep.`,
+        );
+      }
+    }
+
     if (released > 0) {
       this.logger.warn(
         `released ${released} stale sync lock(s) held by a previous process on ${this.host}`,
