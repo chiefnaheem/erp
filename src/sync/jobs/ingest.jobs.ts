@@ -362,9 +362,27 @@ abstract class IngestJob extends SyncJob {
    * Ascending is the right direction: new and freshly-modified rows land at the
    * END, after the pages already walked, instead of shuffling earlier ones.
    */
+  /**
+   * A UNIQUE field to break ties on, or undefined when the object has none.
+   *
+   * ⚠️ Without this, paging is not deterministic and the sweep silently loses
+   * rows. LastModifiedDate is not unique — the ERP bulk-updates customers, so up
+   * to six share one timestamp — and a tie group straddling a page boundary can
+   * be re-sent on the next page while another row is never sent at all. Measured
+   * on 2026-09-22: a customer sweep returned 3,827 rows containing only 3,727
+   * distinct codes, and the full sweep's reconciliation then DELETED the 100
+   * customers it had not seen. They were never gone from the ERP; the paging had
+   * simply skipped them.
+   */
+  protected readonly sortTiebreaker?: string;
+
   private sweepOrder(): ErpOrder[] {
     const field = this.config.get<string>('ERP_INCREMENTAL_FIELD') ?? 'LastModifiedDate';
-    return [{ field_name: field, order_type: 'asc' }];
+    const order: ErpOrder[] = [{ field_name: field, order_type: 'asc' }];
+    if (this.sortTiebreaker) {
+      order.push({ field_name: this.sortTiebreaker, order_type: 'asc' });
+    }
+    return order;
   }
 
   /**
@@ -645,6 +663,9 @@ const lineHash = (row: Record<string, unknown>, fields: readonly string[]): stri
 @Injectable()
 export class CustomerIngestJob extends IngestJob {
   readonly name = 'ingest:customer';
+
+  /** Tiebreaker for a stable page order: the customer number — one row per customer, and the key this job stores on. */
+  protected readonly sortTiebreaker = 'CUSTOMER_CODE';
   protected readonly method = ERP_METHOD.CUSTOMER_QUERY;
   protected readonly objectType: ErpObjectType = 'CUSTOMER';
 
@@ -690,6 +711,9 @@ export class CustomerIngestJob extends IngestJob {
 @Injectable()
 export class SalesOrderIngestJob extends IngestJob {
   readonly name = 'ingest:sales_order';
+
+  /** Tiebreaker for a stable page order: the subtable primary key, unique per order LINE. */
+  protected readonly sortTiebreaker = 'SALES_ORDER_DOC_D_ID';
   protected readonly method = ERP_METHOD.SALES_ORDER_QUERY;
   protected readonly objectType: ErpObjectType = 'SALES_ORDER';
 
@@ -733,6 +757,9 @@ export class CollectionIngestJob extends IngestJob {
 @Injectable()
 export class SalesDeliveryIngestJob extends IngestJob {
   readonly name = 'ingest:sales_delivery';
+
+  /** Tiebreaker for a stable page order: the subtable primary key, unique per delivery LINE. */
+  protected readonly sortTiebreaker = 'SALES_DELIVERY_D_ID';
   protected readonly method = ERP_METHOD.SALES_DELIVERY_QUERY;
   protected readonly objectType: ErpObjectType = 'SALES_DELIVERY';
 
@@ -848,6 +875,9 @@ export class ArRefundIngestJob extends IngestJob {
 @Injectable()
 export class ArTransferIngestJob extends IngestJob {
   readonly name = 'ingest:ar_transfer';
+
+  /** Tiebreaker for a stable page order: header-only object: 4,440 rows, 4,440 distinct DOC_NO, verified live. */
+  protected readonly sortTiebreaker = 'DOC_NO';
   protected readonly method = ERP_METHOD.AR_TRANSFER_QUERY;
   protected readonly objectType: ErpObjectType = 'AR_TRANSFER';
 

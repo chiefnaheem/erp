@@ -66,7 +66,11 @@ describe('incremental ingest', () => {
     const calls = await runAndCapture();
     expect(calls[0][0]).toBe(ERP_METHOD.CUSTOMER_QUERY);
     expect(calls[0][1].conditions).toBeUndefined(); // no filter
-    expect(calls[0][1].orders).toEqual([{ field_name: 'LastModifiedDate', order_type: 'asc' }]);
+    expect(calls[0][1].orders).toEqual([
+      { field_name: 'LastModifiedDate', order_type: 'asc' },
+      // ...and a unique tiebreaker, without which paging is not deterministic.
+      { field_name: 'CUSTOMER_CODE', order_type: 'asc' },
+    ]);
   });
 
   it('filters on LastModifiedDate once a watermark exists', async () => {
@@ -468,5 +472,51 @@ describe('recent-change catch-up', () => {
     expect(erp.queryAll).toHaveBeenCalledTimes(2);
     expect(erp.queryAll.mock.calls[1][1].conditions).toBeUndefined();
     expect(raw.setCatchupWatermark).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * Deterministic page order.
+ *
+ * The failure this prevents, measured on 2026-09-22 against the production feed:
+ * a customer sweep asked for 3,827 rows ordered by LastModifiedDate alone and
+ * got back 3,827 rows containing only 3,727 distinct customer codes. Up to six
+ * customers share one LastModifiedDate — the ERP bulk-updates them — so a tie
+ * group straddling a page boundary was re-sent on the next page while another
+ * row was never sent at all. The full sweep's reconciliation then deleted the
+ * 100 customers it had not seen. They were never gone from the ERP.
+ */
+describe('sweep page order', () => {
+  const build = (Job: any) => {
+    const config = { get: (k: string) => ({ ERP_INCREMENTAL_FIELD: 'LastModifiedDate' }[k]) };
+    return new Job({}, {}, config);
+  };
+
+  it('breaks ties on a unique field so pages cannot shuffle', () => {
+    const order = (build(CustomerIngestJob) as any).sweepOrder();
+    expect(order).toEqual([
+      { field_name: 'LastModifiedDate', order_type: 'asc' },
+      { field_name: 'CUSTOMER_CODE', order_type: 'asc' },
+    ]);
+  });
+
+  it('keeps the modified date FIRST, so new work still lands at the end', () => {
+    // Ascending-by-modified-date is what lets a days-long sweep resume safely:
+    // freshly changed rows sort past the pages already walked. The tiebreaker
+    // must not disturb that, so it comes second.
+    const [primary] = (build(CustomerIngestJob) as any).sweepOrder();
+    expect(primary).toEqual({ field_name: 'LastModifiedDate', order_type: 'asc' });
+  });
+
+  it('orders by the modified date alone when an object has no unique field', () => {
+    // Not every object exposes one — sales_return has no subtable key at all.
+    // Those keep the old single-field order rather than sorting on something
+    // that is not actually unique, which would buy nothing.
+    class NoTiebreaker extends (CustomerIngestJob as any) {
+      sortTiebreaker = undefined;
+    }
+    expect((build(NoTiebreaker) as any).sweepOrder()).toEqual([
+      { field_name: 'LastModifiedDate', order_type: 'asc' },
+    ]);
   });
 });
