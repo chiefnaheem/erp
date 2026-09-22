@@ -30,9 +30,13 @@ describe('incremental ingest', () => {
     settings = {
       ERP_INCREMENTAL: true,
       ERP_INCREMENTAL_FIELD: 'LastModifiedDate',
+      ERP_PAGE_SIZE: 100,
       ERP_INCREMENTAL_OVERLAP_MINUTES: 30,
     };
-    config = { get: (k: string) => settings[k] };
+    config = {
+      get: (k: string) => settings[k],
+      getOrThrow: (k: string) => settings[k],
+    };
     raw = {
       tableFor: () => 'raw_customer',
       getIngestPage: jest.fn().mockResolvedValue(1),
@@ -343,12 +347,16 @@ describe('recent-change catch-up', () => {
     settings = {
       ERP_INCREMENTAL: true,
       ERP_INCREMENTAL_FIELD: 'LastModifiedDate',
+      ERP_PAGE_SIZE: 100,
       ERP_INCREMENTAL_OVERLAP_MINUTES: 30,
       ERP_CATCHUP: true,
       ERP_CATCHUP_MAX_MINUTES: 2,
       ERP_CATCHUP_LOOKBACK_HOURS: 48,
     };
-    config = { get: (k: string) => settings[k] };
+    config = {
+      get: (k: string) => settings[k],
+      getOrThrow: (k: string) => settings[k],
+    };
     raw = {
       tableFor: () => 'raw_customer',
       // startPage > 1 == a backfill is mid-flight, which is when catch-up runs.
@@ -488,7 +496,9 @@ describe('recent-change catch-up', () => {
  */
 describe('sweep page order', () => {
   const build = (Job: any) => {
-    const config = { get: (k: string) => ({ ERP_INCREMENTAL_FIELD: 'LastModifiedDate' }[k]) };
+    const cfg: Record<string, unknown> = { ERP_INCREMENTAL_FIELD: 'LastModifiedDate',
+      ERP_PAGE_SIZE: 100, ERP_PAGE_SIZE: 100 };
+    const config = { get: (k: string) => cfg[k], getOrThrow: (k: string) => cfg[k] };
     return new Job({}, {}, config);
   };
 

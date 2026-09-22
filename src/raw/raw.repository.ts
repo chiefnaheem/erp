@@ -223,24 +223,55 @@ export class RawRepository {
   // a restart RESUMES. The cursor is cleared when a sweep finishes cleanly, so the
   // next cycle starts fresh from page 1 (a full re-sweep to catch early-page changes).
 
-  async getIngestPage(job: string): Promise<number> {
+  /**
+   * Where to resume, translated into the page size in use NOW.
+   *
+   * ⚠️ A page number means nothing without the size it was counted in. Page 6,342
+   * is row 634,100 at 100 rows per page and row 6,341,000 at 1,000 — so changing
+   * ERP_PAGE_SIZE without translating the cursor makes a sweep resume far past
+   * anything it has read and leave a hole in the history. Exactly the kind of
+   * hole that prompted this: on 2026-09-22 raw_sales_order held nothing between
+   * July 2023 and September 2026.
+   *
+   * So the size is stored beside the page (`page@size`) and the translation
+   * happens here, on ROWS READ, rounded DOWN — re-reading part of a page is a
+   * no-op upsert, skipping part of one is a gap. A bare number is read as the
+   * historical 100-row default.
+   */
+  async getIngestPage(job: string, pageSize: number): Promise<number> {
     const rows = await this.withRetry(
       () => this.prisma.$queryRaw<{ cursor_value: string | null }[]>`
         SELECT cursor_value FROM erp_raw.sync_cursor WHERE job = ${job}
       `,
       `getIngestPage(${job})`,
     );
-    const v = rows[0]?.cursor_value;
-    const n = v ? Number(v) : 0;
-    return Number.isFinite(n) && n > 0 ? n : 1;
+    const raw = rows[0]?.cursor_value;
+    if (!raw) return 1;
+
+    const [pageText, sizeText] = String(raw).split('@');
+    const page = Number(pageText);
+    if (!Number.isFinite(page) || page <= 0) return 1;
+
+    const storedSize = Number(sizeText) || 100;
+    if (storedSize === pageSize) return page;
+
+    const rowsRead = (page - 1) * storedSize;
+    const translated = Math.floor(rowsRead / pageSize) + 1;
+    this.logger.warn(
+      `${job}: resume cursor was page ${page} at ${storedSize} rows/page ` +
+        `(${rowsRead} rows read) — resuming at page ${translated} at ${pageSize} rows/page`,
+    );
+    return translated;
   }
 
-  async setIngestPage(job: string, page: number): Promise<void> {
+  /** Record the resume point WITH the page size it is counted in. */
+  async setIngestPage(job: string, page: number, pageSize: number): Promise<void> {
+    const value = `${page}@${pageSize}`;
     await this.withRetry(
       () => this.prisma.$executeRaw`
         INSERT INTO erp_raw.sync_cursor (job, cursor_value, updated_at)
-        VALUES (${job}, ${String(page)}, now())
-        ON CONFLICT (job) DO UPDATE SET cursor_value = ${String(page)}, updated_at = now()
+        VALUES (${job}, ${value}, now())
+        ON CONFLICT (job) DO UPDATE SET cursor_value = ${value}, updated_at = now()
       `,
       `setIngestPage(${job})`,
     );

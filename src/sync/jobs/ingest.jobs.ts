@@ -165,7 +165,9 @@ abstract class IngestJob extends SyncJob {
     // Resume an interrupted sweep instead of restarting from page 1. The cursor
     // is only set mid-sweep; a clean finish clears it (below), so a normal cycle
     // always starts fresh at page 1.
-    const startPage = await this.raw.getIngestPage(this.name);
+    // The size the cursor is translated against — see getIngestPage().
+    const pageSize = this.config.getOrThrow<number>('ERP_PAGE_SIZE');
+    const startPage = await this.raw.getIngestPage(this.name, pageSize);
 
     // Stamped BEFORE the sweep: anything modified while it runs must be picked up
     // next time, not skipped because we stamped the finish time.
@@ -256,7 +258,7 @@ abstract class IngestJob extends SyncJob {
 
       await this.afterPage(rows);
       // Persist progress so a restart resumes from the next page, not page 1.
-      await this.raw.setIngestPage(this.name, pageNo + 1);
+      await this.raw.setIngestPage(this.name, pageNo + 1, pageSize);
 
       if (budgetMs > 0 && Date.now() - sweepStartedAt >= budgetMs) {
         outOfTime = true;
