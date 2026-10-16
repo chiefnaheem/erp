@@ -376,13 +376,14 @@ abstract class IngestJob extends SyncJob {
    * customers it had not seen. They were never gone from the ERP; the paging had
    * simply skipped them.
    */
-  protected readonly sortTiebreaker?: string;
+  protected readonly sortTiebreaker?: string | string[];
 
   private sweepOrder(): ErpOrder[] {
     const field = this.config.get<string>('ERP_INCREMENTAL_FIELD') ?? 'LastModifiedDate';
     const order: ErpOrder[] = [{ field_name: field, order_type: 'asc' }];
-    if (this.sortTiebreaker) {
-      order.push({ field_name: this.sortTiebreaker, order_type: 'asc' });
+    const extra = this.sortTiebreaker;
+    for (const name of Array.isArray(extra) ? extra : extra ? [extra] : []) {
+      order.push({ field_name: name, order_type: 'asc' });
     }
     return order;
   }
@@ -741,6 +742,9 @@ export class SalesOrderIngestJob extends IngestJob {
 @Injectable()
 export class CollectionIngestJob extends IngestJob {
   readonly name = 'ingest:collection';
+
+  /** Tiebreaker for a stable page order: one row per document: 525,031 rows, 525,031 distinct DOC_NO. */
+  protected readonly sortTiebreaker = 'DOC_NO';
   protected readonly method = ERP_METHOD.COLLECTION_QUERY;
   protected readonly objectType: ErpObjectType = 'COLLECTION';
 
@@ -783,6 +787,9 @@ export class SalesDeliveryIngestJob extends IngestJob {
 @Injectable()
 export class CustomerCreditIngestJob extends IngestJob {
   readonly name = 'ingest:customer_credit';
+
+  /** Tiebreaker for a stable page order: the three fields this job keys on, which together are unique. */
+  protected readonly sortTiebreaker = ['CUSTOMER_CREDIT_ID', 'EFFECTIVE_DATE', 'CREDIT_AMT1'];
   protected readonly method = ERP_METHOD.CUSTOMER_CREDIT_QUERY;
   protected readonly objectType: ErpObjectType = 'CUSTOMER_CREDIT';
 
@@ -817,6 +824,9 @@ export class CustomerCreditIngestJob extends IngestJob {
 @Injectable()
 export class SalesReturnIngestJob extends IngestJob {
   readonly name = 'ingest:sales_return';
+
+  /** Tiebreaker for a stable page order: returns carry LINES and expose no subtable key, so this narrows ties to one document's lines rather than the whole feed. */
+  protected readonly sortTiebreaker = ['DOC_NO', 'DOC_Sequence'];
   protected readonly method = ERP_METHOD.SALES_RETURN_QUERY;
   protected readonly objectType: ErpObjectType = 'SALES_RETURN';
 
@@ -866,6 +876,9 @@ export class SalesReturnIngestJob extends IngestJob {
 @Injectable()
 export class ArRefundIngestJob extends IngestJob {
   readonly name = 'ingest:ar_refund';
+
+  /** Tiebreaker for a stable page order: one row per document: 547 rows, 547 distinct DOC_NO. */
+  protected readonly sortTiebreaker = 'DOC_NO';
   protected readonly method = ERP_METHOD.AR_REFUND_QUERY;
   protected readonly objectType: ErpObjectType = 'AR_REFUND';
 
@@ -892,6 +905,9 @@ export class ArTransferIngestJob extends IngestJob {
 @Injectable()
 export class OtherReceivableIngestJob extends IngestJob {
   readonly name = 'ingest:other_receivable';
+
+  /** Tiebreaker for a stable page order: one row per document: 5,847 rows, 5,847 distinct DOC_NO. */
+  protected readonly sortTiebreaker = 'DOC_NO';
   protected readonly method = ERP_METHOD.OTHER_RECEIVABLE_QUERY;
   protected readonly objectType: ErpObjectType = 'OTHER_RECEIVABLE';
 

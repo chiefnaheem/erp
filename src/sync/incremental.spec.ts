@@ -1,7 +1,17 @@
 import { Logger } from '@nestjs/common';
 import { ErpApiError } from '../erp/erp.errors';
 import { ERP_METHOD } from '../erp/erp.types';
-import { CustomerIngestJob } from './jobs/ingest.jobs';
+import {
+  ArRefundIngestJob,
+  ArTransferIngestJob,
+  CollectionIngestJob,
+  CustomerCreditIngestJob,
+  CustomerIngestJob,
+  OtherReceivableIngestJob,
+  SalesDeliveryIngestJob,
+  SalesOrderIngestJob,
+  SalesReturnIngestJob,
+} from './jobs/ingest.jobs';
 
 /**
  * The incremental filter and its fallback.
@@ -497,7 +507,7 @@ describe('recent-change catch-up', () => {
 describe('sweep page order', () => {
   const build = (Job: any) => {
     const cfg: Record<string, unknown> = { ERP_INCREMENTAL_FIELD: 'LastModifiedDate',
-      ERP_PAGE_SIZE: 100, ERP_PAGE_SIZE: 100 };
+      ERP_PAGE_SIZE: 100 };
     const config = { get: (k: string) => cfg[k], getOrThrow: (k: string) => cfg[k] };
     return new Job({}, {}, config);
   };
@@ -528,5 +538,57 @@ describe('sweep page order', () => {
     expect((build(NoTiebreaker) as any).sweepOrder()).toEqual([
       { field_name: 'LastModifiedDate', order_type: 'asc' },
     ]);
+  });
+});
+
+/**
+ * Every object needs a tiebreaker, not just the ones with a single-field key.
+ *
+ * Measured against the live ERP on 2026-10-16. Asking for the whole
+ * customer_credit feed ordered by LastModifiedDate alone returned 1,884 rows
+ * covering only 1,569 customers; the SAME request with the key appended as a
+ * tiebreaker returned 1,884 rows covering 1,880. The ordering was handing back
+ * some rows twice and omitting 311 customers entirely — among them 40510137,
+ * which has 213 approved collections and was left with no credit row at all.
+ */
+describe('tiebreakers on every object', () => {
+  const build = (Job: any) => {
+    const cfg: Record<string, unknown> = {
+      ERP_INCREMENTAL_FIELD: 'LastModifiedDate',
+      ERP_PAGE_SIZE: 1000,
+    };
+    const config = { get: (k: string) => cfg[k], getOrThrow: (k: string) => cfg[k] };
+    return new Job({}, {}, config) as any;
+  };
+
+  const names = (job: any) => job.sweepOrder().map((o: any) => o.field_name);
+
+  it('orders customer_credit by all three fields its key is built from', () => {
+    // Neither CUSTOMER_CREDIT_ID nor CUSTOMER_CODE is unique here: the ERP holds
+    // one row per credit PERIOD, so a customer can appear several times.
+    expect(names(build(CustomerCreditIngestJob))).toEqual([
+      'LastModifiedDate', 'CUSTOMER_CREDIT_ID', 'EFFECTIVE_DATE', 'CREDIT_AMT1',
+    ]);
+  });
+
+  it('gives the document objects their document number', () => {
+    for (const Job of [CollectionIngestJob, ArRefundIngestJob, OtherReceivableIngestJob]) {
+      expect(names(build(Job))).toEqual(['LastModifiedDate', 'DOC_NO']);
+    }
+  });
+
+  it('leaves no ingest job ordering on the modified date alone', () => {
+    const jobs = [
+      CustomerIngestJob, CustomerCreditIngestJob, SalesOrderIngestJob,
+      SalesDeliveryIngestJob, SalesReturnIngestJob, CollectionIngestJob,
+      ArRefundIngestJob, OtherReceivableIngestJob, ArTransferIngestJob,
+    ];
+    for (const Job of jobs) {
+      const order = names(build(Job));
+      expect(order[0]).toBe('LastModifiedDate');
+      // The whole point: something unique must follow it, or paging a feed with
+      // tied timestamps silently drops rows.
+      expect(order.length).toBeGreaterThan(1);
+    }
   });
 });
