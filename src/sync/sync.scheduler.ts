@@ -344,13 +344,19 @@ export class SyncScheduler implements OnApplicationBootstrap {
   /**
    * Say so, loudly, when a feed has stopped.
    *
-   * Hourly and on its own cron, so it keeps reporting while the problem lasts
+   * Every quarter hour, matching the cadence of the feeds it watches. It ran
+   * hourly when the feeds did; once they moved to 15 minutes that left /health
+   * reporting `degraded` for up to an hour after the cause had cleared — which
+   * is how a health endpoint stops being believed. The check is one aggregate
+   * over erp_raw.sync_run, so running it four times as often costs nothing.
+   *
+   * On its own cron, so it keeps reporting while the problem lasts
    * instead of once at the moment it started. It only reads and logs — the cure
    * for a stalled feed is never "quietly sweep it", because the reason is
    * usually something a person needs to see (the service paused, the ERP
    * refusing a key, the database out of disk).
    */
-  @Cron('0 5 * * * *', { name: 'erp-freshness' })
+  @Cron('0 5,20,35,50 * * * *', { name: 'erp-freshness' })
   async freshnessTick(): Promise<void> {
     let report: Awaited<ReturnType<SyncScheduler['freshness']>>;
     try {
