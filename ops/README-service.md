@@ -63,3 +63,49 @@ curl http://localhost:3100/health
 After any code change: `npm run build` then `pm2 restart erp-sync`.
 Never start the production worker with `npm run start:dev` — that is watch mode,
 and every file save kills the in-flight ERP sweep.
+
+## Keeping it up: the repeating watchdog (added 2026-11-06)
+
+`pm2` restarts the **app** when it crashes. Nothing restarted **pm2**, and that
+gap cost eleven days of sync:
+
+1. 26 Oct — the pm2 daemon stopped. Its saved process list survived, but nothing
+   replays that list except `pm2 resurrect`, and the only thing calling it was
+   the Startup-folder launcher, which runs **at logon only**. The machine stayed
+   logged in, so it never ran. The worker was simply absent.
+2. Someone started the worker by hand, outside pm2 — so no autorestart.
+3. 5 Nov — the database became unreachable for ten minutes. `DbWatchdog` did
+   exactly what it is designed to do and exited the process so a supervisor
+   could hand it a fresh client. There was no supervisor. It stayed down.
+
+Nobody noticed until invoices stopped arriving.
+
+`ops/ensure-up.js` closes it. Run on a REPEATING schedule, it checks in order:
+app online in pm2 → listed but stopped → absent (daemon restarted: `resurrect`,
+then `start` if that did not bring it back) → online but `/health` silent for
+three consecutive probes (a wedged process still reads as "online" to pm2).
+
+Every branch is idempotent, so when all is well it costs one pm2 call and one
+HTTP GET. If pm2 itself cannot be queried it does **nothing** and says so —
+never start a second worker on a guess, because two sweeps of one object delete
+each other's rows (see the note in `ops/run-job.js`).
+
+Register it once, from a normal (non-admin) prompt:
+
+```
+schtasks /create /tn "erp-sync-watchdog" ^
+  /tr "\"C:\Users\ServerPC\Documents\erp\ops\ensure-erp-sync.cmd\"" ^
+  /sc minute /mo 5 /f
+```
+
+That runs every five minutes while this user is logged on — which is how this
+box is actually used. To survive a logout as well, recreate it from an
+ADMINISTRATOR prompt with `/ru SYSTEM` added. Check it with:
+
+```
+schtasks /query /tn "erp-sync-watchdog" /v /fo list | findstr /i "Status Last Next"
+type logs\ensure-up.log
+```
+
+The log stays quiet while the worker is healthy; every line in it is the
+watchdog having had to do something.
