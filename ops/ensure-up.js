@@ -76,13 +76,48 @@ const status = () => {
     say(`could not run pm2: ${error.message.split('\n')[0]} — doing nothing this round`);
     return 'unknown';
   }
-  try {
-    const app = JSON.parse(raw).find((p) => p.name === APP);
-    return app ? app.pm2_env.status : 'absent';
-  } catch {
+  const list = parseProcessList(raw);
+  if (!list) {
     say('pm2 returned output that is not a process list — doing nothing this round');
     return 'unknown';
   }
+  const app = list.find((p) => p.name === APP);
+  return app ? app.pm2_env.status : 'absent';
+};
+
+/**
+ * The process list out of `pm2 jlist` output, or null if there isn't one.
+ *
+ * ⚠️ Not a bare JSON.parse of the whole output. When the daemon is DOWN — the
+ * one case this watchdog exists for — pm2 starts it and narrates first:
+ *
+ *   [PM2] Spawning PM2 daemon with pm2_home=C:\\Users\\...
+ *   [PM2] PM2 Successfully daemonized
+ *   [PM2][Module] Starting NPM module pm2-logrotate
+ *   [{"pid":19544,"name":"pm2-logrotate",...}]
+ *
+ * Parsing that whole blob throws, and the first version of this read the throw
+ * as "pm2 is unreachable" and stood down. Tested on 2026-11-06 by killing the
+ * daemon: the worker stayed dead and the log said "doing nothing this round".
+ *
+ * Note those banner lines ALSO start with '[', so a line cannot be recognised
+ * by its first character — each candidate is parsed, and the first that yields
+ * an array of objects with names is the list.
+ */
+const parseProcessList = (raw) => {
+  for (const line of String(raw).split(/\r?\n/)) {
+    const text = line.trim();
+    if (!text.startsWith('[')) continue;
+    try {
+      const value = JSON.parse(text);
+      if (Array.isArray(value) && value.every((p) => p && typeof p.name === 'string')) {
+        return value;
+      }
+    } catch {
+      // A narration line such as "[PM2] Spawning..." — keep looking.
+    }
+  }
+  return null;
 };
 
 const healthy = () =>
