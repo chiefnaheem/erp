@@ -818,8 +818,29 @@ export class ProjectionRepository {
         const maxRows = Math.max(1_000, opts.maxRowsPerRun);
         const cursor = await this.scanCursor(tx, JOB);
 
+        // ── Freshly changed rows FIRST, then the cursor's slice ──────────────
+        //
+        // The cursor walks the table by id so the permanently-queued backlog
+        // (orders whose distributor has not onboarded) gets worked through
+        // rather than re-read forever. But it also means a brand-new order,
+        // which has the HIGHEST id, waits for the cursor to travel the whole
+        // table to reach it. Measured on 2026-11-06: the cursor sat at 657,167
+        // of 7,405,315, so an invoice already sitting in raw_sales_order within
+        // fifteen minutes was still hours away from appearing in the app.
+        //
+        // So each run takes a small, recent-first helping before its slice. The
+        // two are unioned into one temp table and everything downstream is
+        // unchanged; a row picked up by both is simply upserted once. The
+        // recent pass carries no cursor and must not advance one — it is a
+        // priority lane, not progress through the backlog.
+        const recent = Math.max(100, Math.round(maxRows / 10));
+
+        // The cursor's own slice, kept SEPARATE because the cursor is computed
+        // from it. Mixing the recent rows in here would hand the cursor their
+        // (highest) ids and skip everything between — the backlog would never be
+        // read again.
         await tx.$executeRawUnsafe(`
-          CREATE TEMP TABLE erp_proj_slice ON COMMIT DROP AS
+          CREATE TEMP TABLE erp_proj_cursor_slice ON COMMIT DROP AS
           SELECT r.id, r.payload->>'DOC_NO' AS doc_no_raw
           FROM erp_raw.raw_sales_order r
           WHERE ${sel}
@@ -829,8 +850,26 @@ export class ProjectionRepository {
           LIMIT ${maxRows}
         `);
 
+        // What this run will actually process: the priority lane plus the slice.
+        await tx.$executeRawUnsafe(`
+          CREATE TEMP TABLE erp_proj_slice ON COMMIT DROP AS
+          SELECT id, doc_no_raw FROM (
+            (
+              SELECT r.id, r.payload->>'DOC_NO' AS doc_no_raw
+              FROM erp_raw.raw_sales_order r
+              WHERE ${sel}
+                AND NULLIF(btrim(coalesce(r.payload->>'DOC_NO', '')), '') IS NOT NULL
+              ORDER BY r.changed_at DESC
+              LIMIT ${recent}
+            )
+            UNION
+            SELECT id, doc_no_raw FROM erp_proj_cursor_slice
+          ) both
+        `);
+
+        // ⚠️ Counted over the CURSOR slice only, for the reason above.
         const edge = await tx.$queryRawUnsafe<{ n: bigint; max_id: bigint | null }[]>(
-          `SELECT count(*)::bigint AS n, max(id)::bigint AS max_id FROM erp_proj_slice`,
+          `SELECT count(*)::bigint AS n, max(id)::bigint AS max_id FROM erp_proj_cursor_slice`,
         );
         const sliceRows = Number(edge[0]?.n ?? 0);
         const truncated = sliceRows >= maxRows;
