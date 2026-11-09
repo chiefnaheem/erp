@@ -481,7 +481,25 @@ export class SyncScheduler implements OnApplicationBootstrap {
   }
 
   /**
-   * Objects whose interval has elapsed, in schedule order.
+   * Objects whose interval has elapsed, most overdue first.
+   *
+   * ⚠️ There is deliberately NO "only at its own start minute" test here any
+   * more, and that removal is the fix for a real fault. Each object used to be
+   * eligible at exactly ONE minute in every interval window. A tick is skipped
+   * outright while a sweep is in flight, so any sweep that overran by even a
+   * minute stole the NEXT object's only slot — and that object then waited a
+   * full interval.
+   *
+   * Seen in the ERP's own gateway log on 2026-11-09:
+   * yvijucrm.sales_order_doc.query arriving at 12:52, 13:22, 13:52, 14:22 —
+   * every 30 minutes against a 15-minute setting. sales_delivery (start minute
+   * 21) and sales_order (start minute 7) sit one minute apart in the window, so
+   * they took turns: whichever ran first pushed the other out, every time.
+   *
+   * The stagger the ERP asked for does not depend on that test. ingestTick
+   * dispatches at most ONE sweep per tick and ERP_INGEST_CONCURRENCY is 1, so
+   * two objects cannot start together whatever the minute. offsetMinutes now
+   * only breaks ties.
    *
    * After a restart nothing has a recorded run, so every object is due at once —
    * deliberately: one goes per minute until all are caught up, then each settles
@@ -491,32 +509,31 @@ export class SyncScheduler implements OnApplicationBootstrap {
     const defaultInterval =
       this.config.get<number>('ERP_INGEST_INTERVAL_MINUTES') ?? 60;
     const now = Date.now();
-    const minuteOfHour = new Date(now).getMinutes();
+    // `last` records when a sweep STARTED, a second or two after the tick that
+    // launched it, so the elapsed time at the next tick is always a hair under
+    // the interval — 14.98 minutes for a 15-minute one. Without this grace the
+    // job is judged "not due" and runs at HALF the configured frequency
+    // (customer_credit once ran every 2 hours on a 1-hour setting).
+    const TICK_MS = 60_000;
 
     return this.ingestSchedule
-      .filter(({ job, configKey, offsetMinutes }) => {
+      .map(({ job, configKey, offsetMinutes }) => {
         const intervalMin = this.config.get<number>(configKey) ?? defaultInterval;
         const last = this.lastIngestAt.get(job);
-
-        // Never run in this process: due now (restart catch-up).
-        if (last === undefined) return true;
-
-        // Grace of one tick. `last` records when the sweep STARTED, a second or
-        // two after the tick that launched it, so at the next matching minute the
-        // elapsed time is always a hair under the interval — 59.97 minutes for a
-        // 60-minute interval. Without this the job is judged "not due", waits for
-        // the following matching minute, and silently runs at HALF the configured
-        // frequency (customer_credit was running every 2 hours, not every 1).
-        const TICK_MS = 60_000;
-        if (now - last < intervalMin * 60_000 - TICK_MS) return false;
-
-        // Past due AND at its own start minute, so two objects with the same
-        // interval still do not fire together. If the offset minute is missed
-        // (a long sweep overran it), the next matching minute picks it up.
-        return intervalMin >= 60
-          ? minuteOfHour === offsetMinutes % 60
-          : minuteOfHour % intervalMin === offsetMinutes % intervalMin;
+        // Never run in this process: due now, and more overdue than anything
+        // that has run — that is the restart catch-up.
+        const overdueMs =
+          last === undefined
+            ? Number.MAX_SAFE_INTEGER
+            : now - last - (intervalMin * 60_000 - TICK_MS);
+        return { job, offsetMinutes, overdueMs };
       })
+      .filter(({ overdueMs }) => overdueMs >= 0)
+      // Most overdue first, so a job that lost its turn is first in line for the
+      // next one. Ties — every job on a fresh process, where none has run — fall
+      // back to schedule order, so customer still goes first and builds the
+      // Guid->code bridge the later objects read.
+      .sort((a, b) => b.overdueMs - a.overdueMs || a.offsetMinutes - b.offsetMinutes)
       .map(({ job }) => job);
   }
 

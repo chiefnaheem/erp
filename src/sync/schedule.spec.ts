@@ -44,14 +44,56 @@ describe('SyncScheduler per-object schedule', () => {
     expect(scheduler.dueJobs()).not.toContain('ingest:customer');
   });
 
-  it('runs an object again at its own minute once the interval has passed', () => {
+  it('runs an object as soon as its interval has passed, at ANY minute', () => {
     scheduler.lastIngestAt.set('ingest:customer', at(9, 0)); // offset 0
     jest.spyOn(Date, 'now').mockReturnValue(at(10, 0));
     expect(scheduler.dueJobs()).toContain('ingest:customer');
 
-    // ...but not at some other minute of the hour
+    // ...and still at 10:03, three minutes later.
+    //
+    // This assertion used to be the opposite, and that was the bug. A job was
+    // eligible at exactly ONE minute per interval window, so losing that minute
+    // to a sweep already in flight cost it a WHOLE interval. The ERP's gateway
+    // log showed sales_order arriving every 30 minutes on a 15-minute setting
+    // because sales_delivery, one minute ahead of it in the window, kept
+    // overrunning into its slot.
     jest.spyOn(Date, 'now').mockReturnValue(at(10, 3));
-    expect(scheduler.dueJobs()).not.toContain('ingest:customer');
+    expect(scheduler.dueJobs()).toContain('ingest:customer');
+  });
+
+  it('retries the very next minute when a sweep stole the slot', () => {
+    // sales_delivery starts at :06 and overruns; sales_order's :07 tick is
+    // skipped because a sweep is in flight. At :08 it must still be due — not
+    // fifteen minutes later.
+    scheduler.lastIngestAt.set('ingest:sales_order', at(9, 22));
+    settings.ERP_INTERVAL_SALES_ORDER = 15;
+    jest.spyOn(Date, 'now').mockReturnValue(at(9, 37)); // its own minute, missed
+    expect(scheduler.dueJobs()).toContain('ingest:sales_order');
+    jest.spyOn(Date, 'now').mockReturnValue(at(9, 38)); // the one after
+    expect(scheduler.dueJobs()).toContain('ingest:sales_order');
+    jest.spyOn(Date, 'now').mockReturnValue(at(9, 41));
+    expect(scheduler.dueJobs()).toContain('ingest:sales_order');
+  });
+
+  it('puts the most overdue object first, so nothing starves', () => {
+    settings.ERP_INGEST_INTERVAL_MINUTES = 15;
+    jest.spyOn(Date, 'now').mockReturnValue(at(10, 0));
+    // customer ran recently; sales_order has been waiting far longer.
+    scheduler.lastIngestAt.set('ingest:customer', at(9, 44));
+    scheduler.lastIngestAt.set('ingest:sales_order', at(9, 10));
+    scheduler.lastIngestAt.set('ingest:collection', at(9, 30));
+    for (const j of ['ingest:sales_delivery', 'ingest:customer_credit', 'ingest:sales_return',
+      'ingest:ar_refund', 'ingest:other_receivable', 'ingest:ar_transfer']) {
+      scheduler.lastIngestAt.set(j, at(9, 59));
+    }
+    expect(scheduler.dueJobs()[0]).toBe('ingest:sales_order');
+  });
+
+  it('still lets customer go first on a fresh process, for the Guid bridge', () => {
+    // Nothing has run, so everything ties — schedule order decides, and the
+    // customer sweep is what fills erp_raw.customer_link that the document
+    // objects resolve against.
+    expect(scheduler.dueJobs()[0]).toBe('ingest:customer');
   });
 
   it('honours a per-object interval override', () => {
