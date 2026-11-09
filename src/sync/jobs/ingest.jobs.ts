@@ -188,6 +188,13 @@ abstract class IngestJob extends SyncJob {
     // keep separate positions (catchup: vs the page cursor), so neither disturbs
     // the other, and change latency becomes one interval — 30 minutes — no matter
     // how many days of history are still to load.
+    // The turn's clock starts HERE, before the catch-up, so one turn cannot
+    // exceed ERP_SWEEP_MAX_MINUTES in total. It used to start after, giving
+    // the catch-up its own separate budget on top — so a 2-minute box really
+    // meant up to 4, and sales_delivery turns averaged 231s. A turn blocks
+    // every other object, and that overrun is what knocked them off their
+    // 15-minute slots.
+    const turnStartedAt = Date.now();
     let caught = { fetched: 0, changed: 0 };
     if (startPage > 1 && isFullSweep) {
       caught = await this.catchUpOnRecentChanges();
@@ -204,7 +211,7 @@ abstract class IngestJob extends SyncJob {
     // cursor already lets a sweep resume, so a big object can take its time across
     // many short turns instead of monopolising the worker in one long one.
     const budgetMs = (this.config.get<number>('ERP_SWEEP_MAX_MINUTES') ?? 10) * 60_000;
-    const sweepStartedAt = Date.now();
+    const sweepStartedAt = turnStartedAt;
     let outOfTime = false;
 
     // Full sweeps also RECONCILE: they record every key returned and afterwards

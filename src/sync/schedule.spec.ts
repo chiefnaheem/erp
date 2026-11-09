@@ -75,7 +75,7 @@ describe('SyncScheduler per-object schedule', () => {
     expect(scheduler.dueJobs()).toContain('ingest:sales_order');
   });
 
-  it('puts the most overdue object first, so nothing starves', () => {
+  it('puts the object that is ON TIME first, and still lists the stragglers', () => {
     settings.ERP_INGEST_INTERVAL_MINUTES = 15;
     jest.spyOn(Date, 'now').mockReturnValue(at(10, 0));
     // customer ran recently; sales_order has been waiting far longer.
@@ -86,7 +86,12 @@ describe('SyncScheduler per-object schedule', () => {
       'ingest:ar_refund', 'ingest:other_receivable', 'ingest:ar_transfer']) {
       scheduler.lastIngestAt.set(j, at(9, 59));
     }
-    expect(scheduler.dueJobs()[0]).toBe('ingest:sales_order');
+    const due = scheduler.dueJobs();
+    // customer sits exactly on its 10:00 slot, so it leads — being on time is
+    // what earns the tick. sales_order has waited far longer and is still in
+    // the list; it takes one of the six minutes an hour nobody is scheduled for.
+    expect(due[0]).toBe('ingest:customer');
+    expect(due).toContain('ingest:sales_order');
   });
 
   it('still lets customer go first on a fresh process, for the Guid bridge', () => {
@@ -290,5 +295,136 @@ describe('SyncScheduler lease recovery', () => {
   it('treats an unreadable owner as gone rather than blocking forever', () => {
     expect(build().ownerStillRunning(null)).toBe(false);
     expect(build().ownerStillRunning('host:not-a-pid')).toBe(false);
+  });
+});
+
+/**
+ * The cadence holds to the clock, not to the last run.
+ *
+ * Measured on 2026-11-09 after the first fix: sales_order started at 15:49,
+ * 16:04, 16:23, 16:43, 17:03 — fifteen minutes, then nineteen, then twenty,
+ * then twenty. Due time was `last start + interval`, so a run delayed by
+ * contention became the base for the next and the lateness compounded until the
+ * feed had quietly halved its rate again.
+ */
+describe('SyncScheduler cadence is anchored to the clock', () => {
+  let settings: Record<string, unknown>;
+  let scheduler: any;
+
+  const at = (hh: number, mm: number, ss = 0) =>
+    new Date(2026, 10, 9, hh, mm, ss).getTime();
+
+  beforeEach(() => {
+    settings = { ERP_INGEST_INTERVAL_MINUTES: 15, SYNC_ENABLED: true };
+    const raw = { lastSuccessByJob: () => Promise.resolve(new Map()) };
+    const config = { get: (k: string) => settings[k] } as never;
+    scheduler = new SyncScheduler({} as never, {} as never, raw as never, config);
+  });
+
+  afterEach(() => jest.restoreAllMocks());
+
+  it('does not move the next target when a run starts late', () => {
+    // sales_order's grid at interval 15, offset 7: :07, :22, :37, :52.
+    // It was blocked at :07 and only got away at :10.
+    scheduler.lastIngestAt.set('ingest:sales_order', at(10, 10));
+
+    // Not due again at :21 — its slot has not come round.
+    jest.spyOn(Date, 'now').mockReturnValue(at(10, 21));
+    expect(scheduler.dueJobs()).not.toContain('ingest:sales_order');
+
+    // Due at :22, the next point on the grid. The late start did NOT push this
+    // out to :25, which is what produced 19- and 20-minute gaps.
+    jest.spyOn(Date, 'now').mockReturnValue(at(10, 22));
+    expect(scheduler.dueJobs()).toContain('ingest:sales_order');
+  });
+
+  it('runs once per slot, not twice', () => {
+    scheduler.lastIngestAt.set('ingest:sales_order', at(10, 22, 1));
+    jest.spyOn(Date, 'now').mockReturnValue(at(10, 23));
+    expect(scheduler.dueJobs()).not.toContain('ingest:sales_order');
+    jest.spyOn(Date, 'now').mockReturnValue(at(10, 36));
+    expect(scheduler.dueJobs()).not.toContain('ingest:sales_order');
+  });
+
+  it('keeps every object on its own fifteen-minute grid', () => {
+    const slots = (offset: number) =>
+      [0, 1, 2, 3].map((n) => {
+        const t = at(10, 0) + n * 15 * 60_000;
+        const s = scheduler.slotStart(t + 14 * 60_000, 15, offset);
+        return new Date(s).getMinutes();
+      });
+    // Four targets an hour, exactly fifteen minutes apart, for any offset.
+    for (const offset of [0, 7, 14, 21, 28, 56]) {
+      const minutes = slots(offset);
+      const gaps = minutes.map((m, i) => (i === 0 ? 15 : (m - minutes[i - 1] + 60) % 60));
+      expect(gaps.every((g) => g === 15)).toBe(true);
+    }
+  });
+
+  it('still catches a feed up after a restart, before anything else', () => {
+    jest.spyOn(Date, 'now').mockReturnValue(at(10, 3));
+    // Nothing has run in this process: all nine are due at once.
+    expect(scheduler.dueJobs()).toHaveLength(9);
+    expect(scheduler.dueJobs()[0]).toBe('ingest:customer');
+  });
+});
+
+/**
+ * The tick belongs to the job that is ON TIME.
+ *
+ * Most-overdue-first sounds like the fair rule and is the wrong one: the job
+ * sitting exactly on its slot is the LEAST overdue in the list, so it lost
+ * every time something else was running late — and the job that was on time is
+ * the one knocked off its grid. Seen at 17:22 on 2026-11-09, where
+ * other_receivable (three minutes late) took the tick that belonged to
+ * sales_order (due that very minute), which then did not run until 17:32.
+ */
+describe('SyncScheduler gives the tick to the job at its slot', () => {
+  let settings: Record<string, unknown>;
+  let scheduler: any;
+  const at = (hh: number, mm: number, ss = 0) =>
+    new Date(2026, 10, 9, hh, mm, ss).getTime();
+
+  beforeEach(() => {
+    settings = { ERP_INGEST_INTERVAL_MINUTES: 15, SYNC_ENABLED: true };
+    const raw = { lastSuccessByJob: () => Promise.resolve(new Map()) };
+    scheduler = new SyncScheduler({} as never, {} as never, raw as never,
+      { get: (k: string) => settings[k] } as never);
+  });
+
+  afterEach(() => jest.restoreAllMocks());
+
+  it('prefers the object whose slot is this minute over one running late', () => {
+    // other_receivable: offset 49 -> slot minutes :04 :19 :34 :49 — late since :19.
+    // sales_order:      offset 7  -> slot minutes :07 :22 :37 :52 — due right now.
+    scheduler.lastIngestAt.set('ingest:other_receivable', at(10, 3));
+    scheduler.lastIngestAt.set('ingest:sales_order', at(10, 11));
+    for (const j of ['ingest:customer', 'ingest:collection', 'ingest:sales_delivery',
+      'ingest:customer_credit', 'ingest:sales_return', 'ingest:ar_refund',
+      'ingest:ar_transfer']) {
+      scheduler.lastIngestAt.set(j, at(10, 21));
+    }
+
+    jest.spyOn(Date, 'now').mockReturnValue(at(10, 22));
+    const due = scheduler.dueJobs();
+    expect(due).toContain('ingest:other_receivable'); // still due, just not first
+    expect(due[0]).toBe('ingest:sales_order');
+  });
+
+  it('still serves the late job on a minute nobody is scheduled for', () => {
+    scheduler.lastIngestAt.set('ingest:other_receivable', at(10, 3));
+    for (const j of ['ingest:customer', 'ingest:sales_order', 'ingest:collection',
+      'ingest:sales_delivery', 'ingest:customer_credit', 'ingest:sales_return',
+      'ingest:ar_refund', 'ingest:ar_transfer']) {
+      scheduler.lastIngestAt.set(j, at(10, 23));
+    }
+    // :24 is not a slot minute for any object, so the straggler gets it.
+    jest.spyOn(Date, 'now').mockReturnValue(at(10, 24));
+    expect(scheduler.dueJobs()[0]).toBe('ingest:other_receivable');
+  });
+
+  it('keeps restart catch-up ahead of everything, customer first', () => {
+    jest.spyOn(Date, 'now').mockReturnValue(at(10, 22));
+    expect(scheduler.dueJobs()[0]).toBe('ingest:customer');
   });
 });

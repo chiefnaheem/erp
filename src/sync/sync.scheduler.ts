@@ -509,32 +509,77 @@ export class SyncScheduler implements OnApplicationBootstrap {
     const defaultInterval =
       this.config.get<number>('ERP_INGEST_INTERVAL_MINUTES') ?? 60;
     const now = Date.now();
-    // `last` records when a sweep STARTED, a second or two after the tick that
-    // launched it, so the elapsed time at the next tick is always a hair under
-    // the interval — 14.98 minutes for a 15-minute one. Without this grace the
-    // job is judged "not due" and runs at HALF the configured frequency
-    // (customer_credit once ran every 2 hours on a 1-hour setting).
-    const TICK_MS = 60_000;
 
     return this.ingestSchedule
       .map(({ job, configKey, offsetMinutes }) => {
         const intervalMin = this.config.get<number>(configKey) ?? defaultInterval;
+        const slot = this.slotStart(now, intervalMin, offsetMinutes);
         const last = this.lastIngestAt.get(job);
-        // Never run in this process: due now, and more overdue than anything
-        // that has run — that is the restart catch-up.
-        const overdueMs =
-          last === undefined
-            ? Number.MAX_SAFE_INTEGER
-            : now - last - (intervalMin * 60_000 - TICK_MS);
-        return { job, offsetMinutes, overdueMs };
+        return {
+          job,
+          offsetMinutes,
+          slot,
+          // Never run in this process — the restart catch-up.
+          neverRun: last === undefined,
+          due: last === undefined || last < slot,
+        };
       })
-      .filter(({ overdueMs }) => overdueMs >= 0)
-      // Most overdue first, so a job that lost its turn is first in line for the
-      // next one. Ties — every job on a fresh process, where none has run — fall
-      // back to schedule order, so customer still goes first and builds the
-      // Guid->code bridge the later objects read.
-      .sort((a, b) => b.overdueMs - a.overdueMs || a.offsetMinutes - b.offsetMinutes)
+      .filter(({ due }) => due)
+      // ⚠️ NEWEST SLOT FIRST, which is not the same as "most overdue first" and
+      // is deliberately the opposite of it.
+      //
+      // Most-overdue-first reads as the fair choice and is the wrong one here,
+      // because the job sitting exactly ON its slot is the least overdue thing
+      // in the list and therefore always lost to anything running late. Seen at
+      // 17:22 on 2026-11-09: other_receivable, three minutes past its own slot,
+      // took the tick that belonged to sales_order, which was due that very
+      // minute — so the job that was ON TIME is the one knocked off its grid.
+      //
+      // Every object has a distinct slot minute (the offsets differ), so at most
+      // one job is at its slot in any given minute. Giving that job the tick
+      // keeps it exactly on its interval, and a job that missed a slot still
+      // gets served on the minutes where nobody is scheduled — six of every
+      // fifteen.
+      //
+      // A fresh process is the exception: nothing has run, everything is due,
+      // and those go first in schedule order so customer leads and builds the
+      // Guid->code bridge the document objects read.
+      .sort((a, b) => {
+        // Catch-up first, and among those strictly in schedule order: on a fresh
+        // process every job is due and none has a meaningful slot to compare, so
+        // sorting them by slot would scramble the order that puts customer — and
+        // the Guid->code bridge it builds — ahead of the document objects.
+        if (a.neverRun !== b.neverRun) return Number(b.neverRun) - Number(a.neverRun);
+        if (a.neverRun) return a.offsetMinutes - b.offsetMinutes;
+        return b.slot - a.slot || a.offsetMinutes - b.offsetMinutes;
+      })
       .map(({ job }) => job);
+  }
+
+  /**
+   * The most recent point on a job's fixed clock grid, at or before `now`.
+   *
+   * ⚠️ The grid is why the cadence holds. Due time used to be measured from the
+   * PREVIOUS START — `last + interval` — so a run delayed by contention became
+   * the base for the next one and the lateness compounded. Measured on
+   * 2026-11-09 after the first fix, sales_order went 15:49, 16:04, 16:23, 16:43,
+   * 17:03: fifteen minutes, then nineteen, then twenty, then twenty, drifting
+   * further out every cycle on a 15-minute setting.
+   *
+   * Anchored to the clock instead, a job's targets are fixed — :07, :22, :37,
+   * :52 for a 15-minute interval at offset 7 — and a late run does NOT move the
+   * next one. A run that slips to :10 is followed by :22, which pulls the
+   * spacing straight back. The long-run rate is then exactly the configured
+   * interval, which is what "every 15 minutes" has to mean.
+   *
+   * Anchored to the epoch rather than the top of the hour so an interval that
+   * does not divide 60 still gets an even grid instead of a short slot each
+   * hour.
+   */
+  private slotStart(now: number, intervalMin: number, offsetMinutes: number): number {
+    const intervalMs = Math.max(1, intervalMin) * 60_000;
+    const offsetMs = (offsetMinutes % Math.max(1, intervalMin)) * 60_000;
+    return Math.floor((now - offsetMs) / intervalMs) * intervalMs + offsetMs;
   }
 
   // PROJECT: erp_raw → public.*. Runs on its own, more frequent schedule (every
