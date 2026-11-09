@@ -324,25 +324,25 @@ describe('SyncScheduler cadence is anchored to the clock', () => {
   afterEach(() => jest.restoreAllMocks());
 
   it('does not move the next target when a run starts late', () => {
-    // sales_order's grid at interval 15, offset 7: :07, :22, :37, :52.
-    // It was blocked at :07 and only got away at :10.
-    scheduler.lastIngestAt.set('ingest:sales_order', at(10, 10));
+    // sales_order's grid at interval 15, offset 12: :12, :27, :42, :57.
+    // It was blocked at :12 and only got away at :15.
+    scheduler.lastIngestAt.set('ingest:sales_order', at(10, 15));
 
-    // Not due again at :21 — its slot has not come round.
-    jest.spyOn(Date, 'now').mockReturnValue(at(10, 21));
+    // Not due again at :26 — its slot has not come round.
+    jest.spyOn(Date, 'now').mockReturnValue(at(10, 26));
     expect(scheduler.dueJobs()).not.toContain('ingest:sales_order');
 
-    // Due at :22, the next point on the grid. The late start did NOT push this
-    // out to :25, which is what produced 19- and 20-minute gaps.
-    jest.spyOn(Date, 'now').mockReturnValue(at(10, 22));
+    // Due at :27, the next point on the grid. The late start did NOT push this
+    // out to :30, which is what produced 19- and 20-minute gaps.
+    jest.spyOn(Date, 'now').mockReturnValue(at(10, 27));
     expect(scheduler.dueJobs()).toContain('ingest:sales_order');
   });
 
   it('runs once per slot, not twice', () => {
-    scheduler.lastIngestAt.set('ingest:sales_order', at(10, 22, 1));
-    jest.spyOn(Date, 'now').mockReturnValue(at(10, 23));
+    scheduler.lastIngestAt.set('ingest:sales_order', at(10, 27, 1));
+    jest.spyOn(Date, 'now').mockReturnValue(at(10, 28));
     expect(scheduler.dueJobs()).not.toContain('ingest:sales_order');
-    jest.spyOn(Date, 'now').mockReturnValue(at(10, 36));
+    jest.spyOn(Date, 'now').mockReturnValue(at(10, 41));
     expect(scheduler.dueJobs()).not.toContain('ingest:sales_order');
   });
 
@@ -395,31 +395,32 @@ describe('SyncScheduler gives the tick to the job at its slot', () => {
   afterEach(() => jest.restoreAllMocks());
 
   it('prefers the object whose slot is this minute over one running late', () => {
-    // other_receivable: offset 49 -> slot minutes :04 :19 :34 :49 — late since :19.
-    // sales_order:      offset 7  -> slot minutes :07 :22 :37 :52 — due right now.
-    scheduler.lastIngestAt.set('ingest:other_receivable', at(10, 3));
-    scheduler.lastIngestAt.set('ingest:sales_order', at(10, 11));
+    // other_receivable: offset 5  -> slot minutes :05 :20 :35 :50 — late since :20.
+    // sales_order:      offset 12 -> slot minutes :12 :27 :42 :57 — due right now.
+    scheduler.lastIngestAt.set('ingest:other_receivable', at(10, 10));
+    scheduler.lastIngestAt.set('ingest:sales_order', at(10, 14));
     for (const j of ['ingest:customer', 'ingest:collection', 'ingest:sales_delivery',
       'ingest:customer_credit', 'ingest:sales_return', 'ingest:ar_refund',
       'ingest:ar_transfer']) {
-      scheduler.lastIngestAt.set(j, at(10, 21));
+      scheduler.lastIngestAt.set(j, at(10, 26));
     }
 
-    jest.spyOn(Date, 'now').mockReturnValue(at(10, 22));
+    jest.spyOn(Date, 'now').mockReturnValue(at(10, 27));
     const due = scheduler.dueJobs();
     expect(due).toContain('ingest:other_receivable'); // still due, just not first
     expect(due[0]).toBe('ingest:sales_order');
   });
 
   it('still serves the late job on a minute nobody is scheduled for', () => {
-    scheduler.lastIngestAt.set('ingest:other_receivable', at(10, 3));
+    scheduler.lastIngestAt.set('ingest:other_receivable', at(10, 10));
     for (const j of ['ingest:customer', 'ingest:sales_order', 'ingest:collection',
       'ingest:sales_delivery', 'ingest:customer_credit', 'ingest:sales_return',
       'ingest:ar_refund', 'ingest:ar_transfer']) {
-      scheduler.lastIngestAt.set(j, at(10, 23));
+      scheduler.lastIngestAt.set(j, at(10, 27));
     }
-    // :24 is not a slot minute for any object, so the straggler gets it.
-    jest.spyOn(Date, 'now').mockReturnValue(at(10, 24));
+    // :28 is not a slot minute for any object (slots are 0,2,3,4,5,6,7,9,12),
+    // so the straggler gets it.
+    jest.spyOn(Date, 'now').mockReturnValue(at(10, 28));
     expect(scheduler.dueJobs()[0]).toBe('ingest:other_receivable');
   });
 

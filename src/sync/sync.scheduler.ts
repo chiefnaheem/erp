@@ -160,15 +160,30 @@ export class SyncScheduler implements OnApplicationBootstrap {
     configKey: string;
     offsetMinutes: number;
   }[] = [
+    // ── Slot minutes, and why these numbers ────────────────────────────────
+    //
+    // At a 15-minute interval a job's slot is offsetMinutes % 15, so these lay
+    // nine objects across a fifteen-minute window. They used to be 0, 7, 14, 21,
+    // 28, 35, 42, 49, 56 — which modulo 15 is 0, 7, 14, 6, 13, 5, 12, 4, 11, and
+    // that put sales_delivery (6) one minute ahead of sales_order (7).
+    //
+    // One minute is not enough. sales_delivery is the one object whose turn
+    // regularly runs the full ERP_SWEEP_MAX_MINUTES — it is the big backfill —
+    // so it was still sweeping when sales_order's slot came round, every single
+    // cycle. Measured 2026-11-09: sales_delivery on its slot at 18:21, and
+    // sales_order pushed from 18:22 to 18:24.
+    //
+    // So the long-running object gets THREE clear minutes after it, and the
+    // quick ones (3-30s each) sit a minute apart where that is harmless.
     { job: 'ingest:customer', configKey: 'ERP_INTERVAL_CUSTOMER', offsetMinutes: 0 },
-    { job: 'ingest:sales_order', configKey: 'ERP_INTERVAL_SALES_ORDER', offsetMinutes: 7 },
-    { job: 'ingest:collection', configKey: 'ERP_INTERVAL_COLLECTION', offsetMinutes: 14 },
-    { job: 'ingest:sales_delivery', configKey: 'ERP_INTERVAL_SALES_DELIVERY', offsetMinutes: 21 },
-    { job: 'ingest:customer_credit', configKey: 'ERP_INTERVAL_CUSTOMER_CREDIT', offsetMinutes: 28 },
-    { job: 'ingest:sales_return', configKey: 'ERP_INTERVAL_SALES_RETURN', offsetMinutes: 35 },
-    { job: 'ingest:ar_refund', configKey: 'ERP_INTERVAL_AR_REFUND', offsetMinutes: 42 },
-    { job: 'ingest:other_receivable', configKey: 'ERP_INTERVAL_OTHER_RECEIVABLE', offsetMinutes: 49 },
-    { job: 'ingest:ar_transfer', configKey: 'ERP_INTERVAL_AR_TRANSFER', offsetMinutes: 56 },
+    { job: 'ingest:collection', configKey: 'ERP_INTERVAL_COLLECTION', offsetMinutes: 2 },
+    { job: 'ingest:customer_credit', configKey: 'ERP_INTERVAL_CUSTOMER_CREDIT', offsetMinutes: 3 },
+    { job: 'ingest:sales_return', configKey: 'ERP_INTERVAL_SALES_RETURN', offsetMinutes: 4 },
+    { job: 'ingest:other_receivable', configKey: 'ERP_INTERVAL_OTHER_RECEIVABLE', offsetMinutes: 5 },
+    { job: 'ingest:ar_refund', configKey: 'ERP_INTERVAL_AR_REFUND', offsetMinutes: 6 },
+    { job: 'ingest:ar_transfer', configKey: 'ERP_INTERVAL_AR_TRANSFER', offsetMinutes: 7 },
+    { job: 'ingest:sales_delivery', configKey: 'ERP_INTERVAL_SALES_DELIVERY', offsetMinutes: 9 },
+    { job: 'ingest:sales_order', configKey: 'ERP_INTERVAL_SALES_ORDER', offsetMinutes: 12 },
   ];
 
   /** When each object last STARTED a sweep, so intervals are measured from a run
