@@ -864,7 +864,7 @@ export class ProjectionRepository {
             )
             UNION
             SELECT id, doc_no_raw FROM erp_proj_cursor_slice
-          ) both
+          ) recent_and_slice
         `);
 
         // ⚠️ Counted over the CURSOR slice only, for the reason above.
