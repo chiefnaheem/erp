@@ -109,3 +109,50 @@ type logs\ensure-up.log
 
 The log stays quiet while the worker is healthy; every line in it is the
 watchdog having had to do something.
+
+## Is the sync healthy? (start here)
+
+One URL answers it. Anything other than `"status":"ok"` with an empty
+`staleFeeds` needs a look:
+
+```
+curl http://localhost:3100/health
+curl http://localhost:3100/sync/freshness     # per-feed: when each last COMPLETED
+```
+
+`freshness` reads `erp_raw.sync_run`, so it survives a restart and tells the
+truth about a feed that has stopped. A job failing every cycle shows up here as
+stale, because a failed run never completes.
+
+**When something looks wrong, read the job's own status — not a sample row.**
+A projection was failing 477 times in a row on 2026-11-09 while the data it had
+written the day before still looked fine; checking a row said "working", and
+`sync_run` said FAILED the whole time:
+
+```sql
+SELECT job, status, started_at, rows_fetched, rows_projected, error
+FROM erp_raw.sync_run
+WHERE started_at > now() - interval '1 hour'
+ORDER BY started_at DESC;
+```
+
+Then the logs, in order of usefulness:
+
+```
+pm2 logs erp-sync --lines 200          # live
+type logs\erp-sync.err.log             # failures only
+type logs\ensure-up.log                # the watchdog; SILENT means healthy
+```
+
+### The sync stopped overnight
+
+Check whether the machine was even awake before suspecting the code:
+
+```powershell
+(Get-CimInstance Win32_OperatingSystem).LastBootUpTime
+Get-ScheduledTaskInfo -TaskName 'erp-sync-watchdog' | Select LastRunTime, LastTaskResult
+```
+
+On 2026-11-12 the answer was a 01:34 Windows Update reboot and a watchdog task
+that only ran at logon — see ops/install-watchdog-task.ps1, which fixes exactly
+that.

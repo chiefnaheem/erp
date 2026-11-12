@@ -1085,6 +1085,8 @@ export class ProjectionRepository {
     full: boolean;
     statementTimeoutMs: number;
     txTimeoutMs: number;
+    /** Raw rows one run may read. See the bounded-slice note inside. */
+    maxRowsPerRun: number;
   }): Promise<ProjectionResult> {
     const JOB = 'project:payment';
 
@@ -1095,6 +1097,45 @@ export class ProjectionRepository {
       async (tx, wm) => {
         const notes: string[] = [];
         const sel = this.selector('r', wm, opts.full);
+
+        // ── A BOUNDED slice, newest changes first ───────────────────────────
+        //
+        // This used to read every row the selector matched, with no limit. The
+        // selector matches `projected_at IS NULL`, and most collections are
+        // permanently in that state — their distributor has not onboarded, so
+        // they are deliberately left queued. Measured over one hour on
+        // 2026-11-12: 2,261,591 rows read to write 968, with 13 of 19 runs
+        // writing nothing at all. The same read, every three minutes, for ever.
+        //
+        // Same shape as the purchase job: a recent-first helping so a payment
+        // taken moments ago lands immediately, plus a slice walked by id from a
+        // cursor so the backlog is still worked through rather than re-read.
+        // The cursor is computed from the CURSOR SLICE ALONE — mixing the recent
+        // rows in would hand it their (highest) ids and strand everything
+        // between.
+        const maxRows = Math.max(1_000, opts.maxRowsPerRun);
+        const recent = Math.max(100, Math.round(maxRows / 10));
+        const cursor = await this.scanCursor(tx, JOB);
+
+        await tx.$executeRawUnsafe(`
+          CREATE TEMP TABLE erp_proj_payment_slice ON COMMIT DROP AS
+          SELECT r.id
+          FROM erp_raw.raw_collection r
+          WHERE ${sel} AND r.id > ${cursor}
+          ORDER BY r.id
+          LIMIT ${maxRows}
+        `);
+
+        const payEdge = await tx.$queryRawUnsafe<{ n: bigint; max_id: bigint | null }[]>(
+          `SELECT count(*)::bigint AS n, max(id)::bigint AS max_id FROM erp_proj_payment_slice`,
+        );
+        const payRows = Number(payEdge[0]?.n ?? 0);
+        const payTruncated = payRows >= maxRows;
+        await this.setScanCursor(
+          tx,
+          JOB,
+          payTruncated ? Number(payEdge[0]?.max_id ?? 0) : 0,
+        );
 
         await tx.$executeRawUnsafe(`
           CREATE TEMP TABLE erp_proj_payment ON COMMIT DROP AS
@@ -1108,7 +1149,14 @@ export class ProjectionRepository {
           FROM erp_raw.raw_collection r
           LEFT JOIN public."Customer" cust
             ON cust."erpId" = r.payload->>'CUSTOMER_CODE' AND cust.password IS NOT NULL
-          WHERE ${sel}
+          WHERE r.id IN (
+            (SELECT id FROM erp_proj_payment_slice)
+            UNION
+            (SELECT id FROM erp_raw.raw_collection r2
+             WHERE ${this.selector('r2', wm, opts.full)}
+             ORDER BY r2.changed_at DESC
+             LIMIT ${recent})
+          )
         `);
 
         const fetched = await this.count(tx, 'erp_proj_payment');

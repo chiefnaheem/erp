@@ -215,6 +215,7 @@ export class PaymentProjectionJob extends ProjectionJob {
       full: this.full,
       statementTimeoutMs: this.statementTimeoutMs,
       txTimeoutMs: this.txTimeoutMs,
+      maxRowsPerRun: this.config.get<number>('ERP_PROJECT_MAX_ROWS_PER_RUN') ?? 100_000,
     });
     return this.toStats(result);
   }
