@@ -41,7 +41,15 @@ const PORT = Number(process.env.SYNC_PORT || 3100);
 const UNHEALTHY_STRIKES = Number(process.env.ENSURE_UP_STRIKES || 3);
 
 const say = (line) => {
-  const stamp = new Date().toISOString().replace('T', ' ').slice(0, 19);
+  // LOCAL time, deliberately. This used to stamp UTC, so a recovery at 11:46
+  // was logged as 10:46 and did not line up with pm2's logs, the ERP gateway
+  // log or the Windows event log — which is exactly when you are trying to
+  // correlate them.
+  const d = new Date();
+  const pad = (n) => String(n).padStart(2, '0');
+  const stamp =
+    `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ` +
+    `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
   try {
     mkdirSync(join(ROOT, 'logs'), { recursive: true });
     appendFileSync(LOG, `[${stamp}] ${line}\n`);

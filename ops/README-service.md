@@ -156,3 +156,45 @@ Get-ScheduledTaskInfo -TaskName 'erp-sync-watchdog' | Select LastRunTime, LastTa
 On 2026-11-12 the answer was a 01:34 Windows Update reboot and a watchdog task
 that only ran at logon — see ops/install-watchdog-task.ps1, which fixes exactly
 that.
+
+## After the S4U change: `pm2 list` says EPERM
+
+Expected, and worth knowing before it confuses someone at 2am.
+
+The watchdog task now runs without an interactive logon (LogonType S4U), so the
+pm2 daemon it starts lives in that session. pm2's control channel is a named
+pipe owned by that session, so running `pm2 list`, `pm2 logs` or
+`pm2 restart` from an ordinary prompt gets:
+
+```
+Error: connect EPERM \.\pipe\rpc.sock
+```
+
+The worker is fine — only the CLI cannot reach it. Use these instead, all of
+which work from any session:
+
+| instead of | use |
+|---|---|
+| `pm2 list` | `curl http://localhost:3100/health` |
+| checking the feeds | `curl http://localhost:3100/sync/freshness` |
+| `pm2 logs erp-sync` | `type logs\erp-sync.out.log` / `logs\erp-sync.err.log` |
+| `pm2 restart erp-sync` | `Start-ScheduledTask -TaskName 'erp-sync-watchdog'` after `pm2 kill`, or reboot |
+
+To get the CLI back temporarily, stop the task and start pm2 yourself:
+
+```
+Stop-ScheduledTask -TaskName 'erp-sync-watchdog'
+pm2 kill
+pm2 start ecosystem.config.js
+pm2 save
+```
+
+…but remember that a daemon started interactively dies with the session and
+will NOT come back after a reboot until someone logs in — which is the whole
+problem the S4U task exists to solve. Re-enable the task afterwards with
+`Start-ScheduledTask`.
+
+**A second worker cannot sweep concurrently even if two daemons end up running.**
+The ingest lease in `erp_raw.sync_lock` is held in the database, not in the
+process, so the second one stands down. The worst case is a duplicate crash-
+looping on EADDRINUSE against port 3100, which is noisy rather than harmful.
