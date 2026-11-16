@@ -13,14 +13,17 @@ describe('SyncScheduler per-object schedule', () => {
   let scheduler: any;
   /** Whatever the freshness check reads: job → when it last finished cleanly. */
   let lastSuccess: Map<string, Date>;
-  let raw: { lastSuccessByJob: () => Promise<Map<string, Date>> };
+  let raw: {
+    lastSuccessByJob: () => Promise<Map<string, Date>>;
+    watermarksByJob: () => Promise<Map<string, string>>;
+  };
 
   const at = (hh: number, mm: number) => new Date(2026, 7, 28, hh, mm, 0).getTime();
 
   beforeEach(() => {
     settings = { ERP_INGEST_INTERVAL_MINUTES: 60, SYNC_ENABLED: true };
     lastSuccess = new Map();
-    raw = { lastSuccessByJob: () => Promise.resolve(lastSuccess) };
+    raw = { lastSuccessByJob: () => Promise.resolve(lastSuccess), watermarksByJob: () => Promise.resolve(new Map()) };
     const config = { get: (k: string) => settings[k] } as never;
     scheduler = new SyncScheduler({} as never, {} as never, raw as never, config);
   });
@@ -195,7 +198,7 @@ describe('SyncScheduler freshness', () => {
       SYNC_ENABLED: true,
     };
     lastSuccess = new Map();
-    const raw = { lastSuccessByJob: () => Promise.resolve(lastSuccess) };
+    const raw = { lastSuccessByJob: () => Promise.resolve(lastSuccess), watermarksByJob: () => Promise.resolve(new Map()) };
     const config = { get: (k: string) => settings[k] } as never;
     scheduler = new SyncScheduler({} as never, {} as never, raw as never, config);
   });
@@ -316,7 +319,7 @@ describe('SyncScheduler cadence is anchored to the clock', () => {
 
   beforeEach(() => {
     settings = { ERP_INGEST_INTERVAL_MINUTES: 15, SYNC_ENABLED: true };
-    const raw = { lastSuccessByJob: () => Promise.resolve(new Map()) };
+    const raw = { lastSuccessByJob: () => Promise.resolve(new Map()), watermarksByJob: () => Promise.resolve(new Map()) };
     const config = { get: (k: string) => settings[k] } as never;
     scheduler = new SyncScheduler({} as never, {} as never, raw as never, config);
   });
@@ -387,7 +390,7 @@ describe('SyncScheduler gives the tick to the job at its slot', () => {
 
   beforeEach(() => {
     settings = { ERP_INGEST_INTERVAL_MINUTES: 15, SYNC_ENABLED: true };
-    const raw = { lastSuccessByJob: () => Promise.resolve(new Map()) };
+    const raw = { lastSuccessByJob: () => Promise.resolve(new Map()), watermarksByJob: () => Promise.resolve(new Map()) };
     scheduler = new SyncScheduler({} as never, {} as never, raw as never,
       { get: (k: string) => settings[k] } as never);
   });

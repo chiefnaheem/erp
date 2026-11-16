@@ -293,6 +293,12 @@ export class SyncScheduler implements OnApplicationBootstrap {
       minutesSince: number | null;
       staleAfterMinutes: number;
       stale: boolean;
+      /** Newest ERP timestamp this feed HOLDS (ERP clock), ingest feeds only. */
+      newestDataAt?: string | null;
+      /** Hours between that and now. Null when the feed keeps no watermark. */
+      dataAgeHours?: number | null;
+      /** True when the DATA has stood still, however healthy the job looks. */
+      dataStale?: boolean;
     }[];
   }> {
     const defaultInterval =
@@ -303,6 +309,9 @@ export class SyncScheduler implements OnApplicationBootstrap {
     const now = Date.now();
 
     const lastSuccess = await this.raw.lastSuccessByJob();
+    // How recent the DATA is, not just the job. See watermarksByJob().
+    const watermarks = await this.raw.watermarksByJob();
+    const dataStaleHours = this.config.get<number>('ERP_DATA_STALE_HOURS') ?? 24;
 
     // The projection is checked too: a fresh raw table that never reaches
     // public.* leaves the app just as wrong as a stale sweep would.
@@ -320,12 +329,28 @@ export class SyncScheduler implements OnApplicationBootstrap {
       const at = lastSuccess.get(job) ?? null;
       const minutesSince = at ? Math.round((now - at.getTime()) / 60_000) : null;
       const staleAfterMinutes = everyMinutes * multiple;
+
+      // The ERP's timestamps are its own clock, and 'YYYY-MM-DD HH:mm:ss' is
+      // parsed here as UTC purely to get an age in hours. An hour or two of
+      // offset does not matter against a threshold measured in days, and the
+      // value is reported verbatim so a reader sees the ERP's own string.
+      const newestDataAt = watermarks.get(job) ?? null;
+      const parsed = newestDataAt
+        ? new Date(`${newestDataAt.replace(' ', 'T')}Z`).getTime()
+        : NaN;
+      const dataAgeHours = Number.isNaN(parsed)
+        ? null
+        : Math.round(((now - parsed) / 3_600_000) * 10) / 10;
+
       return {
         job,
         everyMinutes,
         lastSuccessAt: at ? at.toISOString() : null,
         minutesSince,
         staleAfterMinutes,
+        newestDataAt,
+        dataAgeHours,
+        dataStale: dataAgeHours !== null && dataAgeHours > dataStaleHours,
         // Never having run at all counts as stale — that is the state a feed is
         // in when it was wired up but never scheduled, which is worth shouting
         // about rather than rendering as a blank.
@@ -383,8 +408,31 @@ export class SyncScheduler implements OnApplicationBootstrap {
       return;
     }
 
+    // A feed whose DATA has stood still, however punctually the job runs.
+    //
+    // This is reported before (and independently of) staleness, because the two
+    // failures look nothing alike from here: a stale feed has stopped running
+    // and shouts about it, while a frozen feed keeps answering SUCCESS every 15
+    // minutes with nothing behind it. On 2026-11-16 this very check printed
+    // "all 12 feed(s) current" while ingest:sales_order had held the same
+    // watermark for two days and the app showed no new invoices. A quiet night
+    // or a weekend will trip this too — hence a warning that names the ERP's
+    // own timestamp, and not an error.
+    const frozen = report.feeds.filter((f) => f.dataStale);
+    for (const feed of frozen) {
+      this.logger.warn(
+        `freshness: ${feed.job} is RUNNING but its data has not moved in ` +
+          `${feed.dataAgeHours}h — newest record it holds is ${feed.newestDataAt} ` +
+          `(ERP clock). Either the ERP has been quiet that long, or this feed is ` +
+          `reading a window it never finishes; check for a full sweep in progress.`,
+      );
+    }
+
     if (report.staleCount === 0) {
-      this.logger.log(`freshness: all ${report.feeds.length} feed(s) current`);
+      this.logger.log(
+        `freshness: all ${report.feeds.length} feed(s) current` +
+          (frozen.length ? `, but ${frozen.length} with data older than expected` : ''),
+      );
       return;
     }
 

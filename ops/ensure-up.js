@@ -22,7 +22,7 @@
 // Every path is idempotent, so running it every few minutes costs one pm2 call
 // and one HTTP GET when all is well.
 const { execFileSync } = require('node:child_process');
-const { appendFileSync, mkdirSync } = require('node:fs');
+const { appendFileSync, mkdirSync, existsSync, unlinkSync } = require('node:fs');
 const { join } = require('node:path');
 const http = require('node:http');
 
@@ -39,6 +39,22 @@ const PM2_JS =
 const PORT = Number(process.env.SYNC_PORT || 3100);
 /** A wedged process is only restarted after this many consecutive bad probes. */
 const UNHEALTHY_STRIKES = Number(process.env.ENSURE_UP_STRIKES || 3);
+/**
+ * Drop this file to have the next watchdog run restart the worker.
+ *
+ * The worker runs in the scheduled task's own session, so an ordinary shell
+ * cannot signal it: `pm2 restart` answers EPERM on the daemon's pipe, and even
+ * Stop-Process on the pid is "Access is denied". That left no way to pick up a
+ * new build without an administrator prompt — which is exactly the kind of
+ * manual step this whole setup exists to remove. The watchdog already runs in
+ * the right session every few minutes, so it does the restart on request:
+ *
+ *   echo > logs\.restart-requested && Start-ScheduledTask -TaskName erp-sync-watchdog
+ *
+ * The file is consumed BEFORE the restart, so a restart that fails is not
+ * retried for ever in a loop.
+ */
+const RESTART_REQUEST = join(ROOT, 'logs', '.restart-requested');
 
 const say = (line) => {
   // LOCAL time, deliberately. This used to stamp UTC, so a recovery at 11:46
@@ -174,6 +190,23 @@ const writeStrikes = (n) => {
     }
     writeStrikes(0);
     say('started');
+    return;
+  }
+
+  // An operator (or a deploy) has asked for a restart. Honoured whatever the
+  // health check would say, because a worker running happily on the PREVIOUS
+  // build is exactly the case this exists for.
+  if (existsSync(RESTART_REQUEST)) {
+    try { unlinkSync(RESTART_REQUEST); } catch { /* consumed either way */ }
+    say('restart requested — restarting the worker');
+    try {
+      pm2('restart', APP);
+      writeStrikes(0);
+      say('restarted on request');
+    } catch (error) {
+      say(`requested restart failed: ${error.message.split('\n')[0]}`);
+      process.exitCode = 1;
+    }
     return;
   }
 

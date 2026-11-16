@@ -815,6 +815,44 @@ export class RawRepository {
     return new Map(rows.map((r) => [r.job, r.finished_at]));
   }
 
+  /**
+   * The newest ERP timestamp we HOLD per ingest job, from its watermark.
+   *
+   * The companion to lastSuccessByJob(), and the question it cannot answer.
+   * lastSuccessByJob() says "we asked the ERP and it answered"; this says "and
+   * this is how recent the answer was". A feed can keep answering SUCCESS every
+   * 15 minutes for days while the data behind it stands still — which is
+   * exactly what ingest:sales_order did from 14 to 16 November 2026 while the
+   * app showed no new invoices and every freshness check reported it current.
+   *
+   * Returned as the raw ERP string ('YYYY-MM-DD HH:mm:ss', the ERP's own
+   * clock), because that is the only clock these values may be compared in.
+   */
+  async watermarksByJob(): Promise<Map<string, string>> {
+    const rows = await this.withRetry(
+      () => this.prisma.$queryRaw<{ job: string; cursor_value: string }[]>`
+        -- BOTH lanes. The sweep watermark is deliberately frozen for the whole
+        -- of a full sweep (only a completed sweep earns one), so on its own it
+        -- reports a multi-day-old feed as stale while the catch-up lane is
+        -- quietly keeping it current. The newest data we hold is the later of
+        -- the two, and both are ERP timestamps in the same sortable format.
+        SELECT job, max(cursor_value) AS cursor_value
+        FROM (
+          SELECT replace(job, 'watermark:', '') AS job, cursor_value
+          FROM erp_raw.sync_cursor
+          WHERE job LIKE 'watermark:ingest:%'
+          UNION ALL
+          SELECT replace(job, 'catchup:', '') AS job, cursor_value
+          FROM erp_raw.sync_cursor
+          WHERE job LIKE 'catchup:ingest:%'
+        ) lanes
+        GROUP BY job
+      `,
+      'watermarksByJob',
+    );
+    return new Map(rows.map((r) => [r.job, r.cursor_value]));
+  }
+
   async startRun(job: string): Promise<bigint> {
     const rows = await this.withRetry(
       () => this.prisma.$queryRaw<{ id: bigint }[]>`

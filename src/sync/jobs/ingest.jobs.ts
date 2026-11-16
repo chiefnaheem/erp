@@ -196,6 +196,10 @@ abstract class IngestJob extends SyncJob {
     // 15-minute slots.
     const turnStartedAt = Date.now();
     let caught = { fetched: 0, changed: 0 };
+    // `startPage > 1` means a full sweep is genuinely mid-flight, which is the
+    // only time this lane is needed: a sweep that finishes inside one turn has
+    // already read the whole feed. The first turn of a long sweep therefore has
+    // no catch-up, which costs one interval of latency, once per sweep.
     if (startPage > 1 && isFullSweep) {
       caught = await this.catchUpOnRecentChanges();
     }
@@ -385,12 +389,23 @@ abstract class IngestJob extends SyncJob {
    */
   protected readonly sortTiebreaker?: string | string[];
 
-  private sweepOrder(): ErpOrder[] {
+  /**
+   * The page order for a sweep.
+   *
+   * `desc` is for the catch-up lane only, which wants the NEWEST changes first
+   * and can afford to read just the first page or two. The backfill stays `asc`:
+   * it walks the feed from the beginning and its page cursor is meaningless if
+   * the order flips underneath it.
+   *
+   * The tiebreaker direction follows the primary field so the total order stays
+   * consistent either way.
+   */
+  private sweepOrder(direction: 'asc' | 'desc' = 'asc'): ErpOrder[] {
     const field = this.config.get<string>('ERP_INCREMENTAL_FIELD') ?? 'LastModifiedDate';
-    const order: ErpOrder[] = [{ field_name: field, order_type: 'asc' }];
+    const order: ErpOrder[] = [{ field_name: field, order_type: direction }];
     const extra = this.sortTiebreaker;
     for (const name of Array.isArray(extra) ? extra : extra ? [extra] : []) {
-      order.push({ field_name: name, order_type: 'asc' });
+      order.push({ field_name: name, order_type: direction });
     }
     return order;
   }
@@ -448,9 +463,12 @@ abstract class IngestJob extends SyncJob {
     const startedAt = Date.now();
 
     try {
+      // NEWEST FIRST. This is the whole point of the lane: one page then holds
+      // the most recent changes in the feed, so today's documents land on the
+      // first page read rather than after the window has been drained.
       for await (const { rows } of this.erp.queryAll<Record<string, unknown>>(
         this.method,
-        { conditions, orders: this.sweepOrder() },
+        { conditions, orders: this.sweepOrder('desc') },
       )) {
         pages++;
         const result = await this.raw.upsertMany(this.objectType, rows, (row) =>
@@ -469,8 +487,8 @@ abstract class IngestJob extends SyncJob {
         await this.afterPage(rows);
 
         if (Date.now() - startedAt >= budgetMs) {
-          // Out of time with pages still to come. Do NOT advance the watermark:
-          // the unread remainder must be offered again next turn.
+          // Out of time with pages still to come. Reading newest-first, the
+          // unread remainder is OLDER than everything we just took.
           complete = false;
           break;
         }
@@ -485,15 +503,35 @@ abstract class IngestJob extends SyncJob {
       return empty;
     }
 
-    // Only a pass that reached the end of the window can say "everything up to
-    // here is in". A truncated one leaves the watermark where it was.
-    if (complete && maxSeen) await this.raw.setCatchupWatermark(this.name, maxSeen);
+    // Advance to the newest timestamp this pass actually saw, EVEN IF the pass
+    // ran out of budget.
+    //
+    // ⚠️ This looks unsafe and is the opposite of what the code did before, so
+    // the reasoning matters. Reading newest-first, a truncated pass has read the
+    // NEWEST part of the window and left an older remainder unread. Committing
+    // the high-water mark therefore skips that older remainder in this lane —
+    // which is sound for one reason only: this lane runs EXCLUSIVELY alongside a
+    // full sweep, and a full sweep reads every row in the feed and reconciles.
+    // Nothing this lane steps over is lost; it is merely picked up by the
+    // backfill instead, which is the division of labour the lane was built on —
+    // the backfill owns completeness, the catch-up owns freshness.
+    //
+    // Holding the watermark back instead is what broke sales_order. Its window
+    // (9 days of line-level changes) cannot be drained inside
+    // ERP_CATCHUP_MAX_MINUTES, so every pass ended truncated, every pass refused
+    // to commit, and the lane re-read the same oldest 5,000 rows every 15
+    // minutes from 2026-11-07 to 2026-11-16 — 0 new/changed, every single time,
+    // while invoices raised that morning sat unread at the far end of the
+    // window. The app and the CRM showed nothing newer than 14 November for two
+    // days, and `sync_run` said SUCCESS for all 96 of the day's runs.
+    if (maxSeen) await this.raw.setCatchupWatermark(this.name, maxSeen);
 
     if (fetched > 0 || !complete) {
       this.logger.log(
         `${this.name}: catch-up — ${fetched} recent row(s) over ${pages} page(s), ` +
           `${changed} new/changed, changed since ${since}` +
-          (complete ? '' : ` (budget reached; the rest comes next turn)`),
+          (maxSeen ? `, now current to ${maxSeen}` : '') +
+          (complete ? '' : ` (budget reached; older rows left to the backfill)`),
       );
     }
 

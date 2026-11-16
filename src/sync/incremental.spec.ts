@@ -474,6 +474,63 @@ describe('recent-change catch-up', () => {
     expect(raw.getCatchupWatermark).not.toHaveBeenCalled();
   });
 
+  /**
+   * The 2026-11-16 outage, as a test.
+   *
+   * sales_order's catch-up window held nine days of line-level changes — far
+   * more than ERP_CATCHUP_MAX_MINUTES can read. Every pass ended truncated, and
+   * a truncated pass used to refuse to commit its watermark, so the next pass
+   * started from the same place and re-read the same oldest pages. It ran 96
+   * times in one day, reported SUCCESS every time, fetched ~5,000 rows every
+   * time, and stored 0 new rows every time, while the invoices raised that
+   * morning sat unread at the far end of the window.
+   */
+  it('commits what it read even when it runs out of budget', async () => {
+    settings.ERP_CATCHUP_MAX_MINUTES = 0.0001; // truncate on the first page
+    erp.queryAll.mockImplementationOnce(async function* () {
+      yield {
+        pageNo: 1,
+        rows: [{ CUSTOMER_CODE: 'C1', LastModifiedDate: '2026-09-20 11:30:00' }],
+      };
+      yield {
+        pageNo: 2,
+        rows: [{ CUSTOMER_CODE: 'C2', LastModifiedDate: '2026-09-20 09:00:00' }],
+      };
+    });
+
+    await (build() as any).execute();
+
+    // The old code called setCatchupWatermark only when the pass completed, so
+    // this assertion is the regression guard: a truncated pass must still move.
+    expect(raw.setCatchupWatermark).toHaveBeenCalledWith(
+      'ingest:customer',
+      '2026-09-20 11:30:00',
+    );
+  });
+
+  it('asks for the NEWEST changes first, so one page is enough to stay current', async () => {
+    await (build() as any).execute();
+    const [, catchupOpts] = erp.queryAll.mock.calls[0];
+    // Newest-first is what makes committing a truncated pass safe: the rows it
+    // leaves behind are OLDER than everything it took, and the full sweep
+    // running alongside it reads those anyway.
+    expect(catchupOpts.orders[0]).toEqual({
+      field_name: 'LastModifiedDate',
+      order_type: 'desc',
+    });
+    for (const order of catchupOpts.orders) {
+      expect(order.order_type).toBe('desc');
+    }
+  });
+
+  it('leaves the BACKFILL reading oldest-first, so its page cursor still means something', async () => {
+    await (build() as any).execute();
+    const [, backfillOpts] = erp.queryAll.mock.calls[1];
+    for (const order of backfillOpts.orders) {
+      expect(order.order_type).toBe('asc');
+    }
+  });
+
   it('can be switched off without touching the backfill', async () => {
     settings.ERP_CATCHUP = false;
     await (build() as any).execute();
