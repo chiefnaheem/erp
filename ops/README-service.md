@@ -144,6 +144,44 @@ type logs\erp-sync.err.log             # failures only
 type logs\ensure-up.log                # the watchdog; SILENT means healthy
 ```
 
+### "Everything says SUCCESS but the app shows no new records"
+
+The hardest one, because every status light is green. A job can run on time,
+report SUCCESS and fetch thousands of rows while storing none of them — so ask
+how old the DATA is, not when the job last ran:
+
+```
+curl http://localhost:3100/sync/freshness
+```
+
+Each ingest feed now carries `newestDataAt` (the newest ERP timestamp it
+holds), `dataAgeHours`, and `dataStale`. `staleCount` can be 0 while a feed is
+frozen solid; that is precisely the case this field exists for.
+
+A feed reading `dataStale` is not automatically a fault — the ERP may simply
+have been quiet, which is the honest answer for `ingest:sales_return` (no
+return documents since September 2026). Confirm against the ERP before
+treating it as a bug:
+
+```sql
+-- what we hold, per feed
+SELECT job, cursor_value FROM erp_raw.sync_cursor
+WHERE job LIKE 'watermark:ingest:%' OR job LIKE 'catchup:ingest:%' ORDER BY job;
+```
+
+On 2026-11-16 `ingest:sales_order` had held `2026-11-14 18:22:35` for two days
+while running every 15 minutes. The cause was a full sweep in progress (the
+page cursor `ingest:sales_order` sits at `<page>@<size>`): during one, the
+sweep watermark is frozen by design and the catch-up lane is the only thing
+keeping the feed current. Check that the lane is actually advancing —
+
+```
+findstr /C:"catch-up" logs\erp-sync.out.log
+```
+
+— and that `now current to` moves between runs. If it does not, the lane is
+re-reading a window it never finishes.
+
 ### The sync stopped overnight
 
 Check whether the machine was even awake before suspecting the code:
@@ -178,7 +216,24 @@ which work from any session:
 | `pm2 list` | `curl http://localhost:3100/health` |
 | checking the feeds | `curl http://localhost:3100/sync/freshness` |
 | `pm2 logs erp-sync` | `type logs\erp-sync.out.log` / `logs\erp-sync.err.log` |
-| `pm2 restart erp-sync` | `Start-ScheduledTask -TaskName 'erp-sync-watchdog'` after `pm2 kill`, or reboot |
+| `pm2 restart erp-sync` | see **Restarting / deploying** below |
+
+### Restarting, and deploying a new build
+
+`pm2 restart` answers EPERM from an ordinary shell, and even
+`Stop-Process -Id <worker pid>` is "Access is denied" — the worker lives in the
+task's own session. So ask the watchdog, which is already in that session:
+
+```
+npx nest build                                   # if you changed code
+echo > logs\.restart-requested
+Start-ScheduledTask -TaskName 'erp-sync-watchdog'
+```
+
+The next watchdog run consumes the file and restarts the worker. It is consumed
+BEFORE the restart is attempted, so a restart that fails does not loop. Without
+the explicit trigger it is picked up by the next scheduled run anyway, within
+five minutes.
 
 To get the CLI back temporarily, stop the task and start pm2 yourself:
 
