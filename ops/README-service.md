@@ -373,6 +373,31 @@ worth each time, the identity is not being reused and nothing will be deleted.
 Afterwards, look for `removed N stale row(s)` — or a `SKIPPING` line, which now
 reports the exact figure it refused.
 
+**The recent window clears them sooner.** A full sweep reads oldest-first, so it
+reaches a document edited today LAST — about two days on sales_delivery. The
+refresh lane (`ERP_REFRESH_JOBS`, every `ERP_REFRESH_EVERY_MINUTES`) re-reads a
+`DOC_DATE` window and now removes deleted lines inside it, so an edited document
+is corrected within hours instead.
+
+It deliberately makes a narrower claim than the full sweep. A window only asked
+the ERP for part of the feed, so "the ERP did not return this key" proves
+nothing on its own — that reasoning, applied to a sweep whose paging had skipped
+rows, once deleted 100 live customers. Instead a line is deleted only when
+ANOTHER line of the SAME document came back in the same pass. A document the
+window missed contributes no lines, so nothing about it can be deleted. Whole
+documents deleted in the ERP are therefore still the full sweep's job.
+
+To run one by hand (it respects the ingest lease):
+
+```
+curl -s -X POST http://127.0.0.1:3100/sync/backfill -H "Content-Type: application/json" \
+  -d '{"job":"ingest:sales_delivery","from":"2026-11-16 00:00:00","to":"2026-11-19 23:59:59"}'
+```
+
+Then look for `window reconciliation removed N line(s)`. Set
+`ERP_BACKFILL_RECONCILE=false` to turn the deleting half off and leave the
+re-read as a pure upsert.
+
 **To force a sweep** rather than wait for the 7-day cadence, backdate its marker
 (it is read from `updated_at`, not from the value):
 
