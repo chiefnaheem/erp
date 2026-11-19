@@ -252,6 +252,37 @@ export class ProjectionRepository {
    * onboarded, a row that was quarantined) keeps projected_at NULL so it heals
    * itself the moment the blocker clears. A watermark alone would strand every
    * one of those permanently.
+   *
+   * ─── ⚠️ THE LOST UPDATE, and why every stamp is guarded on changed_at ──────
+   *
+   * This selector is the ONLY way a row comes back. So a row stamped
+   * `projected_at = now()` while holding content that was never projected is
+   * stranded for good: projected_at is no longer NULL, the watermark has moved
+   * past its changed_at, and nothing reads it again until the ERP happens to
+   * touch it a second time.
+   *
+   * That is exactly what the consume step used to do. A projection run is one
+   * transaction, but Postgres READ COMMITTED gives each STATEMENT its own
+   * snapshot — so the statement that stamped rows consumed, written as
+   * `WHERE <selector>`, re-evaluated the selector at the END of the run and
+   * matched rows the ingest had changed since the values were read at the start.
+   * Those rows were marked done carrying the new content, which nothing had
+   * projected.
+   *
+   * It leaves a signature that cannot be anything else — projected_at EARLIER
+   * than changed_at. Measured 2026-11-19:
+   *
+   *   raw_customer_credit  635 rows   (stale outstanding balances)
+   *   raw_collection       168 rows   (stale payments)
+   *   raw_sales_order       17 rows   (stale orders)
+   *
+   * Every consume statement therefore stamps from a SNAPSHOT captured before the
+   * values were read, and requires `changed_at` to still match. A row that moved
+   * mid-run fails the guard, keeps projected_at NULL, and is picked up by the
+   * next run — the safe direction to fail in. The invariant to check is simply:
+   *
+   *   SELECT count(*) FROM erp_raw.<table>
+   *   WHERE projected_at IS NOT NULL AND projected_at < changed_at;  -- must be 0
    */
   private selector(alias: string, watermark: Date | null, full: boolean): string {
     if (full || !watermark) return 'TRUE';
@@ -374,6 +405,18 @@ export class ProjectionRepository {
         // record moved. Without the second half a balance change would never
         // reach the app — the customer row itself is untouched by a credit
         // update, which is precisely why balances looked frozen.
+
+        // The credit rows this run is about to consume, captured BEFORE the
+        // candidates are built — the order matters. Taken first, a row the
+        // ingest changes mid-run fails the changed_at guard and simply stays
+        // queued for the next run. Taken after, it would match the guard while
+        // the balance came from the older content: the lost update itself.
+        await tx.$executeRawUnsafe(`
+          CREATE TEMP TABLE erp_proj_credit_seen ON COMMIT DROP AS
+          SELECT c.id, c.changed_at FROM erp_raw.raw_customer_credit c
+          WHERE ${creditSel}
+        `);
+
         await tx.$executeRawUnsafe(`
           CREATE TEMP TABLE erp_proj_customer ON COMMIT DROP AS
           WITH src AS (
@@ -711,25 +754,41 @@ export class ProjectionRepository {
         `);
 
         // ── 5. Close the loop on the raw rows ───────────────────────────────
+        //
+        // ⚠️ EVERY stamp below is guarded on changed_at, and that guard is the
+        // whole correctness of this step. See the LOST UPDATE note above
+        // selector() — without it a row the ingest touches while this
+        // transaction is open is marked consumed carrying content this run never
+        // projected, and nothing ever comes back for it.
         await tx.$executeRawUnsafe(`
           UPDATE erp_raw.raw_customer r
           SET projected_at = now(), project_error = NULL
           FROM erp_proj_customer c
           WHERE r.id = c.raw_id AND c.reject IS NULL
+            AND r.changed_at = c.changed_at
         `);
         await tx.$executeRawUnsafe(`
           UPDATE erp_raw.raw_customer r
           SET project_error = c.reject || ': ' || coalesce(c.reject_detail, '')
           FROM erp_proj_customer c
           WHERE r.id = c.raw_id AND c.reject IS NOT NULL
+            AND r.changed_at = c.changed_at
         `);
         // Credit rows drive this job too, so they are consumed here. Without
         // this they would stay projected_at IS NULL forever and every run would
         // re-scan the whole customer set.
+        //
+        // ⚠️ Stamped from the SNAPSHOT taken in step 1, never from the selector
+        // re-evaluated here. Re-evaluating it is what this statement used to do,
+        // and it was the single biggest source of the lost update: 635 credit
+        // rows were sitting with projected_at EARLIER than changed_at on
+        // 2026-11-19 — each one a distributor whose outstanding balance in the
+        // portal was a figure the ERP had already moved on from.
         await tx.$executeRawUnsafe(`
           UPDATE erp_raw.raw_customer_credit c
           SET projected_at = now(), project_error = NULL
-          WHERE ${creditSel}
+          FROM erp_proj_credit_seen s
+          WHERE c.id = s.id AND c.changed_at = s.changed_at
         `);
 
         await this.advanceWatermark(tx, JOB, projected, [
@@ -920,6 +979,9 @@ export class ProjectionRepository {
             r.changed_at,
             btrim(coalesce(r.payload->>'ApproveStatus', '')) AS approve_status,
             btrim(coalesce(r.payload->>'CLOSE', ''))         AS close_status,
+            -- Which VERSION of the document this line belongs to. See the
+            -- GHOST LINES note on hdr below.
+            ${ts("r.payload->>'LastModifiedDate'")}          AS line_modified_at,
             ${num("r.payload->>'BUSINESS_QTY'")}             AS qty_ordered,
             ${num("r.payload->>'DELIVERED_BUSINESS_QTY'")}   AS qty_delivered,
             r.payload->>'CUSTOMER_ID'                        AS customer_guid,
@@ -947,21 +1009,53 @@ export class ProjectionRepository {
             SELECT
               doc_no,
               max(changed_at) AS changed_at,
-              bool_and(approve_status IN (${eligible})) AS eligible,
-              bool_and(approve_status = 'Y')            AS all_approved,
+              -- ⚠️ No bool_and over ApproveStatus here any more. Eligibility and
+              -- approval are decided from the document's CURRENT version in the
+              -- final SELECT, because a bool_and over every stored line lets a
+              -- pre-edit GHOST veto a document the ERP has since approved. Of
+              -- the 16 documents holding mixed versions on 2026-11-19, 15 also
+              -- had mixed ApproveStatus — so each was excluded from the upsert
+              -- entirely, kept its stale Purchase row, and was re-scanned by
+              -- every run for ever.
               bool_and(close_status = '2')              AS all_closed,
               sum(qty_ordered)                          AS qty_ordered,
               sum(qty_delivered)                        AS qty_delivered
             FROM erp_proj_line GROUP BY doc_no
           ), hdr AS (
+            -- ⚠️ GHOST LINES. The NEWEST version of the document wins, and it
+            -- used to be ORDER BY doc_no, id — the lowest row id, i.e. the
+            -- OLDEST line we happen to hold.
+            --
+            -- Editing an order in the ERP replaces its lines. The removed ones
+            -- do not disappear from erp_raw: deletion is reconciled only when a
+            -- FULL sweep completes (sweep_seen), and on sales_order that is
+            -- weekly and takes ~30 hours. Until then one DOC_NO holds lines from
+            -- two versions, and the header fields differ between them because
+            -- QTY_TOTAL / AMT_UNINCLUDE_TAX_OC / TAX_OC are header totals
+            -- repeated onto every line.
+            --
+            -- Seen on 2026-11-19, document 2301-202611110031: five lines from
+            -- 11 Nov carrying QTY_TOTAL 1137 and ApproveStatus N, beside six
+            -- lines from 16 Nov carrying 2379 and Y. The lowest id was a ghost,
+            -- so the app published 1137 items for an order the ERP says is
+            -- 2379 — "I changed the quantity and it never updated", exactly.
+            --
+            -- Ordering by the line's own LastModifiedDate makes the surviving
+            -- version win. Ghosts are by definition the older version, so this
+            -- cannot pick one over a current line.
             SELECT DISTINCT ON (doc_no)
-              doc_no, customer_guid, order_date, total_items, total_value
-            FROM erp_proj_line ORDER BY doc_no, id
+              doc_no, customer_guid, order_date, total_items, total_value,
+              approve_status AS current_approve_status
+            FROM erp_proj_line
+            ORDER BY doc_no, line_modified_at DESC NULLS LAST, id DESC
           )
           SELECT
             a.doc_no,
             a.changed_at,
-            a.eligible,
+            -- Approval is a property of the DOCUMENT, so it is read from the
+            -- document's current version — not bool_and'd across stored lines
+            -- that may include a pre-edit ghost. See all_lines_eligible above.
+            (h.current_approve_status IN (${eligible})) AS eligible,
             cust.id AS customer_id,
             h.order_date,
             -- header totals: taken ONCE, never summed across the lines
@@ -970,7 +1064,7 @@ export class ProjectionRepository {
             -- §4's derivation, in its stated order of precedence. Used on INSERT
             -- only; see the note above the method.
             (CASE
-               WHEN NOT a.all_approved                                   THEN 'PENDING'
+               WHEN h.current_approve_status <> 'Y'                      THEN 'PENDING'
                WHEN a.all_closed                                         THEN 'CLOSED'
                WHEN a.qty_ordered > 0
                     AND a.qty_delivered >= a.qty_ordered                 THEN 'DELIVERED'
@@ -1033,13 +1127,20 @@ export class ProjectionRepository {
         `);
 
         // Mark every LINE of a projected order, not just the changed ones — the
-        // whole order was consumed.
+        // whole order was consumed. erp_proj_line already holds every line of
+        // every affected document, so joining through it keeps that intent.
+        //
+        // ⚠️ changed_at guard: see the LOST UPDATE note above selector(). This
+        // used to match lines by DOC_NO alone, re-read from the live table at
+        // the end of the run, so a line the ingest touched mid-run was stamped
+        // consumed carrying content this run never aggregated.
         await tx.$executeRawUnsafe(`
           UPDATE erp_raw.raw_sales_order r
           SET projected_at = now(), project_error = NULL
           FROM erp_proj_purchase p
-          JOIN erp_proj_doc d ON btrim(d.doc_no_raw) = p.doc_no
-          WHERE r.payload->>'DOC_NO' = d.doc_no_raw
+          JOIN erp_proj_line l ON l.doc_no = p.doc_no
+          WHERE r.id = l.id
+            AND r.changed_at = l.changed_at
             AND p.eligible AND p.customer_id IS NOT NULL AND p.order_date IS NOT NULL
         `);
 
@@ -1200,11 +1301,16 @@ export class ProjectionRepository {
             reference    = EXCLUDED.reference
         `);
 
+        // ⚠️ changed_at guard: see the LOST UPDATE note above selector().
+        // erp_proj_payment already carries the changed_at each row had when this
+        // run read it, so a collection the ingest amended mid-run fails the
+        // guard and stays queued instead of being marked done unprojected.
         await tx.$executeRawUnsafe(`
           UPDATE erp_raw.raw_collection r
           SET projected_at = now(), project_error = NULL
           FROM erp_proj_payment p
           WHERE r.id = p.raw_id
+            AND r.changed_at = p.changed_at
             AND p.customer_id IS NOT NULL AND p.paid_at IS NOT NULL AND p.erp_id IS NOT NULL
         `);
 
