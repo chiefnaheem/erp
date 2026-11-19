@@ -58,9 +58,15 @@ describe('incremental ingest', () => {
       recordSeen: jest.fn(),
       seenCount: jest.fn().mockResolvedValue(10),
       rowCount: jest.fn().mockResolvedValue(10),
+      countUnseen: jest.fn().mockResolvedValue(0),
       deleteUnseen: jest.fn().mockResolvedValue(0),
       clearSeen: jest.fn(),
       clearStaleSeen: jest.fn(),
+      // The sweep identity that lets a multi-turn sweep reconcile — see
+      // reconcile.spec.ts. Null means "no sweep mid-flight".
+      getSweepIdentity: jest.fn().mockResolvedValue(null),
+      setSweepIdentity: jest.fn(),
+      clearSweepIdentity: jest.fn(),
       setWatermark: jest.fn(),
       upsertMany: jest.fn().mockResolvedValue({ fetched: 0, changed: 0 }),
       linkCustomers: jest.fn(),
@@ -244,6 +250,11 @@ describe('incremental ingest', () => {
 
     it('records the keys a full sweep returned, then deletes what it did not', async () => {
       fullSweep();
+      // Numbers a real cleanup has: a healthy key set, and a handful of ghosts
+      // well under ERP_RECONCILE_MAX_DELETE_PCT.
+      raw.seenCount.mockResolvedValue(500);
+      raw.rowCount.mockResolvedValue(500);
+      raw.countUnseen.mockResolvedValue(5);
       raw.deleteUnseen.mockResolvedValue(5);
       await (build() as any).execute();
 
@@ -279,7 +290,12 @@ describe('incremental ingest', () => {
       await (build() as any).execute();
       // A partial key set must never drive a delete.
       expect(raw.deleteUnseen).not.toHaveBeenCalled();
-      expect(raw.clearSeen).toHaveBeenCalled();
+      // ...but the keys must SURVIVE the pause. This used to assert the
+      // opposite, and that was the bug: a sweep too big for one turn resumes
+      // many times, and clearing here left the finished sweep holding only its
+      // last turn's keys — 1,056 against 1,324,311 rows on sales_delivery — so
+      // the safety check refused every reconciliation it ever attempted.
+      expect(raw.clearSeen).not.toHaveBeenCalled();
     });
 
     it('refuses to reconcile when the sweep saw far fewer keys than we hold', async () => {
@@ -381,9 +397,15 @@ describe('recent-change catch-up', () => {
       recordSeen: jest.fn(),
       seenCount: jest.fn().mockResolvedValue(10),
       rowCount: jest.fn().mockResolvedValue(10),
+      countUnseen: jest.fn().mockResolvedValue(0),
       deleteUnseen: jest.fn().mockResolvedValue(0),
       clearSeen: jest.fn(),
       clearStaleSeen: jest.fn(),
+      // The sweep identity that lets a multi-turn sweep reconcile — see
+      // reconcile.spec.ts. Null means "no sweep mid-flight".
+      getSweepIdentity: jest.fn().mockResolvedValue(null),
+      setSweepIdentity: jest.fn(),
+      clearSweepIdentity: jest.fn(),
       setWatermark: jest.fn(),
       upsertMany: jest.fn().mockResolvedValue({ fetched: 2, changed: 2 }),
       linkCustomers: jest.fn(),

@@ -430,25 +430,61 @@ export class RawRepository {
   }
 
   /**
-   * Delete rows the completed full sweep never returned — ERP deletions, and the
-   * ghosts left behind when a record's key fields were edited.
+   * Rows a completed full sweep never returned — ERP deletions, and the ghosts
+   * left behind when a record's key fields were edited.
    *
    * ⚠️ Only ever call this after a sweep that ran to the END. A paused or failed
    * sweep has an incomplete key set, and deleting against it would wipe the
-   * object. The caller enforces that; the count check here is the second line of
-   * defence.
+   * object. The caller enforces that; the count check there is the second line of
+   * defence, and `countUnseen` lets it look before it leaps.
+   *
+   * ⚠️ `startedBefore` is NOT optional in spirit. A full sweep of sales_delivery
+   * takes days, and the incremental lane keeps inserting rows behind it the whole
+   * time. A row created after the sweep passed its page position was never
+   * offered to the sweep, so its absence from the key set says nothing — without
+   * this guard, reconciliation would delete the newest data in the table. Only
+   * rows that already existed when the sweep began can be judged by it.
    */
-  async deleteUnseen(objectType: ErpObjectType, sweepId: string): Promise<number> {
+  private unseenWhere(table: string) {
+    return `FROM erp_raw.${table} r
+            WHERE r.first_seen_at < $2
+              AND NOT EXISTS (
+                SELECT 1 FROM erp_raw.sweep_seen s
+                WHERE s.sweep_id = $1 AND s.erp_key = r.erp_key
+              )`;
+  }
+
+  /** How many rows the sweep did not return — the look before the leap. */
+  async countUnseen(
+    objectType: ErpObjectType,
+    sweepId: string,
+    startedBefore: Date,
+  ): Promise<number> {
+    const t = this.table(objectType);
+    const rows = await this.withRetry(
+      () =>
+        this.prisma.$queryRawUnsafe<{ n: bigint }[]>(
+          `SELECT count(*) AS n ${this.unseenWhere(t)}`,
+          sweepId,
+          startedBefore,
+        ),
+      `countUnseen(${objectType})`,
+    );
+    return Number(rows[0]?.n ?? 0);
+  }
+
+  async deleteUnseen(
+    objectType: ErpObjectType,
+    sweepId: string,
+    startedBefore: Date,
+  ): Promise<number> {
     const t = this.table(objectType);
     const deleted = await this.withRetry(
       () =>
         this.prisma.$executeRawUnsafe(
-          `DELETE FROM erp_raw.${t} r
-           WHERE NOT EXISTS (
-             SELECT 1 FROM erp_raw.sweep_seen s
-             WHERE s.sweep_id = $1 AND s.erp_key = r.erp_key
-           )`,
+          `DELETE ${this.unseenWhere(t)}`,
           sweepId,
+          startedBefore,
         ),
       `deleteUnseen(${objectType})`,
     );
@@ -463,14 +499,74 @@ export class RawRepository {
     );
   }
 
-  /** Rows currently held for an object — used to sanity-check a reconciliation. */
-  async rowCount(objectType: ErpObjectType): Promise<number> {
+  /**
+   * Rows currently held for an object — used to sanity-check a reconciliation.
+   *
+   * With `firstSeenBefore`, counts only the rows a sweep that began then was in a
+   * position to return, which is the number the key set must be compared against.
+   */
+  async rowCount(objectType: ErpObjectType, firstSeenBefore?: Date): Promise<number> {
     const t = this.table(objectType);
     const rows = await this.withRetry(
-      () => this.prisma.$queryRawUnsafe<{ n: bigint }[]>(`SELECT count(*) AS n FROM erp_raw.${t}`),
+      () =>
+        firstSeenBefore
+          ? this.prisma.$queryRawUnsafe<{ n: bigint }[]>(
+              `SELECT count(*) AS n FROM erp_raw.${t} WHERE first_seen_at < $1`,
+              firstSeenBefore,
+            )
+          : this.prisma.$queryRawUnsafe<{ n: bigint }[]>(
+              `SELECT count(*) AS n FROM erp_raw.${t}`,
+            ),
       `rowCount(${objectType})`,
     );
     return Number(rows[0]?.n ?? 0);
+  }
+
+  // ─── Sweep identity ──────────────────────────────────────────────────────
+  // A full sweep of a large object spans many TURNS — sales_delivery took 1,324
+  // pages across two days — and each turn is a separate call. The recorded key
+  // set has to span the whole logical sweep, so the id that owns it must survive
+  // the pauses. Kept in sync_cursor beside the page cursor it belongs to, under
+  // its own namespace, so there is no migration and no new table.
+
+  /** The in-flight sweep's identity, or null if no sweep is mid-flight. */
+  async getSweepIdentity(job: string): Promise<{ sweepId: string; startedAt: Date } | null> {
+    const rows = await this.withRetry(
+      () => this.prisma.$queryRaw<{ cursor_value: string | null }[]>`
+        SELECT cursor_value FROM erp_raw.sync_cursor WHERE job = ${'sweep:' + job}
+      `,
+      `getSweepIdentity(${job})`,
+    );
+    const raw = rows[0]?.cursor_value;
+    if (!raw) return null;
+
+    // The id itself contains colons, so split on the LAST separator, not the first.
+    const cut = raw.lastIndexOf('|');
+    if (cut <= 0) return null;
+    const startedAt = new Date(raw.slice(cut + 1));
+    if (Number.isNaN(startedAt.getTime())) return null;
+    return { sweepId: raw.slice(0, cut), startedAt };
+  }
+
+  async setSweepIdentity(job: string, sweepId: string, startedAt: Date): Promise<void> {
+    const value = `${sweepId}|${startedAt.toISOString()}`;
+    await this.withRetry(
+      () => this.prisma.$executeRaw`
+        INSERT INTO erp_raw.sync_cursor (job, cursor_value, updated_at)
+        VALUES (${'sweep:' + job}, ${value}, now())
+        ON CONFLICT (job) DO UPDATE SET cursor_value = ${value}, updated_at = now()
+      `,
+      `setSweepIdentity(${job})`,
+    );
+  }
+
+  async clearSweepIdentity(job: string): Promise<void> {
+    await this.withRetry(
+      () => this.prisma.$executeRaw`
+        DELETE FROM erp_raw.sync_cursor WHERE job = ${'sweep:' + job}
+      `,
+      `clearSweepIdentity(${job})`,
+    );
   }
 
   /** Forget the watermark, forcing the next sweep to be a full one. */

@@ -225,10 +225,45 @@ abstract class IngestJob extends SyncJob {
     // genuinely deleted in the ERP. Never done on an incremental sweep, which by
     // definition only sees what changed.
     const reconcile = isFullSweep && (this.config.get<boolean>('ERP_RECONCILE_DELETES') ?? true);
-    const sweepId = `${this.name}:${Date.now()}`;
+
+    // ⚠️ The key set belongs to the LOGICAL sweep, not to this turn.
+    //
+    // This used to mint a fresh id here on every call and clear the previous
+    // one's keys. A sweep that fits in a single turn was fine, which is why
+    // customer and customer_credit reconciled correctly — but sales_delivery
+    // takes 1,324 pages across ~15 turns, and every resumed turn threw away what
+    // the earlier ones had recorded. The sweep that finished on 2026-11-18
+    // therefore ended holding 1,056 keys against 1,324,311 rows, the safety check
+    // refused it, and NOTHING was ever deleted. Same for sales_order (2,842 of
+    // 1,158,881), collection and other_receivable. Measured in the logs: those
+    // four objects have never once reconciled, so every ERP deletion since the
+    // feed began is still in our tables — showing up as extra lines on a
+    // document, because the raw rows are what the admin portal reads.
+    //
+    // So the identity is persisted and reused for as long as the page cursor
+    // says a sweep is mid-flight.
+    let sweepId = `${this.name}:${Date.now()}`;
+    let sweepBeganAt = new Date();
     if (reconcile) {
-      // Clear anything a previously killed sweep of this object left behind.
-      await this.raw.clearStaleSeen(this.objectType, sweepId);
+      const resumed = startPage > 1 ? await this.raw.getSweepIdentity(this.name) : null;
+      if (resumed) {
+        sweepId = resumed.sweepId;
+        sweepBeganAt = resumed.startedAt;
+      } else {
+        if (startPage > 1) {
+          // Mid-flight with nothing recorded: the sweep began before this code
+          // shipped. Start accumulating from here; the key set will be short of
+          // the pages already past, the safety check below will refuse it, and
+          // the next sweep from page 1 reconciles properly.
+          this.logger.warn(
+            `${this.name}: resuming at page ${startPage} with no sweep identity recorded — ` +
+              `this pass cannot reconcile deletions. The next full sweep will.`,
+          );
+        }
+        await this.raw.setSweepIdentity(this.name, sweepId, sweepBeganAt);
+        // Clear anything a previously killed sweep of this object left behind.
+        await this.raw.clearStaleSeen(this.objectType, sweepId);
+      }
     }
     const field = this.config.get<string>('ERP_INCREMENTAL_FIELD') ?? 'LastModifiedDate';
 
@@ -289,9 +324,11 @@ abstract class IngestJob extends SyncJob {
     // Advancing it here would declare everything up to now "seen" while most of
     // the sweep is still ahead of us.
     if (outOfTime) {
-      // Incomplete key set — deleting against it would wipe the object.
-      if (reconcile) await this.raw.clearSeen(sweepId);
-    return { fetched: fetched + caught.fetched, changed: changed + caught.changed };
+      // KEEP the recorded keys. They belong to this logical sweep, which resumes
+      // next turn and goes on adding to them; only the completed sweep decides
+      // anything with them. Clearing here is what made reconciliation impossible
+      // for every object too big to sweep in one turn.
+      return { fetched: fetched + caught.fetched, changed: changed + caught.changed };
     }
 
     await this.raw.clearIngestPage(this.name);
@@ -300,7 +337,9 @@ abstract class IngestJob extends SyncJob {
     if (reconcile) {
       try {
         const seen = await this.raw.seenCount(sweepId);
-        const held = await this.raw.rowCount(this.objectType);
+        // Only rows that already existed when the sweep STARTED are judged by it
+        // — the incremental lane inserts behind a multi-day sweep the whole time.
+        const held = await this.raw.rowCount(this.objectType, sweepBeganAt);
 
         // Refuse to reconcile against a suspiciously thin key set. A sweep that
         // silently returned a fraction of the object (a bad page, an ERP filter
@@ -311,8 +350,25 @@ abstract class IngestJob extends SyncJob {
               `${held} row(s) are held. That gap is too large to trust; nothing deleted.`,
           );
         } else {
-          const removed = await this.raw.deleteUnseen(this.objectType, sweepId);
-          if (removed > 0) {
+          // Look before leaping. Reconciliation had never actually run on the big
+          // objects, so the first pass that does could face a backlog of years.
+          // A deletion of more than a fifth of what is held is far more likely to
+          // be a broken sweep than a real one, so it is reported and refused
+          // rather than applied — raise ERP_RECONCILE_MAX_DELETE_PCT to let a
+          // genuinely large first cleanup through.
+          const unseen = await this.raw.countUnseen(this.objectType, sweepId, sweepBeganAt);
+          const capPct = this.config.get<number>('ERP_RECONCILE_MAX_DELETE_PCT') ?? 20;
+          const cap = Math.floor((held * capPct) / 100);
+
+          if (unseen > cap && held > 0) {
+            this.logger.warn(
+              `${this.name}: SKIPPING reconciliation — it would delete ${unseen} of ` +
+                `${held} row(s) (${((unseen / held) * 100).toFixed(1)}%), over the ` +
+                `${capPct}% cap. Nothing deleted. If that figure is genuine, raise ` +
+                `ERP_RECONCILE_MAX_DELETE_PCT.`,
+            );
+          } else if (unseen > 0) {
+            const removed = await this.raw.deleteUnseen(this.objectType, sweepId, sweepBeganAt);
             this.logger.log(
               `${this.name}: removed ${removed} stale row(s) the ERP no longer returns ` +
                 `(deleted there, or left behind when a record's key fields were edited).`,
@@ -321,6 +377,8 @@ abstract class IngestJob extends SyncJob {
         }
       } finally {
         await this.raw.clearSeen(sweepId);
+        // The logical sweep is over; the next one starts a fresh identity.
+        await this.raw.clearSweepIdentity(this.name);
       }
     }
 

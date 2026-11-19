@@ -417,6 +417,21 @@ export class EnvVars {
   @Transform(toBool)
   ERP_RECONCILE_DELETES: boolean = true;
 
+  // The most of an object one reconciliation may delete, as a percentage of the
+  // rows it was entitled to judge. A sweep that quietly returned a fraction of
+  // the feed looks exactly like a feed that was mostly deleted, and only this
+  // tells them apart cheaply: a real cleanup is a small share of the table.
+  // Over the cap, the pass reports the figure and deletes nothing, so the first
+  // reconciliation of an object that has never had one cannot run away with the
+  // table before anyone has seen the number. Raise it deliberately, once the
+  // logged figure has been checked against the ERP.
+  @IsInt()
+  @Min(1)
+  @Max(100)
+  @IsOptional()
+  @Transform(toInt)
+  ERP_RECONCILE_MAX_DELETE_PCT: number = 20;
+
   // Jobs that ALWAYS sweep in full instead of incrementally. Only a full sweep
   // reconciles, so these objects can never accumulate ghost rows — which is what
   // lets customer_credit key on CREDIT_AMT1, sometimes the only thing telling two

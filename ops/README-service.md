@@ -297,8 +297,10 @@ WHERE projected_at IS NOT NULL AND projected_at < changed_at;
 ### Ghost lines: an order whose quantity "never updated"
 
 Editing an order in the ERP replaces its lines, and the removed ones are deleted
-from `erp_raw` only when a FULL sweep completes — weekly, ~30 hours on
-sales_order. Until then one `DOC_NO` holds lines from two versions, and because
+from `erp_raw` only when a FULL sweep completes and RECONCILES — see
+"Deletions the sweep never applied" below, which is why that had never once
+happened on the big objects before 2026-11-19. Until then one `DOC_NO` holds
+lines from two versions, and because
 `QTY_TOTAL` / `AMT_UNINCLUDE_TAX_OC` / `TAX_OC` are header totals repeated onto
 every line, the two versions disagree about the document's totals.
 
@@ -319,6 +321,68 @@ FROM erp_raw.raw_sales_order
 WHERE (payload->>'DOC_DATE')::timestamp > now() - interval '120 days'
 GROUP BY 1 HAVING count(DISTINCT payload->>'QTY_TOTAL') > 1;
 ```
+
+### Deletions the sweep never applied (fixed 2026-11-19)
+
+**Symptom.** A document shows more lines than the ERP has — most visibly in the
+admin portal's Sales Delivery modal, which reads `erp_raw.raw_sales_delivery`
+directly, so three stored lines become three rows on screen and a total that is
+too high. `2510-202611160001` showed 3 lines totalling 4,227 cartons and
+₦6,072,000 when the ERP had one line: 3,848 @ ₦1,500 = ₦5,772,000.
+
+**Why it is invisible to every other lane.** A deletion is not a modification.
+The row simply stops being returned, and no `LastModifiedDate` filter can ask
+for "things that are gone". Only a full sweep can notice, by recording every key
+it saw and deleting what it did not.
+
+**The bug.** That key set was destroyed twice per turn. A full sweep of a big
+object does not fit in one turn — sales_delivery is 1,324 pages over ~15 of them
+— and each paused turn called `clearSeen()` while each resumed turn minted a new
+`sweepId`, whose `clearStaleSeen()` removed the previous turn's keys. The sweep
+that finished on 2026-11-18 therefore ended holding 1,056 keys against 1,324,311
+rows; the safety check refused it, as designed:
+
+```
+ingest:sales_delivery: SKIPPING reconciliation — the sweep saw 1056 key(s)
+but 1324311 row(s) are held. That gap is too large to trust; nothing deleted.
+```
+
+Reconciliation had **never run** on sales_delivery, sales_order, collection or
+other_receivable. It worked only on customer and customer_credit — the objects
+small enough to sweep in one turn, which is exactly why nobody noticed.
+
+**The fix.** The sweep identity lives in `sync_cursor` under `sweep:<job>` and is
+reused for as long as the page cursor says a sweep is mid-flight, so the keys
+accumulate across turns. Two guards came with it:
+
+- only rows with `first_seen_at` older than the sweep's START are judged, because
+  the incremental lane keeps inserting behind a multi-day sweep and those rows
+  were never offered to it;
+- a reconciliation that would delete more than `ERP_RECONCILE_MAX_DELETE_PCT`
+  (default 20%) of what it judged is reported and refused, not applied.
+
+**To check it is working**, during a full sweep:
+
+```sql
+SELECT * FROM erp_raw.sync_cursor WHERE job LIKE 'sweep:%';
+SELECT object_type, count(*) FROM erp_raw.sweep_seen GROUP BY 1;
+```
+
+The count must keep climbing across turns. If it resets to roughly one turn's
+worth each time, the identity is not being reused and nothing will be deleted.
+Afterwards, look for `removed N stale row(s)` — or a `SKIPPING` line, which now
+reports the exact figure it refused.
+
+**To force a sweep** rather than wait for the 7-day cadence, backdate its marker
+(it is read from `updated_at`, not from the value):
+
+```sql
+UPDATE erp_raw.sync_cursor SET updated_at = now() - interval '8 days'
+WHERE job = 'watermark:full:ingest:sales_delivery';
+```
+
+Deleting that row does NOT force a sweep — `needsFullSweep()` re-stamps a missing
+marker and waits another 7 days.
 
 ### The sync stopped overnight
 
