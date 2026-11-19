@@ -363,6 +363,50 @@ export class EnvVars {
   @Transform(toInt)
   ERP_FULL_SWEEP_DAYS: number = 7;
 
+  // ── The recent-window refresh ───────────────────────────────────────────
+  //
+  // The full sweep above is the only thing that sees a row the ERP changed
+  // WITHOUT moving LastModifiedDate — and on sales_order it takes ~30 hours and
+  // runs weekly, so such a change waited up to seven days. Measured 2026-11-19:
+  // 38 sales-order lines detected 10-27 days after the LastModifiedDate they
+  // carry, every one of them an order a delivery had been posted against.
+  //
+  // This lane re-reads just the RECENT window, often, on otherwise-idle ingest
+  // ticks. A 30-day DOC_DATE window on sales_order is 16 pages against the full
+  // sweep's 1,158. See SyncScheduler.refreshTick.
+
+  // How far back to re-read. Covers documents still being worked on; older ones
+  // stay with the full sweep.
+  @IsInt()
+  @Min(1)
+  @IsOptional()
+  @Transform(toInt)
+  ERP_REFRESH_WINDOW_DAYS: number = 45;
+
+  // How often each object gets a refresh. 0 disables the lane.
+  @IsInt()
+  @Min(0)
+  @IsOptional()
+  @Transform(toInt)
+  ERP_REFRESH_EVERY_MINUTES: number = 360;
+
+  // Which objects to refresh, comma-separated. Defaults to sales orders alone:
+  // that is where the silent-change class is PROVEN (the delivery-posting case
+  // above). Collections and deliveries show the same shape, but overwhelmingly
+  // on documents more than a year old, which a recent window would not catch
+  // anyway — so they are left to the full sweep rather than spending ERP calls
+  // on a guess. Unknown job names are ignored.
+  @IsString()
+  @IsOptional()
+  ERP_REFRESH_JOBS: string = 'ingest:sales_order';
+
+  // The window field. DOC_DATE is the document's own date — the one field that
+  // reliably places a document in time without depending on LastModifiedDate,
+  // which is the very thing this lane exists to work around.
+  @IsString()
+  @IsOptional()
+  ERP_REFRESH_FIELD: string = 'DOC_DATE';
+
   // After a FULL sweep, delete rows the ERP no longer returns. This is what
   // removes records deleted in the ERP, and the ghosts left behind when the ERP
   // edits a field that forms part of our key (customer_credit moved five

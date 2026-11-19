@@ -190,6 +190,21 @@ export class SyncScheduler implements OnApplicationBootstrap {
    *  rather than from the clock. Empty after a restart — see dueJobs(). */
   private readonly lastIngestAt = new Map<string, number>();
 
+  /**
+   * When each object's RECENT-WINDOW REFRESH last ran in this process.
+   *
+   * Separate from lastIngestAt on purpose: a refresh is not a sweep and must
+   * not stand in for one (see refreshTick).
+   */
+  private readonly lastRefreshAt = new Map<string, number>();
+
+  /**
+   * When this worker started. The refresh lane's starvation clock runs from
+   * here as well as from its last run, so a restart cannot let it preempt the
+   * restart catch-up.
+   */
+  private readonly startedAt = Date.now();
+
   /** A sweep is running in THIS process. Sweeps can outlast their interval (the
    *  customer sweep takes ~90s, collections far longer), and without this the
    *  dispatcher re-picks the same job every minute just to lose the lock race and
@@ -206,27 +221,186 @@ export class SyncScheduler implements OnApplicationBootstrap {
 
     if (this.ingestInFlight) return;
 
-    const due = this.dueJobs();
-    if (due.length === 0) return;
-
-    // ONE per tick. Several may be due at once (notably right after a restart);
-    // running them a minute apart is exactly the spreading the ERP asked for.
-    const job = due[0];
-    this.logger.log(
-      `ingest tick — ${job}` +
-        (due.length > 1 ? ` (${due.length - 1} more due, one per minute)` : ''),
-    );
-
-    // Stamp only if the sweep really ran. A tick that stood down (a longer sweep
-    // still holds the lock) must stay due, or a busy object that keeps colliding
-    // with a slow one would silently wait a full interval each time it lost.
+    // ⚠️ Claimed SYNCHRONOUSLY, before the first await. The in-flight guard
+    // used to be taken further down, next to the sweep it protects — which was
+    // fine while nothing was awaited above it, and stopped being fine the moment
+    // the refresh lane added an await to decide whether it was starving. Two
+    // ticks could then both pass the guard and dispatch, which is precisely the
+    // thing ERP_INGEST_CONCURRENCY=1 exists to prevent.
     this.ingestInFlight = true;
     try {
+      const due = this.dueJobs();
+
+      // Nothing to sweep: the idle tick is where the recent-window refresh
+      // normally goes, so it never takes a tick a sweep wanted.
+      if (due.length === 0) {
+        await this.refreshTick();
+        return;
+      }
+
+      // ⚠️ But idle ticks are not guaranteed. The estimate was "six of every
+      // fifteen minutes are free", and in practice the heavy objects run to
+      // ERP_SWEEP_MAX_MINUTES and something is due on nearly every tick — so a
+      // lane that only ever takes an idle tick can be starved indefinitely,
+      // which is no better than not having it. Once it is two intervals overdue
+      // it takes a tick in front of the sweeps: one turn lost every twelve hours,
+      // against a feed going days without the only check that can see a change
+      // the ERP made without advancing LastModifiedDate.
+      if (await this.refreshTick(true)) return;
+
+      // ONE per tick. Several may be due at once (notably right after a restart);
+      // running them a minute apart is exactly the spreading the ERP asked for.
+      const job = due[0];
+      this.logger.log(
+        `ingest tick — ${job}` +
+          (due.length > 1 ? ` (${due.length - 1} more due, one per minute)` : ''),
+      );
+
+      // Stamp only if the sweep really ran. A tick that stood down (a longer
+      // sweep still holds the lock) must stay due, or a busy object that keeps
+      // colliding with a slow one would silently wait a full interval each time
+      // it lost.
       const ran = await this.runStage(INGEST_LOCK, () => this.sync.runIngestJob(job));
       if (ran) this.lastIngestAt.set(job, Date.now());
     } finally {
       this.ingestInFlight = false;
     }
+  }
+
+  // ─── The recent-window refresh ───────────────────────────────────────────
+  //
+  // ⚠️ WHY THIS LANE EXISTS. Every lane that keeps a feed fresh — the
+  // incremental sweep and the catch-up lane — asks the ERP the same question:
+  // "what changed since <watermark>", filtered on LastModifiedDate. That is
+  // sound only while the ERP advances LastModifiedDate whenever a row changes,
+  // and it does not always do so.
+  //
+  // Measured on 2026-11-19 over the two days since the catch-up fix: of 2,472
+  // genuine updates to existing raw_sales_order rows, 2,434 were detected within
+  // ~16 minutes — and 38 were detected 10 to 27 DAYS after the LastModifiedDate
+  // they carry. Every one of those 38 had BUSINESS_QTY = DELIVERED_BUSINESS_QTY:
+  // a delivery had been posted against the order, and the ERP updated the
+  // delivered quantity in place WITHOUT touching LastModifiedDate. No
+  // LastModifiedDate query can ever see those rows.
+  //
+  // The only thing that found them was the full sweep, which reads every row and
+  // compares content hashes — but a full sweep runs every ERP_FULL_SWEEP_DAYS (7)
+  // and takes ~30 hours on sales_order, so a silent change waited up to a week.
+  // To a distributor that is "my order never updated".
+  //
+  // So: re-read a RECENT WINDOW often and cheaply. A 30-day DOC_DATE window on
+  // sales_order is 15,582 rows — 16 pages against the full sweep's 1,158 — and
+  // it catches 33 of those 38. It reuses backfill(), which upserts through the
+  // ordinary key and deliberately touches no page cursor, no watermark and no
+  // reconciliation, so the running sweep resumes exactly where it paused and
+  // unchanged rows cost nothing (the content hash makes them no-ops).
+  //
+  // Old documents stay with the full sweep. A receipt from 2023 being touched by
+  // a batch process is not what anyone is waiting on.
+
+  /** Objects to re-read over a recent window. Unknown names are ignored. */
+  private refreshJobs(): string[] {
+    const configured =
+      this.config.get<string>('ERP_REFRESH_JOBS') ?? 'ingest:sales_order';
+    const known = new Set(this.ingestJobNames());
+    return configured
+      .split(',')
+      .map((name) => name.trim())
+      .filter((name) => name.length > 0 && known.has(name));
+  }
+
+  /** The window to re-read: the last ERP_REFRESH_WINDOW_DAYS of DOC_DATE. */
+  private refreshWindow(): { field: string; from: string; to: string } {
+    const days = Math.max(1, this.config.get<number>('ERP_REFRESH_WINDOW_DAYS') ?? 45);
+    const field = this.config.get<string>('ERP_REFRESH_FIELD') ?? 'DOC_DATE';
+    const day = (at: Date) => at.toISOString().slice(0, 10);
+    const to = new Date();
+    const from = new Date(to.getTime() - days * 86_400_000);
+    // Whole days, inclusive at both ends. DOC_DATE is a date-at-midnight in this
+    // feed, and a day of slack either side of a 45-day window costs nothing.
+    return { field, from: `${day(from)} 00:00:00`, to: `${day(to)} 23:59:59` };
+  }
+
+  /**
+   * The object whose refresh is due, or null.
+   *
+   * Seeded from erp_raw.sync_run rather than from memory alone, so a restart
+   * does not re-run every window: the lane is cheap but not free, and a worker
+   * that restarts repeatedly should not re-read the same 16 pages each time.
+   */
+  private async dueRefresh(): Promise<{ job: string; starving: boolean } | null> {
+    const everyMin = this.config.get<number>('ERP_REFRESH_EVERY_MINUTES') ?? 360;
+    if (everyMin <= 0) return null; // 0 disables the lane outright
+
+    const jobs = this.refreshJobs();
+    if (jobs.length === 0) return null;
+
+    const now = Date.now();
+    const lastSuccess = await this.raw.lastSuccessByJob();
+    // Past this, the lane has waited long enough that it stops being polite.
+    const starveAfterMs = everyMin * 2 * 60_000;
+
+    const candidates = jobs
+      .map((job, index) => {
+        // Stagger by position so two refreshes never fall on one minute.
+        const slot = this.slotStart(now, everyMin, index);
+        const last =
+          this.lastRefreshAt.get(job) ?? lastSuccess.get(`${job}:backfill`)?.getTime();
+        // Measured from the LATER of "last refresh" and "worker start", so a
+        // restart does not let the lane barge in front of the restart catch-up —
+        // nine objects all due at once is exactly when sweeps matter most.
+        const waitingSince = Math.max(last ?? 0, this.startedAt);
+        return {
+          job,
+          slot,
+          due: last === undefined || last < slot,
+          starving: now - waitingSince > starveAfterMs,
+        };
+      })
+      .filter(({ due }) => due)
+      .sort((a, b) => Number(b.starving) - Number(a.starving) || b.slot - a.slot);
+
+    const first = candidates[0];
+    return first ? { job: first.job, starving: first.starving } : null;
+  }
+
+  /**
+   * Re-read one object's recent window, on an otherwise-idle ingest tick.
+   *
+   * Runs under the SAME in-flight guard and ingest lease as a sweep, which is
+   * the point: this must never put a second caller on the ERP beside a sweep.
+   * The external-integration licence is concurrency-limited (CE66044 returns an
+   * EMPTY body when it is exhausted), so an extra parallel reader would not just
+   * be impolite, it would make the sweep fail blind.
+   */
+  /**
+   * Re-read one object's recent window. Returns whether it took the tick.
+   *
+   * The caller already holds the in-flight guard, so this does not touch it.
+   * `starvingOnly` is how a tick a sweep wanted is offered: only a lane that is
+   * two intervals overdue may take it.
+   */
+  private async refreshTick(starvingOnly = false): Promise<boolean> {
+    const due = await this.dueRefresh();
+    if (!due) return false;
+    if (starvingOnly && !due.starving) return false;
+
+    const { job } = due;
+    const window = this.refreshWindow();
+    this.logger.log(
+      `refresh tick — ${job} (${window.field} ${window.from} .. ${window.to})` +
+        (starvingOnly ? ' — OVERDUE, taking this tick ahead of the sweeps' : ''),
+    );
+
+    // Stamped even when the backfill FAILS. runStage returns "the stage ran",
+    // not "the work succeeded", and that is the behaviour we want here: a window
+    // the ERP refuses to filter on must not be retried every idle minute. It is
+    // recorded FAILED in erp_raw.sync_run and waits for the next interval.
+    const ran = await this.runStage(INGEST_LOCK, () =>
+      this.sync.runBackfillJob(job, window),
+    );
+    if (ran) this.lastRefreshAt.set(job, Date.now());
+    return true;
   }
 
   // ─── On-demand triggers ──────────────────────────────────────────────────
@@ -257,6 +431,17 @@ export class SyncScheduler implements OnApplicationBootstrap {
           lastRun: last ? new Date(last).toISOString() : null,
         };
       }),
+      // The recent-window refresh: what it covers and when each object last had
+      // one. See refreshTick — this is the lane that catches ERP changes made
+      // without advancing LastModifiedDate.
+      refresh: {
+        everyMinutes: this.config.get<number>('ERP_REFRESH_EVERY_MINUTES') ?? 360,
+        window: this.refreshWindow(),
+        objects: this.refreshJobs().map((job) => {
+          const last = this.lastRefreshAt.get(job);
+          return { job, lastRun: last ? new Date(last).toISOString() : null };
+        }),
+      },
     };
   }
 

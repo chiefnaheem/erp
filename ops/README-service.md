@@ -182,6 +182,144 @@ findstr /C:"catch-up" logs\erp-sync.out.log
 — and that `now current to` moves between runs. If it does not, the lane is
 re-reading a window it never finishes.
 
+### "The ERP record was edited but ours still shows the old values"
+
+First, check whether the edit moved the ERP's own `LastModifiedDate`, because
+everything that keeps a feed fresh filters on exactly that field:
+
+```sql
+-- what we hold for the document, and when we noticed it change
+SELECT payload->>'DOC_NO', payload->>'LastModifiedDate', changed_at, projected_at
+FROM erp_raw.raw_sales_order WHERE payload->>'DOC_NO' = '<doc no>';
+```
+
+If `changed_at` is recent, we saw it — look at the projection instead (the row
+may be queued because the customer has not onboarded; `project_error` says so).
+
+If `LastModifiedDate` is OLD and the ERP values have moved anyway, this is the
+**silent-change** case. The ERP does not always advance `LastModifiedDate`: the
+clearest example is posting a DELIVERY against a sales order, which updates
+`DELIVERED_BUSINESS_QTY` and `CLOSE` in place and leaves `LastModifiedDate`
+alone. No incremental or catch-up query can ever see those rows — they filter on
+the field that did not move.
+
+Measured on 2026-11-19, over the two days after the catch-up fix: of 2,472
+genuine updates to existing sales-order rows, 2,434 landed within ~16 minutes
+and **38 were found 10 to 27 days late**, every one of them with
+`BUSINESS_QTY = DELIVERED_BUSINESS_QTY`.
+
+Two things cover it, and you can check both:
+
+```
+curl http://localhost:3100/sync/status      # the "refresh" block
+findstr /C:"refresh tick" logs\erp-sync.out.log
+```
+
+1. **The recent-window refresh** (`ERP_REFRESH_*`) re-reads the last
+   `ERP_REFRESH_WINDOW_DAYS` (45) of `DOC_DATE` every `ERP_REFRESH_EVERY_MINUTES`
+   (360). It filters on `DOC_DATE`, not `LastModifiedDate`, which is the whole
+   point. Cheap: measured 2026-11-19, a 2-day window was 867 rows in one page in
+   7 seconds, and a 30-day window is ~16 pages against the full sweep's 1,158.
+
+   It normally waits for a tick no sweep wants, and **preempts the sweeps once it
+   is two intervals (12h) overdue**. That second rule is not belt-and-braces: the
+   first version only ever took idle ticks, and on this box the heavy objects run
+   to `ERP_SWEEP_MAX_MINUTES` so something is due on nearly every minute — three
+   deploys went by without the lane running once. A lane that can be starved
+   indefinitely is the same as no lane.
+
+   To force one now (it takes the ingest lease, so it will not collide with a
+   sweep):
+
+   ```
+   curl -X POST http://localhost:3100/sync/backfill ^
+     -H "Content-Type: application/json" ^
+     -d "{\"job\":\"ingest:sales_order\",\"from\":\"2026-11-01\",\"to\":\"2026-11-19 23:59:59\"}"
+   ```
+2. **The full sweep** (`ERP_FULL_SWEEP_DAYS`, 7) remains the backstop for
+   documents older than the window.
+
+To find how late we are detecting changes on any feed:
+
+```sql
+SELECT count(*) FILTER (WHERE lag_h < 1)   AS prompt,
+       count(*) FILTER (WHERE lag_h > 168) AS only_the_full_sweep_found_it
+FROM (SELECT EXTRACT(EPOCH FROM
+        (changed_at - (payload->>'LastModifiedDate')::timestamp))/3600 AS lag_h
+      FROM erp_raw.raw_sales_order
+      WHERE changed_at > now() - interval '2 days'
+        AND changed_at > first_seen_at + interval '1 second') z;
+```
+
+⚠️ That `changed_at > first_seen_at` filter is not optional. Without it a row
+read for the FIRST time — whose document may be two years old — is
+indistinguishable from a silent change, and the number comes out ~40x too high.
+
+⚠️ Do not reach for `node ops/backfill.js` to fix one of these by hand while the
+worker is running. It does not take the ingest lock, and the ERP's integration
+licence is concurrency-limited: a second reader makes the running **sweep** fail
+with empty bodies while the backfill itself looks fine.
+
+### One invariant worth checking after any projection change
+
+A raw row stamped `projected_at` while holding content nothing projected is
+stranded for good — `projected_at` is no longer NULL, the watermark has moved
+past its `changed_at`, and only the ERP touching that record a second time brings
+it back. It has a signature that cannot be anything else:
+
+```sql
+SELECT 'credit' AS t, count(*) FROM erp_raw.raw_customer_credit
+  WHERE projected_at IS NOT NULL AND projected_at < changed_at
+UNION ALL SELECT 'collection', count(*) FROM erp_raw.raw_collection
+  WHERE projected_at IS NOT NULL AND projected_at < changed_at
+UNION ALL SELECT 'sales_order', count(*) FROM erp_raw.raw_sales_order
+  WHERE projected_at IS NOT NULL AND projected_at < changed_at;
+-- every count must be 0
+```
+
+On 2026-11-19 these were 635 / 168 / 17. The cause: a projection run is one
+transaction, but READ COMMITTED gives each STATEMENT its own snapshot, and the
+consume step was written as `UPDATE ... WHERE <selector>` — so it re-evaluated
+the selector at the END of the run and stamped rows the ingest had changed since
+the values were read at the start. The 635 credit rows were 31 distributors whose
+outstanding balance in the portal was a figure the ERP had already moved on from.
+
+Every consume statement now stamps from a snapshot taken before the values were
+read and requires `changed_at` to still match, so a row that moves mid-run stays
+queued. If the counts above are ever non-zero again, a consume statement has lost
+its guard; re-queue the affected rows with
+
+```sql
+UPDATE erp_raw.<table> SET projected_at = NULL
+WHERE projected_at IS NOT NULL AND projected_at < changed_at;
+```
+
+### Ghost lines: an order whose quantity "never updated"
+
+Editing an order in the ERP replaces its lines, and the removed ones are deleted
+from `erp_raw` only when a FULL sweep completes — weekly, ~30 hours on
+sales_order. Until then one `DOC_NO` holds lines from two versions, and because
+`QTY_TOTAL` / `AMT_UNINCLUDE_TAX_OC` / `TAX_OC` are header totals repeated onto
+every line, the two versions disagree about the document's totals.
+
+The projection takes the header from the line with the newest
+`LastModifiedDate`, so the surviving version wins. It used to take the lowest row
+id — the oldest line held — which on 2026-11-19 published 1137 items for
+`2301-202611110031`, an order the ERP says is 2379. Worse, eligibility was a
+`bool_and` of `ApproveStatus` over every stored line, so one stale `N` ghost
+excluded the whole document from the upsert: it kept its old row and was
+re-scanned by every run for ever. 15 of the 16 affected documents were in that
+state.
+
+To find them:
+
+```sql
+SELECT btrim(payload->>'DOC_NO'), count(DISTINCT payload->>'QTY_TOTAL') AS versions
+FROM erp_raw.raw_sales_order
+WHERE (payload->>'DOC_DATE')::timestamp > now() - interval '120 days'
+GROUP BY 1 HAVING count(DISTINCT payload->>'QTY_TOTAL') > 1;
+```
+
 ### The sync stopped overnight
 
 Check whether the machine was even awake before suspecting the code:

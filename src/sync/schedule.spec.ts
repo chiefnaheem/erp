@@ -432,3 +432,171 @@ describe('SyncScheduler gives the tick to the job at its slot', () => {
     expect(scheduler.dueJobs()[0]).toBe('ingest:customer');
   });
 });
+
+/**
+ * The recent-window refresh.
+ *
+ * The defect these pin: the ERP does not always advance LastModifiedDate when a
+ * row changes. Measured 2026-11-19 over the two days after the catch-up fix — of
+ * 2,472 genuine updates to existing sales-order rows, 38 were detected 10 to 27
+ * DAYS after the LastModifiedDate they carry, every one of them an order that a
+ * delivery had been posted against. Every freshness lane filters on
+ * LastModifiedDate, so only the weekly full sweep ever found them.
+ */
+describe('SyncScheduler recent-window refresh', () => {
+  let settings: Record<string, unknown>;
+  let scheduler: any;
+  let lastSuccess: Map<string, Date>;
+  let backfills: { job: string; window: unknown }[];
+
+  const at = (hh: number, mm: number) => new Date(2026, 10, 19, hh, mm, 0).getTime();
+
+  beforeEach(() => {
+    settings = { ERP_INGEST_INTERVAL_MINUTES: 60, SYNC_ENABLED: true };
+    lastSuccess = new Map();
+    backfills = [];
+    const raw = {
+      lastSuccessByJob: () => Promise.resolve(lastSuccess),
+      watermarksByJob: () => Promise.resolve(new Map()),
+    };
+    const sync = {
+      runBackfillJob: (job: string, window: unknown) => {
+        backfills.push({ job, window });
+        return Promise.resolve();
+      },
+    };
+    const config = { get: (k: string) => settings[k] } as never;
+    scheduler = new SyncScheduler(sync as never, {} as never, raw as never, config);
+  });
+
+  afterEach(() => jest.restoreAllMocks());
+
+  it('asks for DOC_DATE, not LastModifiedDate — the field that moves', () => {
+    // The entire point of the lane. A window on LastModifiedDate would be blind
+    // to exactly the rows it exists to find.
+    expect(scheduler.refreshWindow().field).toBe('DOC_DATE');
+  });
+
+  it('covers the configured number of days, inclusive at both ends', () => {
+    settings.ERP_REFRESH_WINDOW_DAYS = 30;
+    jest.spyOn(Date, 'now').mockReturnValue(at(9, 0));
+    const w = scheduler.refreshWindow();
+    expect(w.to).toMatch(/23:59:59$/);
+    expect(w.from).toMatch(/00:00:00$/);
+    const days = (Date.parse(w.to) - Date.parse(w.from)) / 86_400_000;
+    expect(days).toBeGreaterThan(29);
+    expect(days).toBeLessThan(32);
+  });
+
+  it('is disabled outright by ERP_REFRESH_EVERY_MINUTES=0', async () => {
+    settings.ERP_REFRESH_EVERY_MINUTES = 0;
+    await expect(scheduler.dueRefresh()).resolves.toBeNull();
+  });
+
+  it('ignores a job name that is not a real ingest object', async () => {
+    settings.ERP_REFRESH_JOBS = 'ingest:nonsense, ingest:sales_order';
+    expect(scheduler.refreshJobs()).toEqual(['ingest:sales_order']);
+    await expect(scheduler.dueRefresh()).resolves.toMatchObject({
+      job: 'ingest:sales_order',
+    });
+  });
+
+  it('does NOT re-read the window again after a restart', async () => {
+    // lastRefreshAt is empty on a fresh process, so without the sync_run seed
+    // every restart would spend the pages again. A worker that restart-loops
+    // would re-read the same 16 pages each time.
+    settings.ERP_REFRESH_EVERY_MINUTES = 360;
+    jest.spyOn(Date, 'now').mockReturnValue(at(9, 0));
+    lastSuccess.set('ingest:sales_order:backfill', new Date(at(8, 30)));
+    await expect(scheduler.dueRefresh()).resolves.toBeNull();
+  });
+
+  it('comes due once the interval has passed', async () => {
+    settings.ERP_REFRESH_EVERY_MINUTES = 360;
+    lastSuccess.set('ingest:sales_order:backfill', new Date(at(2, 0)));
+    jest.spyOn(Date, 'now').mockReturnValue(at(14, 0));
+    await expect(scheduler.dueRefresh()).resolves.toMatchObject({
+      job: 'ingest:sales_order',
+    });
+  });
+
+  it('takes a tick off the sweeps once it is two intervals overdue', async () => {
+    // ⚠️ The lane cannot depend on idle ticks. Measured 2026-11-19: the heavy
+    // objects run to ERP_SWEEP_MAX_MINUTES and something was due on nearly
+    // every tick, so three deploys went by without the refresh ever getting
+    // one. Starved indefinitely is the same as absent.
+    settings.ERP_REFRESH_EVERY_MINUTES = 360;
+    scheduler.startedAt = at(0, 0);
+    lastSuccess.set('ingest:sales_order:backfill', new Date(at(0, 0)));
+    jest.spyOn(Date, 'now').mockReturnValue(at(13, 0)); // 13h > 2 x 6h
+    await expect(scheduler.dueRefresh()).resolves.toMatchObject({ starving: true });
+
+    // ...and it then wins the tick even with a sweep due.
+    jest.spyOn(scheduler, 'dueJobs').mockReturnValue(['ingest:customer']);
+    const stage = jest
+      .spyOn(scheduler, 'runStage')
+      .mockImplementation(async (_lock: unknown, work: () => Promise<void>) => {
+        await work();
+        return true;
+      });
+    await scheduler.ingestTick();
+    expect(stage).toHaveBeenCalledTimes(1);
+    expect(backfills).toHaveLength(1);
+    expect(backfills[0].job).toBe('ingest:sales_order');
+  });
+
+  it('does NOT preempt a sweep while it is merely due, not starving', async () => {
+    settings.ERP_REFRESH_EVERY_MINUTES = 360;
+    scheduler.startedAt = at(12, 0);
+    jest.spyOn(Date, 'now').mockReturnValue(at(13, 0)); // only 1h since start
+    jest.spyOn(scheduler, 'dueJobs').mockReturnValue(['ingest:customer']);
+    jest.spyOn(scheduler, 'runStage').mockResolvedValue(true);
+    await scheduler.ingestTick();
+    expect(backfills).toHaveLength(0);
+  });
+
+  it('never takes a tick a sweep wanted', async () => {
+    // Priority matters: new records reaching the app is worth more than a
+    // silent change landing a few minutes sooner. The refresh only ever runs on
+    // an idle tick — six of every fifteen minutes.
+    settings.ERP_REFRESH_EVERY_MINUTES = 360;
+    scheduler.startedAt = Date.now(); // nothing has had time to starve
+    jest.spyOn(scheduler, 'dueJobs').mockReturnValue(['ingest:customer']);
+    jest.spyOn(scheduler, 'runStage').mockResolvedValue(true);
+    await scheduler.ingestTick();
+    expect(backfills).toHaveLength(0);
+  });
+
+  it('runs on an idle tick, through the ingest lease like any sweep', async () => {
+    // Through runStage/INGEST_LOCK deliberately: the ERP's integration licence
+    // is concurrency-limited and answers an empty body when exhausted, so a
+    // second parallel reader would make the running sweep fail blind.
+    settings.ERP_REFRESH_EVERY_MINUTES = 360;
+    jest.spyOn(scheduler, 'dueJobs').mockReturnValue([]);
+    const stage = jest
+      .spyOn(scheduler, 'runStage')
+      .mockImplementation(async (_lock: unknown, work: any) => {
+        await work();
+        return true;
+      });
+    await scheduler.ingestTick();
+    expect(stage).toHaveBeenCalled();
+    expect(backfills).toHaveLength(1);
+    expect(backfills[0].job).toBe('ingest:sales_order');
+    expect((backfills[0].window as any).field).toBe('DOC_DATE');
+  });
+
+  it('does not retry a failing window every idle minute', async () => {
+    // runStage reports "the stage ran", not "the work succeeded". A window the
+    // ERP refuses to filter on is recorded FAILED and waits for the next
+    // interval instead of burning every spare tick.
+    settings.ERP_REFRESH_EVERY_MINUTES = 360;
+    jest.spyOn(scheduler, 'dueJobs').mockReturnValue([]);
+    jest.spyOn(scheduler, 'runStage').mockResolvedValue(true);
+    jest.spyOn(Date, 'now').mockReturnValue(at(9, 0));
+    await scheduler.ingestTick();
+    expect(scheduler.lastRefreshAt.get('ingest:sales_order')).toBeDefined();
+    jest.spyOn(Date, 'now').mockReturnValue(at(9, 1));
+    await expect(scheduler.dueRefresh()).resolves.toBeNull();
+  });
+});

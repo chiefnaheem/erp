@@ -11,7 +11,21 @@
 //
 // Like the endpoint, it touches no page cursor, no watermark and no
 // reconciliation, so the scheduled sweep carries on from exactly where it
-// paused. It takes the ingest lock, so it will not run alongside a sweep.
+// paused.
+//
+// ⚠️ It does NOT take the ingest lock. This comment used to claim it did, and
+// that is wrong in a way that costs you the sweep: the lock is taken by
+// SyncScheduler.runStage around the call, not by runBackfillJob itself, so this
+// script reads the ERP in a second process with nothing coordinating it. The
+// external-integration licence is concurrency-limited and answers an EMPTY BODY
+// when exhausted (CE66044) — indistinguishable from a bad key — so a backfill
+// started next to a running sweep makes the SWEEP fail, blind, while this script
+// looks fine.
+//
+// Run it when the worker is paused or idle. For the routine case — re-reading
+// the recent window so changes the ERP made without advancing LastModifiedDate
+// are picked up — you do not need this script at all: the scheduler now does it
+// on idle ticks under the lease (ERP_REFRESH_* in src/config/env.validation.ts).
 require('../dist/config/load-env');
 
 const { NestFactory } = require('@nestjs/core');
