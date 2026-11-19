@@ -398,7 +398,19 @@ export class EnvVars {
   // on a guess. Unknown job names are ignored.
   @IsString()
   @IsOptional()
-  ERP_REFRESH_JOBS: string = 'ingest:sales_order';
+  // sales_delivery joined on 2026-11-19: its raw rows are what the admin
+  // portal's delivery modal renders, so a line the ERP deleted is visible to a
+  // user immediately, and the full sweep reaches a document edited today LAST.
+  ERP_REFRESH_JOBS: string = 'ingest:sales_order,ingest:sales_delivery';
+
+  // Let a windowed re-read delete the lines the ERP no longer returns, on the
+  // documents that same pass returned. Narrower than the full sweep's
+  // reconciliation by design — see IngestJob.documentField — and the only lane
+  // that clears an edited document in hours rather than days.
+  @IsBoolean()
+  @IsOptional()
+  @Transform(toBool)
+  ERP_BACKFILL_RECONCILE: boolean = true;
 
   // The window field. DOC_DATE is the document's own date — the one field that
   // reliably places a document in time without depending on LastModifiedDate,

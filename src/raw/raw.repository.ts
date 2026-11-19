@@ -522,6 +522,88 @@ export class RawRepository {
     return Number(rows[0]?.n ?? 0);
   }
 
+  // ─── Windowed reconciliation ─────────────────────────────────────────────
+  // A full sweep reaches a document edited TODAY last: it reads oldest-first and
+  // takes days. A re-read of a recent window can clear that document's deleted
+  // lines within the hour instead — but it must never reason like a full sweep,
+  // because it only asked the ERP for part of the feed.
+  //
+  // So the claim is narrowed to one the window can actually support: a line is
+  // deleted only when ANOTHER line of the SAME document came back in the same
+  // pass. A document the window did not return has no lines in the seen set and
+  // is therefore untouchable, which is what makes a missed page, a changed ERP
+  // filter or an off-by-one window harmless here.
+
+  /** `$1` seen LINE keys, `$2` seen DOCUMENT numbers, `$3` first_seen_at bound. */
+  private inSeenDocumentsWhere(table: string, documentField: string, onlyUnseen: boolean) {
+    // Interpolated into SQL — constants in code today, validated anyway.
+    if (!/^[A-Za-z0-9_]+$/.test(documentField)) {
+      throw new Error(`unsafe document field: ${documentField}`);
+    }
+    return `FROM erp_raw.${table} r
+            WHERE r.first_seen_at < $3
+              AND EXISTS (
+                SELECT 1 FROM erp_raw.sweep_seen d
+                WHERE d.sweep_id = $2 AND d.erp_key = r.payload->>'${documentField}'
+              )
+              ${
+                onlyUnseen
+                  ? `AND NOT EXISTS (
+                SELECT 1 FROM erp_raw.sweep_seen s
+                WHERE s.sweep_id = $1 AND s.erp_key = r.erp_key
+              )`
+                  : ''
+              }`;
+  }
+
+  /**
+   * Rows the window pass could judge, and of those, the ones it did not return.
+   * Returned together so the caller can size one against the other.
+   */
+  async countInSeenDocuments(
+    objectType: ErpObjectType,
+    sweepId: string,
+    docsSweepId: string,
+    documentField: string,
+    startedBefore: Date,
+  ): Promise<{ eligible: number; unseen: number }> {
+    const t = this.table(objectType);
+    const one = async (onlyUnseen: boolean) => {
+      const rows = await this.withRetry(
+        () =>
+          this.prisma.$queryRawUnsafe<{ n: bigint }[]>(
+            `SELECT count(*) AS n ${this.inSeenDocumentsWhere(t, documentField, onlyUnseen)}`,
+            sweepId,
+            docsSweepId,
+            startedBefore,
+          ),
+        `countInSeenDocuments(${objectType})`,
+      );
+      return Number(rows[0]?.n ?? 0);
+    };
+    return { eligible: await one(false), unseen: await one(true) };
+  }
+
+  async deleteUnseenInSeenDocuments(
+    objectType: ErpObjectType,
+    sweepId: string,
+    docsSweepId: string,
+    documentField: string,
+    startedBefore: Date,
+  ): Promise<number> {
+    const t = this.table(objectType);
+    return this.withRetry(
+      () =>
+        this.prisma.$executeRawUnsafe(
+          `DELETE ${this.inSeenDocumentsWhere(t, documentField, true)}`,
+          sweepId,
+          docsSweepId,
+          startedBefore,
+        ),
+      `deleteUnseenInSeenDocuments(${objectType})`,
+    );
+  }
+
   // ─── Sweep identity ──────────────────────────────────────────────────────
   // A full sweep of a large object spans many TURNS — sales_delivery took 1,324
   // pages across two days — and each turn is a separate call. The recorded key

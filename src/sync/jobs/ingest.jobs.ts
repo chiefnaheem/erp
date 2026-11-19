@@ -448,6 +448,23 @@ abstract class IngestJob extends SyncJob {
   protected readonly sortTiebreaker?: string | string[];
 
   /**
+   * The field holding the DOCUMENT number, on objects that arrive as one row per
+   * detail LINE. Set it and a windowed re-read can reconcile deletions inside
+   * its window; leave it undefined and the backfill only ever upserts.
+   *
+   * It is what makes that reconciliation safe. A full sweep decides "the ERP
+   * never returned this key, so delete it" against the whole feed, and when
+   * paging once skipped rows that reasoning deleted 100 live customers (above).
+   * A window cannot make that claim — it only asked for part of the feed. So it
+   * makes a strictly narrower one: delete a line only when ANOTHER line of the
+   * SAME document came back in this pass. That proves the ERP returned the
+   * document and chose not to return the line, which is exactly what a deleted
+   * line looks like. A document the window missed contributes no lines at all,
+   * so nothing about it can be deleted.
+   */
+  protected readonly documentField?: string;
+
+  /**
    * The page order for a sweep.
    *
    * `desc` is for the catch-up lane only, which wants the NEWEST changes first
@@ -700,10 +717,25 @@ abstract class IngestJob extends SyncJob {
     let changed = 0;
     let pages = 0;
 
+    // Reconcile deleted LINES inside this window — see `documentField`. Stable
+    // ids, so a pass killed half way leaves keys that the next pass clears.
+    // Deliberately NOT clearStaleSeen(): that would wipe an in-flight full
+    // sweep's accumulated keys, which is the bug this pairs with.
+    const reconcile =
+      !!this.documentField && (this.config.get<boolean>('ERP_BACKFILL_RECONCILE') ?? true);
+    const windowId = `${this.name}:window`;
+    const docsId = `${this.name}:window#doc`;
+    const windowBeganAt = new Date();
+    if (reconcile) {
+      await this.raw.clearSeen(windowId);
+      await this.raw.clearSeen(docsId);
+    }
+
     this.logger.log(
       `${this.name}: BACKFILL ${this.method} → erp_raw.${table} ` +
         `(${window.field} ${window.from} .. ${window.to}) — ` +
-        `re-reading a window; cursor, watermark and reconciliation untouched`,
+        `re-reading a window; cursor and watermark untouched` +
+        (reconcile ? ', reconciling deleted lines within it' : ''),
     );
 
     try {
@@ -721,8 +753,27 @@ abstract class IngestJob extends SyncJob {
           `${this.name}: backfill page ${pageNo} — stored ${result.fetched} row(s) ` +
             `(${result.changed} new/changed) into erp_raw.${table}`,
         );
+        if (reconcile) {
+          await this.raw.recordSeen(
+            this.objectType,
+            windowId,
+            rows.map((row) => this.keyOf(row)).filter((k): k is string => !!k),
+          );
+          await this.raw.recordSeen(
+            this.objectType,
+            docsId,
+            rows
+              .map((row) => row[this.documentField as string])
+              .map((v) => (typeof v === 'string' ? v : v == null ? '' : String(v)))
+              .filter((v) => v.length > 0),
+          );
+        }
         await this.afterPage(rows);
       }
+
+      // Only after the loop ran to the END without throwing: every page the ERP
+      // had for this window is in the key set.
+      if (reconcile) await this.reconcileWindow(windowId, docsId, windowBeganAt);
 
       await this.raw.finishRun(runId, { status: 'SUCCESS', fetched, changed });
       this.logger.log(
@@ -735,6 +786,63 @@ abstract class IngestJob extends SyncJob {
       await this.raw.finishRun(runId, { status: 'FAILED', fetched, changed, error: message });
       this.logger.error(`${this.name}: backfill FAILED — ${message}`);
       throw error;
+    }
+  }
+
+  /**
+   * Remove lines the ERP no longer has, within the documents this window pass
+   * actually returned. Same cap as the full sweep's reconciliation.
+   */
+  private async reconcileWindow(
+    windowId: string,
+    docsId: string,
+    beganAt: Date,
+  ): Promise<void> {
+    const field = this.documentField as string;
+    try {
+      const seen = await this.raw.seenCount(windowId);
+      if (seen === 0) return; // empty window — nothing was returned to reason from
+
+      const { eligible, unseen } = await this.raw.countInSeenDocuments(
+        this.objectType,
+        windowId,
+        docsId,
+        field,
+        beganAt,
+      );
+      if (unseen === 0) return;
+
+      const capPct = this.config.get<number>('ERP_RECONCILE_MAX_DELETE_PCT') ?? 20;
+      const cap = Math.floor((eligible * capPct) / 100);
+      if (unseen > cap && eligible > 0) {
+        this.logger.warn(
+          `${this.name}: window reconciliation SKIPPED — it would delete ${unseen} of ` +
+            `${eligible} row(s) in the documents this pass returned ` +
+            `(${((unseen / eligible) * 100).toFixed(1)}%), over the ${capPct}% cap. ` +
+            `Nothing deleted.`,
+        );
+        return;
+      }
+
+      const removed = await this.raw.deleteUnseenInSeenDocuments(
+        this.objectType,
+        windowId,
+        docsId,
+        field,
+        beganAt,
+      );
+      this.logger.log(
+        `${this.name}: window reconciliation removed ${removed} line(s) the ERP no ` +
+          `longer returns, on documents it did return — deleted there, not merely absent.`,
+      );
+    } catch (error) {
+      // A re-read that upserted correctly is still a success; only the cleanup
+      // failed. Say so and let the full sweep catch it.
+      const message = error instanceof Error ? error.message : String(error);
+      this.logger.error(`${this.name}: window reconciliation failed — ${message}`);
+    } finally {
+      await this.raw.clearSeen(windowId);
+      await this.raw.clearSeen(docsId);
     }
   }
 }
@@ -819,6 +927,7 @@ export class SalesOrderIngestJob extends IngestJob {
   readonly name = 'ingest:sales_order';
 
   /** Tiebreaker for a stable page order: the subtable primary key, unique per order LINE. */
+  protected readonly documentField = 'DOC_NO';
   protected readonly sortTiebreaker = 'SALES_ORDER_DOC_D_ID';
   protected readonly method = ERP_METHOD.SALES_ORDER_QUERY;
   protected readonly objectType: ErpObjectType = 'SALES_ORDER';
@@ -868,6 +977,7 @@ export class SalesDeliveryIngestJob extends IngestJob {
   readonly name = 'ingest:sales_delivery';
 
   /** Tiebreaker for a stable page order: the subtable primary key, unique per delivery LINE. */
+  protected readonly documentField = 'DOC_NO';
   protected readonly sortTiebreaker = 'SALES_DELIVERY_D_ID';
   protected readonly method = ERP_METHOD.SALES_DELIVERY_QUERY;
   protected readonly objectType: ErpObjectType = 'SALES_DELIVERY';

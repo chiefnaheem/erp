@@ -213,3 +213,142 @@ describe('full-sweep deletion reconciliation', () => {
     expect(raw.deleteUnseen).not.toHaveBeenCalled();
   });
 });
+
+/**
+ * The windowed variant, used by the recent-window refresh lane.
+ *
+ * A full sweep reads oldest-first over days, so it reaches a document edited
+ * today LAST — on sales_delivery that is ~2 days after the edit, and the raw
+ * rows are what the admin portal's delivery modal renders. This lane clears the
+ * same ghosts within the hour, but it may only make the narrower claim its
+ * evidence supports: a line is gone if ANOTHER line of the same document came
+ * back without it.
+ */
+describe('windowed reconciliation (recent-window re-read)', () => {
+  let raw: any;
+  let erp: any;
+  let config: any;
+  let settings: Record<string, unknown>;
+  let pages: { pageNo: number; rows: Record<string, unknown>[] }[];
+  let fail: Error | null;
+
+  const line = (id: string, doc = '2510-202611160001') => ({
+    SALES_DELIVERY_D_ID: id,
+    DOC_NO: doc,
+    LastModifiedDate: '2026-11-18 14:25:39',
+  });
+
+  const run = async () => {
+    const job = new SalesDeliveryIngestJob(raw, erp, config);
+    await (job as any).backfill({ field: 'DOC_DATE', from: '2026-10-05', to: '2026-11-19' });
+  };
+
+  beforeEach(() => {
+    fail = null;
+    pages = [{ pageNo: 1, rows: [line('a')] }];
+    settings = {
+      ERP_PAGE_SIZE: 1000,
+      ERP_BACKFILL_RECONCILE: true,
+      ERP_RECONCILE_MAX_DELETE_PCT: 20,
+    };
+    config = { get: (k: string) => settings[k], getOrThrow: (k: string) => settings[k] };
+    raw = {
+      tableFor: () => 'raw_sales_delivery',
+      startRun: jest.fn().mockResolvedValue(1),
+      finishRun: jest.fn(),
+      upsertMany: jest.fn().mockImplementation(async (_t: unknown, rows: unknown[]) => ({
+        fetched: rows.length,
+        changed: 0,
+      })),
+      recordSeen: jest.fn(),
+      seenCount: jest.fn().mockResolvedValue(10),
+      countInSeenDocuments: jest.fn().mockResolvedValue({ eligible: 100, unseen: 2 }),
+      deleteUnseenInSeenDocuments: jest.fn().mockResolvedValue(2),
+      clearSeen: jest.fn(),
+      clearStaleSeen: jest.fn(),
+      linkCustomers: jest.fn(),
+    };
+    erp = {
+      queryAll: jest.fn().mockImplementation(async function* () {
+        for (const p of pages) {
+          if (fail) throw fail;
+          yield p;
+        }
+      }),
+    };
+    jest.spyOn(Logger.prototype, 'log').mockImplementation(() => undefined);
+    jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
+    jest.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
+  });
+
+  afterEach(() => jest.restoreAllMocks());
+
+  it('records both the line keys and the document numbers it saw', async () => {
+    await run();
+    expect(raw.recordSeen).toHaveBeenCalledWith(
+      'SALES_DELIVERY',
+      'ingest:sales_delivery:window',
+      ['a'],
+    );
+    expect(raw.recordSeen).toHaveBeenCalledWith(
+      'SALES_DELIVERY',
+      'ingest:sales_delivery:window#doc',
+      ['2510-202611160001'],
+    );
+  });
+
+  it('deletes the lines the pass did not return, on documents it did', async () => {
+    await run();
+    const [obj, keys, docs, field, began] =
+      raw.deleteUnseenInSeenDocuments.mock.calls[0];
+    expect(obj).toBe('SALES_DELIVERY');
+    expect(keys).toBe('ingest:sales_delivery:window');
+    expect(docs).toBe('ingest:sales_delivery:window#doc');
+    expect(field).toBe('DOC_NO');
+    expect(began).toBeInstanceOf(Date);
+  });
+
+  it('NEVER clears another sweep id — a full sweep may be mid-flight', async () => {
+    await run();
+    // clearStaleSeen wipes every other id for the object, which would destroy
+    // the accumulating key set of an in-flight multi-turn full sweep.
+    expect(raw.clearStaleSeen).not.toHaveBeenCalled();
+    for (const [id] of raw.clearSeen.mock.calls) {
+      expect(id).toMatch(/^ingest:sales_delivery:window/);
+    }
+  });
+
+  it('deletes nothing when a page failed part way through', async () => {
+    fail = new Error('CE66044');
+    await expect(run()).rejects.toThrow('CE66044');
+    expect(raw.deleteUnseenInSeenDocuments).not.toHaveBeenCalled();
+    expect(raw.clearSeen).toHaveBeenCalled(); // but still tidies up
+  });
+
+  it('deletes nothing when the window came back empty', async () => {
+    pages = [];
+    raw.seenCount.mockResolvedValue(0);
+    await run();
+    expect(raw.deleteUnseenInSeenDocuments).not.toHaveBeenCalled();
+  });
+
+  it('refuses a deletion over the cap', async () => {
+    raw.countInSeenDocuments.mockResolvedValue({ eligible: 100, unseen: 21 });
+    await run();
+    expect(raw.deleteUnseenInSeenDocuments).not.toHaveBeenCalled();
+  });
+
+  it('can be switched off', async () => {
+    settings.ERP_BACKFILL_RECONCILE = false;
+    await run();
+    expect(raw.recordSeen).not.toHaveBeenCalled();
+    expect(raw.deleteUnseenInSeenDocuments).not.toHaveBeenCalled();
+  });
+
+  it('still reports the re-read as a success when the cleanup throws', async () => {
+    raw.countInSeenDocuments.mockRejectedValue(new Error('db gone'));
+    await run();
+    expect(raw.finishRun).toHaveBeenCalledWith(1, expect.objectContaining({ status: 'SUCCESS' }));
+    expect(raw.clearSeen).toHaveBeenCalled();
+  });
+});
