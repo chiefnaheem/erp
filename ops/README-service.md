@@ -52,15 +52,26 @@ Remove-Item "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Startup\erp-sync
 
 ## Everyday commands
 
+**None of the `pm2` subcommands work from an ordinary terminal on this box.** The
+worker runs under the watchdog's S4U scheduled task, and pm2's control pipe is
+owned by that session, so `pm2 status` / `pm2 logs` / `pm2 restart` answer
+`connect EPERM \.\pipe\rpc.sock` — or, worse, quietly start a daemon of their own
+and print an EMPTY process list, which reads as "the worker is not running" when
+it is running perfectly well. See **`pm2 list` says EPERM** below. Use these:
+
 ```powershell
-pm2 status                     # what is running
-pm2 logs erp-sync              # tail logs
-pm2 restart erp-sync           # after: npm run build
-pm2 describe erp-sync          # restart count, uptime, memory
-curl http://localhost:3100/health
+curl http://localhost:3100/health             # what pm2 status would have told you
+curl http://localhost:3100/sync/freshness     # per-feed: when each last COMPLETED
+type logs\erp-sync.out.log                    # what pm2 logs would have tailed
+type logs\erp-sync.err.log                    # failures only
+type logs\ensure-up.log                       # the watchdog; SILENT means healthy
+
+# restart (what pm2 restart would have done) — the watchdog does it for you:
+echo > logs\.restart-requested
+Start-ScheduledTask -TaskName 'erp-sync-watchdog'
 ```
 
-After any code change: `npm run build` then `pm2 restart erp-sync`.
+After any code change: `npm run build`, then the restart pair above.
 Never start the production worker with `npm run start:dev` — that is watch mode,
 and every file save kills the in-flight ERP sweep.
 
@@ -87,8 +98,28 @@ three consecutive probes (a wedged process still reads as "online" to pm2).
 
 Every branch is idempotent, so when all is well it costs one pm2 call and one
 HTTP GET. If pm2 itself cannot be queried it does **nothing** and says so —
-never start a second worker on a guess, because two sweeps of one object delete
-each other's rows (see the note in `ops/run-job.js`).
+never start a second worker on a guess.
+
+**The port is the authority on whether a worker exists, not pm2** (added
+2026-11-20). "Absent" only means *this* pm2 has no record of the app, and because
+pm2's control pipe belongs to one session, any run from a different session gets
+an empty list and reads it as absent. Resurrecting on that would put a second
+worker on a port that is already served, so the watchdog now probes `/health`
+first and stands down if anything answers, logging why. The sweep was never the
+thing at risk — the ingest lease is in the database — but the duplicate either
+crash-loops on `EADDRINUSE` or wins the port and leaves pm2 supervising the
+loser while an orphan on the old build serves the traffic. Pinned by
+`src/ops/ensure-up.spec.ts`, which drives the real script against a stub pm2.
+
+`start-erp.bat` used to be a second, separate way into that mess: the older
+"ERP Service" task still fires it on every boot, and it ran `npm run start:dev`
+directly — a watch-mode dev server, outside pm2, on the same port. It now calls
+the watchdog instead, so whichever task fires, the outcome is the same one
+supervised worker. Retiring that task needs an administrator and is optional:
+
+```powershell
+Disable-ScheduledTask -TaskName 'ERP Service'   # elevated; optional
+```
 
 Register it once, from a normal (non-admin) prompt:
 
@@ -421,6 +452,61 @@ Get-ScheduledTaskInfo -TaskName 'erp-sync-watchdog' | Select LastRunTime, LastTa
 On 2026-11-12 the answer was a 01:34 Windows Update reboot and a watchdog task
 that only ran at logon — see ops/install-watchdog-task.ps1, which fixes exactly
 that.
+
+### "The server stopped running" — but it hadn't (2026-11-20)
+
+A report came in that the server had stopped. It had not: the worker had been up
+for 28 hours without a single restart, and `pm2` had not relaunched it once.
+
+**Ask this first, before touching anything.** `uptimeSeconds` is the process's
+own uptime, so it settles the question in one call:
+
+```powershell
+curl http://localhost:3100/health
+```
+
+What had actually happened is that the link to the database dropped. From 15:27
+to roughly 16:42 every query failed with Prisma `P1001`:
+
+```
+Can't reach database server at `<db-host>:6543`
+```
+
+The process stayed up and kept retrying, exactly as designed, but it could do no
+work — and a worker that is running and doing nothing looks identical, from the
+web app, to a worker that has died.
+
+Two things made it confusing, and both are worth knowing:
+
+- **No ERP calls appear in the log for that window either**, which looks like the
+  ERP gateway failed too. It did not. Every ingest job takes its database lease
+  *before* it calls the ERP, so a database outage means the ERP is never reached.
+  Do not go hunting for a gateway fault on this evidence.
+- **Recovery was not instant.** The database came back around 16:42, but ingest
+  did not resume until 17:27. The projection lane had a backlog and each cycle
+  re-scanned ~100k rows, so it held the single lease back to back and starved
+  ingest for 45 minutes. It cleared on its own; all feeds were current by 17:35.
+
+To confirm where the fault was rather than guessing:
+
+```sql
+-- did the database engine itself restart, or just the connection path?
+SELECT pg_postmaster_start_time();
+```
+
+On 2026-11-20 that returned 14 Nov — Postgres had never gone down, so the fault
+was the network path or the pooler on :6543, not the database. The link flapped
+again for about a minute at 20:00 and recovered by itself. Latency to that host
+is ~190ms against ~14ms to a neutral public address, so it is a long way off;
+intermittent drops there are not something this box can fix, and the worker is
+already built to ride them out.
+
+**The other way this report happens with nothing wrong at all:** somebody runs
+`pm2 list`, gets an empty table, and concludes the worker is gone. On this box an
+empty `pm2 list` means only that the CLI could not reach the right daemon — see
+the next section. Seven abandoned daemons from such calls had piled up holding
+430 MB; they manage nothing and are safe to kill (keep the one whose children are
+the worker and `pm2-logrotate`).
 
 ## After the S4U change: `pm2 list` says EPERM
 

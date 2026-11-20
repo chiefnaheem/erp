@@ -28,7 +28,7 @@ const http = require('node:http');
 
 const APP = 'erp-sync';
 const ROOT = join(__dirname, '..');
-const LOG = join(ROOT, 'logs', 'ensure-up.log');
+const LOG = process.env.ENSURE_UP_LOG || join(ROOT, 'logs', 'ensure-up.log');
 // pm2's JS entry, run under node. NOT pm2.cmd: since Node 20.12 / 24, spawning
 // a .cmd without a shell fails outright with EINVAL (the fix for CVE-2024-27980),
 // and reaching for shell:true to get around that would put this script's
@@ -178,6 +178,44 @@ const writeStrikes = (n) => {
   if (state === 'unknown') return; // pm2 itself is unreachable; status() has said so
 
   if (state === 'absent') {
+    // ⚠️ Before starting ANYTHING: is the port already being served?
+    //
+    // "absent" means this pm2 has no record of the app. That is not the same as
+    // "the app is not running". pm2 reaches its daemon over a named pipe scoped to
+    // a Windows session, so running this script from a different session than the
+    // daemon that owns the worker yields an empty list — which reads as absent, and
+    // resurrecting on it puts a SECOND worker on the port.
+    //
+    // The sweep itself is safe from that: the ingest lease lives in
+    // erp_raw.sync_lock, in the DATABASE, so the second worker stands down rather
+    // than sweeping alongside the first. What it is not safe from is everything
+    // around it — the duplicate crash-loops on EADDRINUSE, and if it wins the race
+    // for the port instead, pm2 is left supervising the loser while an orphan
+    // running the OLD build serves the traffic. That has happened three times
+    // (see the kill_timeout note in ecosystem.config.js), and an orphan is how the
+    // eleven-day outage above began.
+    //
+    // Seen on 2026-11-20: the worker was healthy under the watchdog’s own
+    // scheduled-task session (pm2 daemon pid 1112, session 0) while `pm2 jlist` from
+    // an interactive shell got EPERM on the daemon's pipe, spun up a daemon of its
+    // own and listed no apps. Seven such orphan daemons had accumulated, holding
+    // 430 MB. The old start-erp.bat pointed a BootTrigger task at a bare
+    // `npm run start:dev`, so this was reachable from a second direction too.
+    //
+    // The port, not pm2, is the authority on whether a worker exists. If it answers,
+    // stand down and say why: an unsupervised worker that is still serving is a
+    // problem to fix deliberately, not by racing a second one onto its port.
+    if (await healthy()) {
+      say(
+        `pm2 has no record of ${APP}, but :${PORT} is already serving a healthy ` +
+          `worker — standing down rather than starting a second one. This pm2 cannot ` +
+          `see the daemon that owns it (a different Windows session, or a different ` +
+          `PM2_HOME). Nothing here is supervising that worker: to manage it, run this ` +
+          `from the erp-sync-watchdog scheduled task, which lives in the right session.`,
+      );
+      return;
+    }
+
     // pm2 has no record of the app: the daemon was restarted, or never replayed
     // the saved list. Resurrect first — it restores every saved app, including
     // the logrotate module — and fall back to the ecosystem file.
